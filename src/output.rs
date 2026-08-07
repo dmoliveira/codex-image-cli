@@ -765,7 +765,8 @@ mod secure {
             let mut transaction =
                 OutputTransaction::reserve(directory.path(), vec!["hero.png".to_owned()], true)
                     .unwrap();
-            fs::remove_file(&destination).unwrap();
+            let preserved_original = directory.path().join("preserved-original.png");
+            fs::rename(&destination, &preserved_original).unwrap();
             fs::write(&destination, b"competitor").unwrap();
             transaction.stage_all(&[b"our image".to_vec()]).unwrap();
             let error = transaction.commit_all().unwrap_err();
