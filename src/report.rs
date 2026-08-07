@@ -1,6 +1,8 @@
 use serde::Serialize;
 use std::path::PathBuf;
 
+use crate::cli::Provider;
+
 pub const SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +123,7 @@ impl AppError {
                 ),
                 image_count,
                 model: "gpt-image-2",
+                provider: "unknown",
                 request_id: self.request_id.clone(),
             },
             http: HttpInfo {
@@ -155,7 +158,7 @@ pub struct RunReport {
 }
 
 impl RunReport {
-    pub fn dry_run(image_count: u8, outputs: Vec<PathBuf>) -> Self {
+    pub fn dry_run(image_count: u8, outputs: Vec<PathBuf>, provider: Provider) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             ok: true,
@@ -165,6 +168,7 @@ impl RunReport {
                 attempted: false,
                 image_count,
                 model: "gpt-image-2",
+                provider: provider.as_str(),
                 request_id: None,
             },
             http: HttpInfo { status: None },
@@ -181,6 +185,7 @@ impl RunReport {
         retained_artifacts: Vec<PathBuf>,
         request_id: Option<String>,
         http_status: Option<u16>,
+        provider: Provider,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -191,6 +196,7 @@ impl RunReport {
                 attempted: true,
                 image_count,
                 model: "gpt-image-2",
+                provider: provider.as_str(),
                 request_id,
             },
             http: HttpInfo {
@@ -209,6 +215,7 @@ pub struct RequestInfo {
     pub attempted: bool,
     pub image_count: u8,
     pub model: &'static str,
+    pub provider: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }

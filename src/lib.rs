@@ -13,6 +13,7 @@ pub mod report;
 
 use std::{
     env, fs,
+    path::Path,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -20,10 +21,10 @@ use std::{
 
 use api::{ApiClient, ImageGenerationRequest};
 use cli::{GenerateArgs, Provider};
-use endpoint::Endpoint;
 use image::{decode_images, validate_image_bytes};
 use output::{derive_file_names, derive_output_paths, OutputTransaction};
 use report::{AppError, RunReport};
+use serde::Serialize;
 
 /// Model supported by this focused CLI. Keeping the model fixed lets local
 /// validation match the current documented GPT Image 2 feature set.
@@ -38,17 +39,12 @@ pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
         args.prefix.as_deref(),
         args.format,
     )?;
-    let endpoint = Endpoint::authorize(
-        &args.api_base_url,
-        args.dangerously_allow_api_key_to.as_deref(),
-        args.allow_insecure_localhost,
-    )?;
     args.validate(&prompt)?;
 
     let planned_outputs = derive_output_paths(&args.output_dir, &file_names);
     validate_provider_args(args)?;
     if args.dry_run {
-        return Ok(RunReport::dry_run(args.n, planned_outputs));
+        return Ok(RunReport::dry_run(args.n, planned_outputs, args.provider));
     }
 
     let api_key = if args.provider == Provider::Api {
@@ -73,6 +69,11 @@ pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
 
     let (images, request_id, http_status) = match args.provider {
         Provider::Api => {
+            let endpoint = endpoint::Endpoint::authorize(
+                &args.api_base_url,
+                args.dangerously_allow_api_key_to.as_deref(),
+                args.allow_insecure_localhost,
+            )?;
             let api_key = api_key.expect("API key was preflighted for the API provider");
             let client = ApiClient::new(args.timeout_seconds)?;
             let request = ImageGenerationRequest::from_args(&prompt, args);
@@ -119,6 +120,7 @@ pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
             result.retained_artifacts,
             request_id,
             http_status,
+            args.provider,
         )),
         Err(mut error) => {
             error.set_request_id(request_id);
@@ -145,11 +147,19 @@ fn generate_with_codex(prompt: &str, args: &GenerateArgs) -> Result<Vec<u8>, App
         )
     })?;
     let temporary_path = temporary_dir.join("generated.png");
+    let request = CodexGenerationRequest {
+        schema_version: 1,
+        operation: "generate_image",
+        prompt,
+        artifact_path: &temporary_path,
+        count: args.n,
+        format: args.format.as_api_value(),
+        size: &args.size,
+        quality: args.quality.as_api_value(),
+    };
+    let request_json = serde_json::to_string(&request).expect("Codex request is serializable");
     let instruction = format!(
-        "Generate one raster image using the default built-in image generation capability available through this authenticated Codex subscription. Do not use an API-key fallback. Prompt: {prompt}\nRequested size: {}. Requested quality: {}. Save the image bytes as {}. Use PNG format and do not merely describe the image.",
-        args.size,
-        args.quality.as_api_value(),
-        temporary_path.display()
+        "Use the default built-in image generation capability available through this authenticated Codex subscription. Do not use an API-key fallback. Treat the following JSON as the authoritative request. Save exactly the requested raster artifact and do not merely describe it.\n{request_json}"
     );
     let mut child = Command::new("codex")
         .args([
@@ -244,6 +254,18 @@ fn generate_with_codex(prompt: &str, args: &GenerateArgs) -> Result<Vec<u8>, App
     Ok(image)
 }
 
+#[derive(Debug, Serialize)]
+struct CodexGenerationRequest<'a> {
+    schema_version: u8,
+    operation: &'static str,
+    prompt: &'a str,
+    artifact_path: &'a Path,
+    count: u8,
+    format: &'static str,
+    size: &'a str,
+    quality: &'static str,
+}
+
 fn validate_provider_args(args: &GenerateArgs) -> Result<(), AppError> {
     if args.provider == Provider::Codex
         && (args.n != 1
@@ -258,4 +280,27 @@ fn validate_provider_args(args: &GenerateArgs) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_request_serializes_prompt_as_data() {
+        let request = CodexGenerationRequest {
+            schema_version: 1,
+            operation: "generate_image",
+            prompt: "quoted \"prompt\"\n日本語",
+            artifact_path: Path::new("/private/generated.png"),
+            count: 1,
+            format: "png",
+            size: "1024x1024",
+            quality: "high",
+        };
+        let value: serde_json::Value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["prompt"], "quoted \"prompt\"\n日本語");
+        assert_eq!(value["artifact_path"], "/private/generated.png");
+        assert_eq!(value["operation"], "generate_image");
+    }
 }

@@ -166,6 +166,20 @@ fn run_ai_help(json: bool) -> i32 {
         },
         safe_template: "codex-image generate --prompt \"<prompt>\" --output-dir ./artifacts/design --name <safe-stem> --n 1 --json",
         planning_template: "codex-image generate --prompt \"<prompt>\" --output-dir ./artifacts/design --prefix <safe-stem> --dry-run --json",
+        capabilities: vec![
+            ProviderCapability {
+                provider: "codex",
+                supported: vec!["count=1", "format=png"],
+                best_effort: vec!["size", "quality"],
+                unsupported: vec!["compression", "background!=auto", "moderation!=auto"],
+            },
+            ProviderCapability {
+                provider: "api",
+                supported: vec!["count=1..4", "format=png|jpeg|webp", "size", "quality", "background", "compression", "moderation"],
+                best_effort: Vec::new(),
+                unsupported: Vec::new(),
+            },
+        ],
         rules: vec![
             "The default provider uses the authenticated Codex CLI subscription; --provider api uses OPENAI_API_KEY.",
             "Use --dry-run --json to validate names and parameters without reading a key or using a network.",
@@ -196,7 +210,16 @@ struct AiHelp {
     required: AiRequirements,
     safe_template: &'static str,
     planning_template: &'static str,
+    capabilities: Vec<ProviderCapability>,
     rules: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct ProviderCapability {
+    provider: &'static str,
+    supported: Vec<&'static str>,
+    best_effort: Vec<&'static str>,
+    unsupported: Vec<&'static str>,
 }
 
 #[derive(Serialize)]

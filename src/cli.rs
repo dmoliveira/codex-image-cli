@@ -136,6 +136,15 @@ pub enum Provider {
     Api,
 }
 
+impl Provider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Api => "api",
+        }
+    }
+}
+
 impl OutputFormat {
     pub fn extension(self) -> &'static str {
         match self {

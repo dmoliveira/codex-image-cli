@@ -118,6 +118,7 @@ Required facts for an agent:
 | --- | --- |
 | Prompt | `--prompt TEXT` or `--prompt-file FILE` (UTF-8 file; `-`/stdin is refused) |
 | Provider | Omit `--provider` for the authenticated Codex subscription; use `--provider api` for `OPENAI_API_KEY` |
+| Capabilities | `codex-image ai-help --json` returns supported, best-effort, and unsupported fields per provider |
 | Output directory | Create it first; it must be non-symlinked and already exist |
 | One output | `--name hero` with `--n 1` |
 | Several outputs | `--prefix hero --n 3` → `hero-01.png` … `hero-03.png` |
