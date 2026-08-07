@@ -1,0 +1,87 @@
+# CLI API contract 📐
+
+This document describes the stable behavior of version 1 JSON reports.
+
+## JSON rules
+
+With `--json`, the CLI writes exactly one JSON object and a newline to stdout. Ordinary application errors do not write to stderr in JSON mode. Reports never include an API key, authorization header, prompt body, server body, or base64 image data.
+
+Every generation report includes:
+
+```json
+{
+  "schema_version": 1,
+  "ok": true,
+  "status": "success",
+  "exit_code": 0,
+  "request": {
+    "attempted": true,
+    "image_count": 1,
+    "model": "gpt-image-2",
+    "request_id": "optional-safe-request-id"
+  },
+  "http": { "status": 200 },
+  "outputs": ["artifacts/design/hero.png"],
+  "retained_artifacts": [],
+  "possibly_modified_paths": []
+}
+```
+
+Failure reports add:
+
+```json
+"error": {
+  "code": "transport_outcome_unknown",
+  "message": "The image POST may have been processed ...",
+  "automatic_retry_safe": false
+}
+```
+
+`outputs` is populated only after all requested files are published. `retained_artifacts` lists private backups deliberately retained after a successful overwrite; they are not automatically unlinked because a pathname-only cleanup can race a competing writer. `possibly_modified_paths` lists outputs/private artifacts that need inspection after a failure. The CLI never calls a multi-file result successful after a partial publication.
+
+## Exit codes
+
+| Code | Status | API request attempted? | Agent behavior |
+| ---: | --- | --- | --- |
+| 0 | `success` / `dry_run` | yes / no | Consume outputs or planned paths. |
+| 2 | `usage_error` | no | Fix flags, prompt, local key presence, or endpoint policy. |
+| 3 | `preflight_error` | no | Fix directory, symlink, collision, permission, or reservation issue. |
+| 4 | `api_rejected` | yes | Inspect the safe HTTP/request ID information; change input/config if appropriate. |
+| 5 | `outcome_indeterminate` | possibly | Do **not** auto-retry; the POST may have been processed/billed. |
+| 6 | `invalid_success_response` | yes | Do **not** auto-retry; 2xx data was unsafe/malformed/oversized. |
+| 7 | `output_commit_failed` | yes | Do **not** auto-retry; inspect paths and determine whether output is recoverable. |
+
+A redirect is refused without forwarding credentials, but it is classified as code 5 rather than code 4 because a POST may have been processed before the redirect response arrived.
+
+## GPT Image 2 compatibility
+
+The CLI sends one documented Image API `POST /v1/images/generations` request with:
+
+| Field | Local contract |
+| --- | --- |
+| `model` | fixed `gpt-image-2` |
+| `prompt` | non-empty, ≤32,000 Unicode scalar values; prompt files are bounded to 256 KiB before decoding |
+| `n` | 1–4 |
+| `size` | `auto` or dimensions meeting GPT Image 2’s current 16px/edge/ratio/pixel constraints |
+| `quality` | `auto`, `low`, `medium`, `high` |
+| `background` | `auto` or `opaque`; transparent is locally rejected for GPT Image 2 |
+| `output_format` | `png`, `jpeg`, `webp` |
+| `output_compression` | 0–100, only JPEG/WebP |
+| `moderation` | `auto`, `low` |
+
+Responses must contain exactly `n` `data[].b64_json` values. The CLI limits a decoded image to 32 MiB and verifies the requested container signature (PNG, JPEG, or WebP) before writing.
+
+## Endpoint/credential policy
+
+- Default origin: `https://api.openai.com/v1`.
+- API keys come only from `OPENAI_API_KEY` for real generation.
+- Proxies and redirects are disabled.
+- Local HTTP requires both a loopback host and `--allow-insecure-localhost`.
+- Any non-loopback custom HTTPS origin requires `--dangerously-allow-api-key-to` containing that exact origin.
+- URL userinfo, query, fragment, and non-loopback HTTP are rejected before a request.
+
+Custom endpoint approval is an explicit trust decision, not a statement of OpenAI compatibility.
+
+## Secure output-platform support
+
+Actual generation currently supports macOS and Linux. Those builds pin every output-directory component with descriptor-relative `openat` operations, reject symlinks, preflight-check final targets, reserve private stages before the POST, and use atomic no-clobber/exchange publication with identity checks. Private stages/backups are retained rather than automatically deleted when a name could have been concurrently replaced. On other platforms the CLI fails closed with `secure_output_transactions_unsupported` before the API request; `--dry-run` remains available.
