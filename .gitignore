@@ -1,0 +1,10 @@
+# Build and local runtime state
+/target/
+/.opencode/
+/.codememory/
+
+# Secrets and local OS metadata
+.env
+.env.*
+!.env.example
+.DS_Store
