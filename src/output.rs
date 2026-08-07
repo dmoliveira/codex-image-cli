@@ -659,7 +659,7 @@ mod secure {
         match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => Ok(Some(EntryInfo {
                 id: FileId {
-                    device: stat.st_dev.try_into().map_err(|_| Errno::IO)?,
+                    device: u64::try_from(i128::from(stat.st_dev)).map_err(|_| Errno::IO)?,
                     inode: stat.st_ino,
                 },
                 file_type: FileType::from_raw_mode(stat.st_mode),
