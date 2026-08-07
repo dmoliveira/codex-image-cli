@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, process::Command as ProcessCommand};
 
 use clap::{error::ErrorKind, Parser};
 use codex_image_cli::{
@@ -120,28 +120,29 @@ struct DoctorCheck {
 }
 
 fn run_doctor(json: bool) -> i32 {
-    let key_present = env::var("OPENAI_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let codex_present = ProcessCommand::new("codex")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
     let report = DoctorReport {
         schema_version: SCHEMA_VERSION,
-        ok: key_present,
-        status: if key_present {
+        ok: codex_present,
+        status: if codex_present {
             "local_configuration_ready"
         } else {
             "local_configuration_required"
         },
-        exit_code: if key_present { 0 } else { 2 },
+        exit_code: if codex_present { 0 } else { 2 },
         checks: vec![DoctorCheck {
-            name: "OPENAI_API_KEY",
-            status: if key_present { "present" } else { "missing" },
-            detail: if key_present {
-                "A non-empty key is present in the environment; it was not sent or validated remotely."
+            name: "CODEX_CLI",
+            status: if codex_present { "present" } else { "missing" },
+            detail: if codex_present {
+                "The Codex CLI is available locally; login status and image entitlement are not validated remotely."
             } else {
-                "Set a non-empty API key in the environment. This command never prompts, sends a request, or spends credits."
+                "Install the Codex CLI and authenticate it with a supported subscription login. This command never prompts or spends credits."
             },
         }],
-        note: "A present key does not prove authentication, billing eligibility, model access, organization verification, or subscription entitlement.",
+        note: "The default provider uses Codex subscription auth. --provider api additionally requires OPENAI_API_KEY and separate API billing eligibility.",
     };
     if json {
         print_json(&report);
@@ -160,18 +161,18 @@ fn run_ai_help(json: bool) -> i32 {
         command: "codex-image generate",
         non_interactive: true,
         required: AiRequirements {
-            environment: "OPENAI_API_KEY (API billing and any required organization verification are separate from ChatGPT/Codex subscriptions)",
+        environment: "authenticated Codex CLI subscription by default; OPENAI_API_KEY only with --provider api",
             flags: vec!["--prompt TEXT or --prompt-file FILE"],
         },
-        safe_template: "codex-image generate --prompt \"<prompt>\" --output-dir ./artifacts/design --prefix <safe-stem> --n 1 --json",
+        safe_template: "codex-image generate --prompt \"<prompt>\" --output-dir ./artifacts/design --name <safe-stem> --n 1 --json",
         planning_template: "codex-image generate --prompt \"<prompt>\" --output-dir ./artifacts/design --prefix <safe-stem> --dry-run --json",
         rules: vec![
-            "Run doctor --json before a real request; it only checks local key presence.",
+            "The default provider uses the authenticated Codex CLI subscription; --provider api uses OPENAI_API_KEY.",
             "Use --dry-run --json to validate names and parameters without reading a key or using a network.",
             "Create --output-dir explicitly; the CLI refuses missing or symlinked output directories.",
             "Use --name only for one image; use --prefix for deterministic multi-image names.",
             "Never retry exit code 5, 6, or 7 automatically because a generation may have been billed.",
-            "Do not use ChatGPT/Codex subscription credentials as an Image API key.",
+            "Use --provider api only when deliberately choosing API billing and OPENAI_API_KEY.",
         ],
     };
     if json {

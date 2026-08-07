@@ -126,6 +126,8 @@ fn generate_writes_a_valid_png_from_a_loopback_mock() {
         .env("OPENAI_API_KEY", "test-key")
         .args([
             "generate",
+            "--provider",
+            "api",
             "--prompt",
             "a small fox",
             "--output-dir",
@@ -165,6 +167,8 @@ fn dry_run_does_not_connect_or_require_a_key() {
         .env_remove("OPENAI_API_KEY")
         .args([
             "generate",
+            "--provider",
+            "api",
             "--prompt",
             "draft only",
             "--output-dir",
@@ -203,6 +207,8 @@ fn collision_stops_before_the_mock_receives_a_request() {
         .env("OPENAI_API_KEY", "test-key")
         .args([
             "generate",
+            "--provider",
+            "api",
             "--prompt",
             "do not call the server",
             "--output-dir",
@@ -239,6 +245,8 @@ fn disconnected_post_is_indeterminate_and_is_not_retried() {
         .env("OPENAI_API_KEY", "test-key")
         .args([
             "generate",
+            "--provider",
+            "api",
             "--prompt",
             "one request only",
             "--output-dir",
@@ -270,6 +278,8 @@ fn server_error_does_not_reflect_the_api_key() {
         .env("OPENAI_API_KEY", "test-key")
         .args([
             "generate",
+            "--provider",
+            "api",
             "--prompt",
             "safe error",
             "--output-dir",
@@ -302,6 +312,8 @@ fn redirect_is_refused_without_following_it() {
         .env("OPENAI_API_KEY", "test-key")
         .args([
             "generate",
+            "--provider",
+            "api",
             "--prompt",
             "do not follow redirects",
             "--output-dir",
@@ -335,6 +347,8 @@ fn malformed_multi_image_response_publishes_no_partial_files() {
         .env("OPENAI_API_KEY", "test-key")
         .args([
             "generate",
+            "--provider",
+            "api",
             "--prompt",
             "all or no files",
             "--output-dir",
@@ -359,23 +373,38 @@ fn malformed_multi_image_response_publishes_no_partial_files() {
 }
 
 #[test]
-fn doctor_and_missing_key_are_machine_safe_and_non_interactive() {
+fn doctor_and_missing_codex_are_machine_safe_and_non_interactive() {
     let doctor = command()
         .env_remove("OPENAI_API_KEY")
         .args(["doctor", "--json"])
         .output()
         .unwrap();
-    assert_eq!(doctor.status.code(), Some(2));
+    let codex_available = Command::new("codex")
+        .arg("--version")
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert_eq!(doctor.status.success(), codex_available);
     assert!(doctor.stderr.is_empty());
     let doctor_report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
-    assert_eq!(doctor_report["status"], "local_configuration_required");
-    assert_eq!(doctor_report["checks"][0]["status"], "missing");
+    assert_eq!(
+        doctor_report["status"],
+        if codex_available {
+            "local_configuration_ready"
+        } else {
+            "local_configuration_required"
+        }
+    );
+    assert_eq!(doctor_report["checks"][0]["name"], "CODEX_CLI");
 
     let directory = safe_tempdir();
     let missing_key = command()
         .env_remove("OPENAI_API_KEY")
         .args([
             "generate",
+            "--provider",
+            "api",
             "--prompt",
             "no key request",
             "--output-dir",

@@ -180,7 +180,7 @@ impl RunReport {
         outputs: Vec<PathBuf>,
         retained_artifacts: Vec<PathBuf>,
         request_id: Option<String>,
-        http_status: u16,
+        http_status: Option<u16>,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -194,7 +194,7 @@ impl RunReport {
                 request_id,
             },
             http: HttpInfo {
-                status: Some(http_status),
+                status: http_status,
             },
             outputs: path_strings(&outputs),
             retained_artifacts: path_strings(&retained_artifacts),

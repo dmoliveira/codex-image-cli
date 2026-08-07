@@ -11,12 +11,17 @@ pub mod image;
 pub mod output;
 pub mod report;
 
-use std::env;
+use std::{
+    env, fs,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use api::{ApiClient, ImageGenerationRequest};
-use cli::GenerateArgs;
+use cli::{GenerateArgs, Provider};
 use endpoint::Endpoint;
-use image::decode_images;
+use image::{decode_images, validate_image_bytes};
 use output::{derive_file_names, derive_output_paths, OutputTransaction};
 use report::{AppError, RunReport};
 
@@ -41,48 +46,68 @@ pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
     args.validate(&prompt)?;
 
     let planned_outputs = derive_output_paths(&args.output_dir, &file_names);
+    validate_provider_args(args)?;
     if args.dry_run {
         return Ok(RunReport::dry_run(args.n, planned_outputs));
     }
 
-    let api_key = env::var("OPENAI_API_KEY").map_err(|_| {
-        AppError::usage(
-            "missing_api_key",
-            "OPENAI_API_KEY must be set for generation. A ChatGPT or Codex subscription login is not an Image API credential.",
-        )
-    })?;
-    if api_key.trim().is_empty() {
-        return Err(AppError::usage(
-            "empty_api_key",
-            "OPENAI_API_KEY is empty. Set a non-empty API key in the environment; do not pass it on the command line.",
-        ));
-    }
-
-    let client = ApiClient::new(args.timeout_seconds)?;
+    let api_key = if args.provider == Provider::Api {
+        let key = env::var("OPENAI_API_KEY").map_err(|_| {
+            AppError::usage(
+                "missing_api_key",
+                "OPENAI_API_KEY must be set for --provider api. The default provider uses the authenticated Codex CLI subscription.",
+            )
+        })?;
+        if key.trim().is_empty() {
+            return Err(AppError::usage(
+                "empty_api_key",
+                "OPENAI_API_KEY is empty. Set a non-empty API key in the environment; do not pass it on the command line.",
+            ));
+        }
+        ApiClient::new(args.timeout_seconds)?;
+        Some(key)
+    } else {
+        None
+    };
     let mut transaction = OutputTransaction::reserve(&args.output_dir, file_names, args.overwrite)?;
 
-    let request = ImageGenerationRequest::from_args(&prompt, args);
-    let response = match client.generate(&endpoint, &api_key, &request) {
-        Ok(response) => response,
-        Err(mut error) => {
-            error.add_possibly_modified_paths(transaction.abort());
-            return Err(error);
+    let (images, request_id, http_status) = match args.provider {
+        Provider::Api => {
+            let api_key = api_key.expect("API key was preflighted for the API provider");
+            let client = ApiClient::new(args.timeout_seconds)?;
+            let request = ImageGenerationRequest::from_args(&prompt, args);
+            let response = match client.generate(&endpoint, &api_key, &request) {
+                Ok(response) => response,
+                Err(mut error) => {
+                    error.add_possibly_modified_paths(transaction.abort());
+                    return Err(error);
+                }
+            };
+            let images = match decode_images(&response.body, args.n, args.format) {
+                Ok(images) => images,
+                Err(mut error) => {
+                    error.set_request_id(response.request_id);
+                    error.set_http_status(response.status);
+                    error.add_possibly_modified_paths(transaction.abort());
+                    return Err(error);
+                }
+            };
+            (images, response.request_id, Some(response.status))
         }
-    };
-
-    let images = match decode_images(&response.body, args.n, args.format) {
-        Ok(images) => images,
-        Err(mut error) => {
-            error.set_request_id(response.request_id);
-            error.set_http_status(response.status);
-            error.add_possibly_modified_paths(transaction.abort());
-            return Err(error);
-        }
+        Provider::Codex => match generate_with_codex(&prompt, args) {
+            Ok(image) => (vec![image], None, None),
+            Err(mut error) => {
+                error.add_possibly_modified_paths(transaction.abort());
+                return Err(error);
+            }
+        },
     };
 
     if let Err(mut error) = transaction.stage_all(&images) {
-        error.set_request_id(response.request_id.clone());
-        error.set_http_status(response.status);
+        error.set_request_id(request_id.clone());
+        if let Some(status) = http_status {
+            error.set_http_status(status);
+        }
         error.add_possibly_modified_paths(transaction.abort());
         return Err(error);
     }
@@ -92,13 +117,145 @@ pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
             args.n,
             result.outputs,
             result.retained_artifacts,
-            response.request_id,
-            response.status,
+            request_id,
+            http_status,
         )),
         Err(mut error) => {
-            error.set_request_id(response.request_id);
-            error.set_http_status(response.status);
+            error.set_request_id(request_id);
+            if let Some(status) = http_status {
+                error.set_http_status(status);
+            }
             Err(error)
         }
     }
+}
+
+fn generate_with_codex(prompt: &str, args: &GenerateArgs) -> Result<Vec<u8>, AppError> {
+    let temporary_dir = env::temp_dir().join(format!(
+        ".codex-image-cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    fs::create_dir(&temporary_dir).map_err(|_| {
+        AppError::preflight(
+            "codex_workspace_unavailable",
+            "The Codex provider could not create a private workspace; no generation was attempted.",
+        )
+    })?;
+    let temporary_path = temporary_dir.join("generated.png");
+    let instruction = format!(
+        "Generate one raster image using the default built-in image generation capability available through this authenticated Codex subscription. Do not use an API-key fallback. Prompt: {prompt}\nRequested size: {}. Requested quality: {}. Save the image bytes as {}. Use PNG format and do not merely describe the image.",
+        args.size,
+        args.quality.as_api_value(),
+        temporary_path.display()
+    );
+    let mut child = Command::new("codex")
+        .args([
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "workspace-write",
+            "--json",
+            "-C",
+        ])
+        .arg(&temporary_dir)
+        .arg(instruction)
+        .env_remove("OPENAI_API_KEY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| {
+            AppError::usage(
+                "codex_cli_unavailable",
+                "The default Codex provider requires the authenticated `codex` CLI. Use --provider api for direct Image API generation.",
+            )
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(args.timeout_seconds);
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    if result.is_none() {
+        let mut error = AppError::indeterminate(
+            "codex_generation_timeout",
+            "The Codex image-generation command exceeded the configured timeout. The subscription generation outcome may be unknown; do not retry automatically.",
+        );
+        error.add_possibly_modified_paths(vec![temporary_path]);
+        return Err(error);
+    }
+    let result = result.expect("checked above");
+    let image = match fs::read(&temporary_path) {
+        Ok(image) => image,
+        Err(_) => {
+            let mut error = if result.success() {
+                AppError::invalid_response(
+                    "codex_image_missing",
+                    "Codex completed without producing the requested PNG. No usable image was returned; do not retry automatically.",
+                )
+            } else {
+                AppError::indeterminate(
+                    "codex_generation_outcome_unknown",
+                    "Codex may have generated an image, but the CLI did not produce a readable PNG. Inspect the output directory before retrying.",
+                )
+            };
+            error.add_possibly_modified_paths(vec![temporary_path]);
+            return Err(error);
+        }
+    };
+    if !result.success() {
+        let mut error = AppError::indeterminate(
+            "codex_generation_failed",
+            "The Codex image-generation command failed after it was started. The subscription generation outcome may be unknown; do not retry automatically.",
+        );
+        error.add_possibly_modified_paths(vec![temporary_path]);
+        return Err(error);
+    }
+    let image = match validate_image_bytes(image, cli::OutputFormat::Png) {
+        Ok(image) => image,
+        Err(mut error) => {
+            error.add_possibly_modified_paths(vec![temporary_path]);
+            return Err(error);
+        }
+    };
+    if fs::remove_file(&temporary_path).is_err() || fs::remove_dir(&temporary_dir).is_err() {
+        let mut error = AppError::output_commit(
+            "codex_workspace_cleanup_failed",
+            "The generated image was valid, but the private Codex workspace could not be cleaned safely; inspect the listed path.",
+        );
+        error.add_possibly_modified_paths(vec![temporary_path]);
+        return Err(error);
+    }
+    Ok(image)
+}
+
+fn validate_provider_args(args: &GenerateArgs) -> Result<(), AppError> {
+    if args.provider == Provider::Codex
+        && (args.n != 1
+            || args.format != cli::OutputFormat::Png
+            || args.compression.is_some()
+            || args.background != cli::Background::Auto
+            || args.moderation != cli::Moderation::Auto)
+    {
+        return Err(AppError::usage(
+            "codex_provider_constraints",
+            "The Codex subscription provider currently supports exactly one PNG per command. Use --provider api for other counts or formats.",
+        ));
+    }
+    Ok(())
 }

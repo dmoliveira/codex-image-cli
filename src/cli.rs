@@ -16,7 +16,7 @@ const MAX_PROMPT_FILE_BYTES: usize = 256 * 1024;
     name = "codex-image",
     version,
     about = "Generate OpenAI GPT Image 2 assets without interactive prompts.",
-    long_about = "A non-interactive, AI-friendly CLI for OpenAI GPT Image 2. It uses OPENAI_API_KEY; ChatGPT/Codex subscription logins are not reused."
+    long_about = "A non-interactive, AI-friendly CLI for GPT Image 2. It uses the authenticated Codex CLI by default, or the Image API with --provider api."
 )]
 pub struct Cli {
     /// Emit exactly one machine-readable JSON object on stdout.
@@ -39,6 +39,10 @@ pub enum Command {
 
 #[derive(Debug, Clone, Args)]
 pub struct GenerateArgs {
+    /// Image backend. The default uses the authenticated Codex CLI subscription.
+    #[arg(long, value_enum, default_value_t = Provider::Codex)]
+    pub provider: Provider,
+
     /// Text prompt for the image. Mutually exclusive with --prompt-file.
     #[arg(
         long,
@@ -123,6 +127,13 @@ pub enum OutputFormat {
     Png,
     Jpeg,
     Webp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Codex,
+    Api,
 }
 
 impl OutputFormat {

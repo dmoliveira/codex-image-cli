@@ -20,14 +20,14 @@ AI tools such as OpenCode need a small, predictable image command—not a browse
 - 🤖 **Agent-ready JSON** via `ai-help --json`, `doctor --json`, and `generate --json`
 - 🧾 **One explicit POST** per generation command; no automatic retry of billable image requests
 - 📁 **Safe deterministic files** with collision protection, staged writes, and controlled `--overwrite`
-- 🔒 **Key-aware endpoint policy**: API keys only from `OPENAI_API_KEY`, no proxy, no redirect forwarding
+- 🔒 **Subscription-first provider**: authenticated Codex CLI by default, direct API billing via `--provider api`
 - 🧪 **Offline-friendly validation**: `--dry-run`, unit tests, fake-API integration tests, and a tmux E2E harness
 
 ## Important account reality ⚠️
 
-This tool uses the documented **OpenAI API** endpoint with `OPENAI_API_KEY` and the `gpt-image-2` model.
+This tool uses the authenticated Codex CLI subscription by default. The Codex provider delegates to Codex's built-in image-generation skill and validates the resulting PNG before publishing it.
 
-**ChatGPT/Codex subscriptions and API billing are separate.** A subscription login is not a documented Image API credential, and this project will not scrape, replay, or repurpose browser/Codex credentials. API access can also require billing setup and [organization verification](https://help.openai.com/en/articles/10910291-api-organization-verification).
+Use `--provider api` to select the direct Image API path with `OPENAI_API_KEY`; ChatGPT/Codex subscriptions and API billing remain separate. API access can also require billing setup and [organization verification](https://help.openai.com/en/articles/10910291-api-organization-verification).
 
 ## Install from any terminal 🚀
 
@@ -83,25 +83,26 @@ codex-image generate \
   --prompt "A warm editorial illustration of a rust-orange fox using a terminal" \
   --output-dir artifacts/design \
   --prefix fox-terminal \
-  --n 2 \
+  --n 1 \
   --size 1536x1024 \
   --quality medium \
   --dry-run \
   --json
 
-# 3. Send exactly one API request after the dry run looks right.
-OPENAI_API_KEY="${OPENAI_API_KEY:?set OPENAI_API_KEY first}" \
+# 3. Generate through the authenticated Codex subscription after the dry run looks right.
 codex-image generate \
   --prompt "A warm editorial illustration of a rust-orange fox using a terminal" \
   --output-dir artifacts/design \
   --prefix fox-terminal \
-  --n 2 \
+  --n 1 \
   --size 1536x1024 \
   --quality medium \
   --json
 ```
 
-That writes `fox-terminal-01.png` and `fox-terminal-02.png` only after every response image has passed base64 and PNG-container validation.
+That writes `fox-terminal.png` after the generated PNG has passed container validation.
+
+The default Codex provider currently supports one PNG per command. Add `--provider api` for multiple outputs, JPEG/WebP, or API-specific endpoint controls.
 
 ## For AI agents 🤖
 
@@ -116,7 +117,7 @@ Required facts for an agent:
 | Need | Safe action |
 | --- | --- |
 | Prompt | `--prompt TEXT` or `--prompt-file FILE` (UTF-8 file; `-`/stdin is refused) |
-| API key | Set `OPENAI_API_KEY` in the environment—never in flags or JSON |
+| Provider | Omit `--provider` for the authenticated Codex subscription; use `--provider api` for `OPENAI_API_KEY` |
 | Output directory | Create it first; it must be non-symlinked and already exist |
 | One output | `--name hero` with `--n 1` |
 | Several outputs | `--prefix hero --n 3` → `hero-01.png` … `hero-03.png` |
