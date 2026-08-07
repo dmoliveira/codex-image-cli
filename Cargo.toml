@@ -1,0 +1,44 @@
+[package]
+name = "codex-image-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+description = "A safe, non-interactive CLI for OpenAI GPT Image generation."
+license = "MIT"
+repository = "https://github.com/dmoliveira/codex-image-cli"
+homepage = "https://github.com/dmoliveira/codex-image-cli"
+readme = "README.md"
+keywords = ["openai", "image-generation", "cli", "ai-agent", "gpt-image"]
+categories = ["command-line-utilities", "multimedia::images"]
+include = [
+  "src/**",
+  "tests/**",
+  "scripts/**",
+  "assets/**",
+  "docs/**",
+  "README.md",
+  "LICENSE",
+  "CHANGELOG.md",
+  "AGENTS.md",
+  "Cargo.toml",
+  "Cargo.lock",
+]
+
+[[bin]]
+name = "codex-image"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.5.31", features = ["derive"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.140"
+url = "2.5.4"
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+getrandom = "0.3.4"
+rustix = { version = "1.1.4", features = ["fs", "std"] }
+
+[dev-dependencies]
+tempfile = "3.17.1"
