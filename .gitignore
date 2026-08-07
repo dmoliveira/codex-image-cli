@@ -2,6 +2,8 @@
 /target/
 /.opencode/
 /.codememory/
+/__pycache__/
+**/__pycache__/
 
 # Secrets and local OS metadata
 .env
