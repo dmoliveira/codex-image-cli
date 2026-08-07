@@ -1,8 +1,15 @@
-use std::{env, process::Command as ProcessCommand};
+use std::{
+    env,
+    io::Read,
+    process::{Command as ProcessCommand, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use clap::{error::ErrorKind, Parser};
 use codex_image_cli::{
     cli::{Cli, Command},
+    provider,
     report::{AppError, RunReport, SCHEMA_VERSION},
     run_generate,
 };
@@ -120,29 +127,56 @@ struct DoctorCheck {
 }
 
 fn run_doctor(json: bool) -> i32 {
-    let codex_present = ProcessCommand::new("codex")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success());
+    let codex_present = codex_version_available();
+    let login_status = if codex_present {
+        codex_login_status()
+    } else {
+        "missing"
+    };
+    let api_key_present = env::var("OPENAI_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let ready = login_status == "logged_in" || api_key_present;
     let report = DoctorReport {
         schema_version: SCHEMA_VERSION,
-        ok: codex_present,
-        status: if codex_present {
+        ok: ready,
+        status: if ready {
             "local_configuration_ready"
         } else {
             "local_configuration_required"
         },
-        exit_code: if codex_present { 0 } else { 2 },
-        checks: vec![DoctorCheck {
-            name: "CODEX_CLI",
-            status: if codex_present { "present" } else { "missing" },
-            detail: if codex_present {
-                "The Codex CLI is available locally; login status and image entitlement are not validated remotely."
-            } else {
-                "Install the Codex CLI and authenticate it with a supported subscription login. This command never prompts or spends credits."
+        exit_code: if ready { 0 } else { 2 },
+        checks: vec![
+            DoctorCheck {
+                name: "CODEX_CLI",
+                status: if codex_present { "present" } else { "missing" },
+                detail: if codex_present {
+                    "The Codex CLI is available locally."
+                } else {
+                    "Install the Codex CLI for the default subscription provider."
+                },
             },
-        }],
-        note: "The default provider uses Codex subscription auth. --provider api additionally requires OPENAI_API_KEY and separate API billing eligibility.",
+            DoctorCheck {
+                name: "CODEX_LOGIN",
+                status: login_status,
+                detail: match login_status {
+                    "logged_in" => "Codex reports a local login; image entitlement is not verified.",
+                    "logged_out" => "Codex is installed but does not report an active login.",
+                    "missing" => "Codex login status was not checked because the executable is unavailable.",
+                    _ => "Codex login status could not be classified safely.",
+                },
+            },
+            DoctorCheck {
+                name: "OPENAI_API_KEY",
+                status: if api_key_present { "present" } else { "missing" },
+                detail: if api_key_present {
+                    "A non-empty API key is present locally; it was not sent or remotely validated."
+                } else {
+                    "No API key is present; this is required only for --provider api."
+                },
+            },
+        ],
+        note: "Login and key presence do not prove API billing, organization verification, model access, entitlement, or successful generation.",
     };
     if json {
         print_json(&report);
@@ -153,6 +187,123 @@ fn run_doctor(json: bool) -> i32 {
         println!("Note: {}", report.note);
     }
     report.exit_code
+}
+
+fn codex_login_status() -> &'static str {
+    let mut command = ProcessCommand::new(provider::executable());
+    command
+        .args(["login", "status"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return "unknown",
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return "unknown";
+    };
+    let stderr = child.stderr.take();
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.by_ref().take(16 * 1024).read_to_end(&mut bytes);
+        bytes
+    });
+    let error_reader = stderr.map(|mut stderr| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.by_ref().take(16 * 1024).read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) | Err(_) => {
+                stop_login_process(&mut child);
+                break None;
+            }
+        }
+    };
+    let mut output = reader.join().unwrap_or_default();
+    if let Some(error_reader) = error_reader {
+        output.extend(error_reader.join().unwrap_or_default());
+    }
+    let text = String::from_utf8_lossy(&output).to_ascii_lowercase();
+    if text.contains("logged out") || text.contains("not logged") {
+        "logged_out"
+    } else if status_success(status)
+        && (text.contains("logged in") || text.contains("using chatgpt"))
+    {
+        "logged_in"
+    } else {
+        "unknown"
+    }
+}
+
+fn status_success(status: Option<std::process::ExitStatus>) -> bool {
+    status.is_some_and(|status| status.success())
+}
+
+fn codex_version_available() -> bool {
+    let mut command = ProcessCommand::new(provider::executable());
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) | Err(_) => {
+                stop_login_process(&mut child);
+                return false;
+            }
+        }
+    }
+}
+
+fn stop_login_process(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let pid = child.id() as libc::pid_t;
+        let _ = libc::kill(-pid, libc::SIGTERM);
+        thread::sleep(Duration::from_millis(100));
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn run_ai_help(json: bool) -> i32 {
@@ -166,20 +317,8 @@ fn run_ai_help(json: bool) -> i32 {
         },
         safe_template: "codex-image generate --prompt \"<prompt>\" --output-dir ./artifacts/design --name <safe-stem> --n 1 --json",
         planning_template: "codex-image generate --prompt \"<prompt>\" --output-dir ./artifacts/design --prefix <safe-stem> --dry-run --json",
-        capabilities: vec![
-            ProviderCapability {
-                provider: "codex",
-                supported: vec!["count=1", "format=png"],
-                best_effort: vec!["size", "quality"],
-                unsupported: vec!["compression", "background!=auto", "moderation!=auto"],
-            },
-            ProviderCapability {
-                provider: "api",
-                supported: vec!["count=1..4", "format=png|jpeg|webp", "size", "quality", "background", "compression", "moderation"],
-                best_effort: Vec::new(),
-                unsupported: Vec::new(),
-            },
-        ],
+        request_file_template: "{\"schema_version\":1,\"prompt\":\"<prompt>\",\"provider\":\"codex\",\"size\":\"auto\",\"quality\":\"auto\"}",
+        capabilities: provider::capabilities(),
         rules: vec![
             "The default provider uses the authenticated Codex CLI subscription; --provider api uses OPENAI_API_KEY.",
             "Use --dry-run --json to validate names and parameters without reading a key or using a network.",
@@ -196,6 +335,7 @@ fn run_ai_help(json: bool) -> i32 {
         println!("Required environment: {}", help.required.environment);
         println!("Required input: {}", help.required.flags.join("; "));
         println!("Plan safely: {}", help.planning_template);
+        println!("Structured request: {}", help.request_file_template);
         println!("Generate: {}", help.safe_template);
         println!("For machine-readable instructions: codex-image ai-help --json");
     }
@@ -210,16 +350,9 @@ struct AiHelp {
     required: AiRequirements,
     safe_template: &'static str,
     planning_template: &'static str,
-    capabilities: Vec<ProviderCapability>,
+    request_file_template: &'static str,
+    capabilities: Vec<provider::Capability>,
     rules: Vec<&'static str>,
-}
-
-#[derive(Serialize)]
-struct ProviderCapability {
-    provider: &'static str,
-    supported: Vec<&'static str>,
-    best_effort: Vec<&'static str>,
-    unsupported: Vec<&'static str>,
 }
 
 #[derive(Serialize)]

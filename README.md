@@ -18,7 +18,7 @@
 AI tools such as OpenCode need a small, predictable image command—not a browser flow or an interactive wizard. `codex-image` provides:
 
 - 🤖 **Agent-ready JSON** via `ai-help --json`, `doctor --json`, and `generate --json`
-- 🧾 **One explicit POST** per generation command; no automatic retry of billable image requests
+- 🧾 **One explicit generation operation** per command; no automatic retry of billable image requests
 - 📁 **Safe deterministic files** with collision protection, staged writes, and controlled `--overwrite`
 - 🔒 **Subscription-first provider**: authenticated Codex CLI by default, direct API billing via `--provider api`
 - 🧪 **Offline-friendly validation**: `--dry-run`, unit tests, fake-API integration tests, and a tmux E2E harness
@@ -74,7 +74,7 @@ Verify the published checksum from the release before installing artifacts direc
 ## Fast start ✨
 
 ```bash
-# 1. Local-only check: does not send a request or spend credits.
+# 1. Check local providers without generating an image.
 codex-image doctor --json
 
 # 2. Prepare an explicit output directory and validate the plan.
@@ -117,6 +117,7 @@ Required facts for an agent:
 | Need | Safe action |
 | --- | --- |
 | Prompt | `--prompt TEXT` or `--prompt-file FILE` (UTF-8 file; `-`/stdin is refused) |
+| Structured request | `--request-file FILE` with versioned JSON; exclusive with generation flags |
 | Provider | Omit `--provider` for the authenticated Codex subscription; use `--provider api` for `OPENAI_API_KEY` |
 | Capabilities | `codex-image ai-help --json` returns supported, best-effort, and unsupported fields per provider |
 | Output directory | Create it first; it must be non-symlinked and already exist |
@@ -136,6 +137,7 @@ codex-image generate --prompt <TEXT> [OPTIONS]
 | Option | Default | Notes |
 | --- | --- | --- |
 | `--prompt TEXT` | required* | Prompt text. Use a UTF-8 `--prompt-file FILE` up to 256 KiB for long local prompts. |
+| `--request-file FILE` | — | Version 1 JSON generation request; cannot be combined with generation-setting flags. |
 | `--n COUNT` | `1` | 1–4 images in one request. |
 | `--output-dir DIR` | `.` | Existing, non-symlink directory. The CLI never creates it implicitly. |
 | `--name STEM` | — | Exact safe stem for one image only: `hero` → `hero.png`. |
@@ -152,6 +154,31 @@ codex-image generate --prompt <TEXT> [OPTIONS]
 | `--json` | off | Stable JSON schema on stdout; diagnostics are not mixed in. |
 
 `*` Exactly one of `--prompt` and `--prompt-file` is required.
+
+### Structured request file
+
+Use a request file when an agent already has typed parameters:
+
+```json
+{
+  "schema_version": 1,
+  "prompt": "A warm editorial illustration of a rust-orange fox using a terminal",
+  "provider": "codex",
+  "size": "1536x1024",
+  "quality": "medium"
+}
+```
+
+```bash
+codex-image generate \
+  --request-file request.json \
+  --output-dir artifacts/design \
+  --name fox-terminal \
+  --dry-run \
+  --json
+```
+
+The file cannot authorize overwrites, custom endpoints, API-key destinations, or insecure HTTP. Use CLI flags for those explicit trust decisions.
 
 ### Endpoint overrides (advanced) 🔐
 

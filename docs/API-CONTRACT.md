@@ -1,6 +1,6 @@
 # CLI API contract 📐
 
-This document describes the stable behavior of version 1 JSON reports.
+This document describes the stable behavior of version 2 JSON reports.
 
 ## JSON rules
 
@@ -10,7 +10,7 @@ Every generation report includes:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "ok": true,
   "status": "success",
   "exit_code": 0,
@@ -18,7 +18,7 @@ Every generation report includes:
     "attempted": true,
     "image_count": 1,
     "model": "gpt-image-2",
-    "provider": "codex",
+    "provider": "api",
     "request_id": "optional-safe-request-id"
   },
   "http": { "status": 200 },
@@ -39,6 +39,8 @@ Failure reports add:
 ```
 
 `outputs` is populated only after all requested files are published. `retained_artifacts` lists private backups deliberately retained after a successful overwrite; they are not automatically unlinked because a pathname-only cleanup can race a competing writer. `possibly_modified_paths` lists outputs/private artifacts that need inspection after a failure. The CLI never calls a multi-file result successful after a partial publication.
+
+`request.provider` is `api` or `codex`. `request.model` is present only when the provider guarantees the model (`gpt-image-2` for `api`); Codex's built-in image model is intentionally not claimed. `http.status` is present only for API responses. Codex process failures may add `process_exit_code`, `process_timed_out`, `diagnostics_bytes`, and `diagnostics_truncated` to `error`.
 
 ## Exit codes
 
@@ -88,6 +90,10 @@ Responses must contain exactly `n` `data[].b64_json` values. The CLI limits a de
 - URL userinfo, query, fragment, and non-loopback HTTP are rejected before a request.
 
 Custom endpoint approval is an explicit trust decision, not a statement of OpenAI compatibility.
+
+## Structured requests
+
+`--request-file FILE` accepts bounded UTF-8 JSON with `schema_version: 1` and a required `prompt`. It may contain `provider`, `n`, `format`, `size`, `quality`, `background`, `compression`, and `moderation`. It is exclusive with those generation flags; output naming, overwrite, endpoint URLs, credential-destination approvals, and insecure-localhost approval remain CLI-only controls. Unknown fields, malformed JSON, stdin (`-`), and oversized files are rejected before key reads, reservation, subprocess creation, or network access.
 
 ## Secure output-platform support
 

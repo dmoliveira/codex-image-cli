@@ -162,6 +162,7 @@ dependencies = [
  "base64",
  "clap",
  "getrandom 0.3.4",
+ "libc",
  "reqwest",
  "rustix",
  "serde",

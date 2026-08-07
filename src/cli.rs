@@ -1,15 +1,16 @@
 use std::{
-    fs::{self, File},
+    fs::File,
     io::Read,
     path::{Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::report::AppError;
 
 const MAX_PROMPT_FILE_BYTES: usize = 256 * 1024;
+const MAX_REQUEST_FILE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -39,6 +40,26 @@ pub enum Command {
 
 #[derive(Debug, Clone, Args)]
 pub struct GenerateArgs {
+    /// Versioned JSON file containing structured generation parameters.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "provider",
+            "prompt",
+            "prompt_file",
+            "n",
+            "format",
+            "size",
+            "quality",
+            "background",
+            "compression",
+            "moderation",
+            "timeout_seconds"
+        ]
+    )]
+    pub request_file: Option<PathBuf>,
+
     /// Image backend. The default uses the authenticated Codex CLI subscription.
     #[arg(long, value_enum, default_value_t = Provider::Codex)]
     pub provider: Provider,
@@ -47,13 +68,17 @@ pub struct GenerateArgs {
     #[arg(
         long,
         value_name = "TEXT",
-        required_unless_present = "prompt_file",
-        conflicts_with = "prompt_file"
+        required_unless_present_any = ["prompt_file", "request_file"],
+        conflicts_with_all = ["prompt_file", "request_file"]
     )]
     pub prompt: Option<String>,
 
     /// UTF-8 file containing the prompt. The special path '-' is intentionally unsupported.
-    #[arg(long, value_name = "FILE", conflicts_with = "prompt")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["prompt", "request_file"]
+    )]
     pub prompt_file: Option<PathBuf>,
 
     /// Number of images to request in one API call (1-4).
@@ -121,7 +146,7 @@ pub struct GenerateArgs {
     pub allow_insecure_localhost: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     Png,
@@ -129,7 +154,7 @@ pub enum OutputFormat {
     Webp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Codex,
@@ -159,7 +184,7 @@ impl OutputFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
     Auto,
@@ -179,7 +204,7 @@ impl Quality {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Background {
     Auto,
@@ -197,7 +222,7 @@ impl Background {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Moderation {
     Auto,
@@ -214,6 +239,65 @@ impl Moderation {
 }
 
 impl GenerateArgs {
+    pub fn resolve_request_file(&self) -> Result<Self, AppError> {
+        let Some(path) = &self.request_file else {
+            return Ok(self.clone());
+        };
+        if path.as_os_str() == "-" {
+            return Err(AppError::usage(
+                "request_file_stdin_not_supported",
+                "--request-file - is not supported because this CLI never waits for interactive stdin. Use a UTF-8 JSON file path instead.",
+            ));
+        }
+        let bytes = read_bounded_file(
+            path,
+            MAX_REQUEST_FILE_BYTES,
+            request_file_unreadable,
+            request_file_unreadable,
+        )?;
+        let request: RequestFile = serde_json::from_slice(&bytes).map_err(|_| {
+            AppError::usage(
+                "request_file_invalid_json",
+                "The request file is not valid UTF-8 JSON matching the documented schema.",
+            )
+        })?;
+        if request.schema_version != 1 {
+            return Err(AppError::usage(
+                "request_file_schema_unsupported",
+                "The request file schema_version must be 1.",
+            ));
+        }
+        let mut resolved = self.clone();
+        resolved.request_file = None;
+        resolved.prompt = Some(request.prompt);
+        resolved.prompt_file = None;
+        if let Some(provider) = request.provider {
+            resolved.provider = provider;
+        }
+        if let Some(n) = request.n {
+            resolved.n = n;
+        }
+        if let Some(format) = request.format {
+            resolved.format = format;
+        }
+        if let Some(size) = request.size {
+            resolved.size = size;
+        }
+        if let Some(quality) = request.quality {
+            resolved.quality = quality;
+        }
+        if let Some(background) = request.background {
+            resolved.background = background;
+        }
+        if let Some(compression) = request.compression {
+            resolved.compression = compression;
+        }
+        if let Some(moderation) = request.moderation {
+            resolved.moderation = moderation;
+        }
+        Ok(resolved)
+    }
+
     pub fn read_prompt(&self) -> Result<String, AppError> {
         let prompt = match (&self.prompt, &self.prompt_file) {
             (Some(prompt), None) => prompt.clone(),
@@ -294,40 +378,63 @@ impl GenerateArgs {
 }
 
 fn read_prompt_file(path: &Path) -> Result<String, AppError> {
-    let metadata = fs::metadata(path).map_err(|_| {
-        AppError::usage(
-            "prompt_file_unreadable",
-            "The prompt file could not be read as UTF-8.",
-        )
-    })?;
-    if metadata.len() > MAX_PROMPT_FILE_BYTES as u64 {
-        return Err(prompt_file_too_large());
-    }
-    let mut file = File::open(path).map_err(|_| {
-        AppError::usage(
-            "prompt_file_unreadable",
-            "The prompt file could not be read as UTF-8.",
-        )
-    })?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
-        .take(MAX_PROMPT_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
+    let bytes = read_bounded_file(
+        path,
+        MAX_PROMPT_FILE_BYTES,
+        || {
             AppError::usage(
                 "prompt_file_unreadable",
                 "The prompt file could not be read as UTF-8.",
             )
-        })?;
-    if bytes.len() > MAX_PROMPT_FILE_BYTES {
-        return Err(prompt_file_too_large());
-    }
+        },
+        prompt_file_too_large,
+    )?;
     String::from_utf8(bytes).map_err(|_| {
         AppError::usage(
             "prompt_file_unreadable",
             "The prompt file could not be read as UTF-8.",
         )
     })
+}
+
+fn read_bounded_file(
+    path: &Path,
+    limit: usize,
+    error: fn() -> AppError,
+    too_large: fn() -> AppError,
+) -> Result<Vec<u8>, AppError> {
+    let mut file = File::open(path).map_err(|_| error())?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| error())?;
+    if bytes.len() > limit {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
+fn request_file_unreadable() -> AppError {
+    AppError::usage(
+        "request_file_unreadable",
+        "The request file could not be read as bounded UTF-8 JSON.",
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestFile {
+    schema_version: u8,
+    prompt: String,
+    provider: Option<Provider>,
+    n: Option<u8>,
+    format: Option<OutputFormat>,
+    size: Option<String>,
+    quality: Option<Quality>,
+    background: Option<Background>,
+    compression: Option<Option<u8>>,
+    moderation: Option<Moderation>,
 }
 
 fn prompt_file_too_large() -> AppError {

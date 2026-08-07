@@ -240,6 +240,7 @@ mod tests {
     #[test]
     fn request_uses_gpt_image_two_and_omits_empty_compression() {
         let args = GenerateArgs {
+            request_file: None,
             provider: crate::cli::Provider::Api,
             prompt: Some("test".to_owned()),
             prompt_file: None,

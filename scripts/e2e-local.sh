@@ -38,6 +38,7 @@ key_env="OPENAI_""API_KEY"
 env "$key_env=local-e2e-key" \
   cargo run --quiet -- \
     generate \
+    --provider api \
     --prompt "offline local E2E verification image" \
     --output-dir "$OUTPUT_DIR" \
     --name verification \

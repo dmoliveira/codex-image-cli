@@ -1,6 +1,8 @@
 use std::{
+    fs,
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
+    path::Path,
     process::{Command, Stdio},
     thread::{self, JoinHandle},
     time::Duration,
@@ -114,6 +116,186 @@ fn safe_tempdir() -> tempfile::TempDir {
         .prefix(".codex-image-test-")
         .tempdir_in(env!("CARGO_MANIFEST_DIR"))
         .unwrap()
+}
+
+#[cfg(unix)]
+fn fake_codex_script(directory: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = directory.join("fake-codex");
+    fs::write(
+        &script,
+        r##"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex-cli fake"
+  exit 0
+fi
+if [ "$1" = "login" ]; then
+  echo "Logged in using ChatGPT"
+  exit 0
+fi
+if [ "$1" = "exec" ]; then
+  if [ "${FAKE_CODEX_MODE:-success}" = "fail" ]; then exit 9; fi
+  if [ "${FAKE_CODEX_MODE:-success}" = "hang" ]; then
+    (sleep 10) &
+    wait
+  fi
+  request=""
+  for argument in "$@"; do request="$argument"; done
+  request_path=$(printf '%s\n' "$request" | sed -n 's/.*request at \([^ ]*\).*/\1/p' | sed 's/[.]$//')
+  request=$(cat "$request_path")
+  printf '%s' "$request" > "$FAKE_CODEX_REQUEST"
+  path=$(printf '%s\n' "$request" | sed -n 's/.*"artifact_path":"\([^"]*\)".*/\1/p')
+  if [ -z "$path" ]; then exit 3; fi
+  if [ -n "${OPENAI_API_KEY:-}" ]; then exit 4; fi
+  cp "$FAKE_CODEX_IMAGE" "$path"
+  exit 0
+fi
+exit 2
+"##,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&script, permissions).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_provider_uses_fake_structured_request_without_api_key() {
+    let fixture_dir = safe_tempdir();
+    let fixture = fixture_dir.path().join("fixture.png");
+    fs::write(&fixture, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+    let request_log = fixture_dir.path().join("request.txt");
+    let codex = fake_codex_script(fixture_dir.path());
+    let output_dir = safe_tempdir();
+    let output = command()
+        .env("CODEX_CLI_PATH", &codex)
+        .env("FAKE_CODEX_IMAGE", &fixture)
+        .env("FAKE_CODEX_REQUEST", &request_log)
+        .env("OPENAI_API_KEY", "must-not-reach-codex")
+        .args([
+            "generate",
+            "--prompt",
+            "quoted \"prompt\"\n日本語",
+            "--output-dir",
+            output_dir.path().to_str().unwrap(),
+            "--name",
+            "fox",
+            "--size",
+            "1024x1024",
+            "--quality",
+            "high",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["request"]["provider"], "codex");
+    assert!(report["http"].get("status").is_none());
+    assert_eq!(
+        fs::read(output_dir.path().join("fox.png")).unwrap(),
+        b"\x89PNG\r\n\x1a\nfixture"
+    );
+    let instruction = fs::read_to_string(request_log).unwrap();
+    let request: Value = serde_json::from_str(instruction.lines().last().unwrap()).unwrap();
+    assert_eq!(request["prompt"], "quoted \"prompt\"\n日本語");
+    assert_eq!(request["size"], "1024x1024");
+    assert_eq!(request["quality"], "high");
+}
+
+#[test]
+fn request_file_resolves_structured_generation_parameters() {
+    let directory = safe_tempdir();
+    let request_file = directory.path().join("request.json");
+    fs::write(
+        &request_file,
+        r#"{"schema_version":1,"prompt":"structured prompt","provider":"api","n":1,"format":"png","size":"1024x1024","quality":"high"}"#,
+    )
+    .unwrap();
+    let output = command()
+        .args([
+            "generate",
+            "--request-file",
+            request_file.to_str().unwrap(),
+            "--output-dir",
+            directory.path().to_str().unwrap(),
+            "--name",
+            "request",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["request"]["provider"], "api");
+    assert_eq!(report["request"]["model"], "gpt-image-2");
+}
+
+#[test]
+fn request_file_rejects_unknown_fields_and_stdin() {
+    let directory = safe_tempdir();
+    let request_file = directory.path().join("unknown.json");
+    fs::write(
+        &request_file,
+        r#"{"schema_version":1,"prompt":"x","unexpected":"nope"}"#,
+    )
+    .unwrap();
+    let unknown = command()
+        .args([
+            "generate",
+            "--request-file",
+            request_file.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(unknown.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&unknown.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "request_file_invalid_json");
+
+    let stdin_request = command()
+        .args(["generate", "--request-file", "-", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(stdin_request.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&stdin_request.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "request_file_stdin_not_supported");
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_timeout_reports_non_retryable_process_metadata() {
+    let fixture_dir = safe_tempdir();
+    let codex = fake_codex_script(fixture_dir.path());
+    let output_dir = safe_tempdir();
+    let output = command()
+        .env("CODEX_CLI_PATH", &codex)
+        .env("FAKE_CODEX_MODE", "hang")
+        .args([
+            "generate",
+            "--prompt",
+            "timeout test",
+            "--output-dir",
+            output_dir.path().to_str().unwrap(),
+            "--name",
+            "timeout",
+            "--timeout-seconds",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "codex_generation_timeout");
+    assert_eq!(report["error"]["process_timed_out"], true);
+    assert_eq!(report["error"]["automatic_retry_safe"], false);
 }
 
 #[test]
@@ -374,29 +556,20 @@ fn malformed_multi_image_response_publishes_no_partial_files() {
 
 #[test]
 fn doctor_and_missing_codex_are_machine_safe_and_non_interactive() {
+    let fake_dir = safe_tempdir();
+    let fake_codex = fake_codex_script(fake_dir.path());
     let doctor = command()
+        .env("CODEX_CLI_PATH", &fake_codex)
         .env_remove("OPENAI_API_KEY")
         .args(["doctor", "--json"])
         .output()
         .unwrap();
-    let codex_available = Command::new("codex")
-        .arg("--version")
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert_eq!(doctor.status.success(), codex_available);
+    assert!(doctor.status.success());
     assert!(doctor.stderr.is_empty());
     let doctor_report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
-    assert_eq!(
-        doctor_report["status"],
-        if codex_available {
-            "local_configuration_ready"
-        } else {
-            "local_configuration_required"
-        }
-    );
+    assert_eq!(doctor_report["status"], "local_configuration_ready");
     assert_eq!(doctor_report["checks"][0]["name"], "CODEX_CLI");
+    assert_eq!(doctor_report["checks"][1]["status"], "logged_in");
 
     let directory = safe_tempdir();
     let missing_key = command()
@@ -434,7 +607,7 @@ fn clap_parse_failure_respects_the_json_contract() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["status"], "usage_error");
     assert_eq!(report["error"]["code"], "cli_parse_error");
     assert_eq!(report["request"]["attempted"], false);

@@ -2,8 +2,9 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::cli::Provider;
+use crate::provider;
 
-pub const SCHEMA_VERSION: u8 = 1;
+pub const SCHEMA_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -46,6 +47,12 @@ pub struct AppError {
     pub message: String,
     pub request_id: Option<String>,
     pub http_status: Option<u16>,
+    pub provider: Option<Provider>,
+    pub image_count: Option<u8>,
+    pub process_exit_code: Option<i32>,
+    pub process_timed_out: bool,
+    pub process_diagnostics_bytes: usize,
+    pub process_diagnostics_truncated: bool,
     pub possibly_modified_paths: Vec<PathBuf>,
 }
 
@@ -57,6 +64,12 @@ impl AppError {
             message: message.into(),
             request_id: None,
             http_status: None,
+            provider: None,
+            image_count: None,
+            process_exit_code: None,
+            process_timed_out: false,
+            process_diagnostics_bytes: 0,
+            process_diagnostics_truncated: false,
             possibly_modified_paths: Vec::new(),
         }
     }
@@ -101,6 +114,27 @@ impl AppError {
         self.http_status = Some(status);
     }
 
+    pub fn set_provider(&mut self, provider: Provider) {
+        self.provider = Some(provider);
+    }
+
+    pub fn set_image_count(&mut self, image_count: u8) {
+        self.image_count = Some(image_count);
+    }
+
+    pub fn set_process_metadata(
+        &mut self,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        diagnostics_bytes: usize,
+        diagnostics_truncated: bool,
+    ) {
+        self.process_exit_code = exit_code;
+        self.process_timed_out = timed_out;
+        self.process_diagnostics_bytes = diagnostics_bytes;
+        self.process_diagnostics_truncated = diagnostics_truncated;
+    }
+
     pub fn add_possibly_modified_paths(&mut self, paths: Vec<PathBuf>) {
         self.possibly_modified_paths.extend(paths);
         self.possibly_modified_paths.sort();
@@ -121,9 +155,9 @@ impl AppError {
                         | Status::InvalidSuccessResponse
                         | Status::OutputCommitFailed
                 ),
-                image_count,
-                model: "gpt-image-2",
-                provider: "unknown",
+                image_count: self.image_count.unwrap_or(image_count),
+                model: self.provider.and_then(provider::model),
+                provider: self.provider.map(Provider::as_str),
                 request_id: self.request_id.clone(),
             },
             http: HttpInfo {
@@ -136,6 +170,10 @@ impl AppError {
                 code: self.code,
                 message: self.message.clone(),
                 automatic_retry_safe: false,
+                process_exit_code: self.process_exit_code,
+                process_timed_out: self.process_timed_out,
+                diagnostics_bytes: self.process_diagnostics_bytes,
+                diagnostics_truncated: self.process_diagnostics_truncated,
             }),
         }
     }
@@ -167,8 +205,8 @@ impl RunReport {
             request: RequestInfo {
                 attempted: false,
                 image_count,
-                model: "gpt-image-2",
-                provider: provider.as_str(),
+                model: provider::model(provider),
+                provider: Some(provider.as_str()),
                 request_id: None,
             },
             http: HttpInfo { status: None },
@@ -195,8 +233,8 @@ impl RunReport {
             request: RequestInfo {
                 attempted: true,
                 image_count,
-                model: "gpt-image-2",
-                provider: provider.as_str(),
+                model: provider::model(provider),
+                provider: Some(provider.as_str()),
                 request_id,
             },
             http: HttpInfo {
@@ -214,8 +252,10 @@ impl RunReport {
 pub struct RequestInfo {
     pub attempted: bool,
     pub image_count: u8,
-    pub model: &'static str,
-    pub provider: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
@@ -231,6 +271,22 @@ pub struct ErrorInfo {
     pub code: &'static str,
     pub message: String,
     pub automatic_retry_safe: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub process_timed_out: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub diagnostics_bytes: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub diagnostics_truncated: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 pub fn path_strings(paths: &[PathBuf]) -> Vec<String> {
