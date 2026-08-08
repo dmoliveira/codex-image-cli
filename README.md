@@ -209,7 +209,9 @@ codex-image batch retrieve \
 
 Use `batch cancel --job-file FILE --json` when cancellation is appropriate. The job record contains remote IDs and recovery state but never stores the prompt, API key, or image data. Batch output is configured to expire after 30 days; retrieve results before expiry. Inspect `retained_artifacts` and `possibly_modified_paths` before any cleanup.
 
-For a custom endpoint, repeat its exact `--dangerously-allow-api-key-to ORIGIN` approval on each status/retrieve/cancel command. For loopback test endpoints, repeat `--allow-insecure-localhost`; trust approvals are intentionally not taken from an editable job file.
+For a custom endpoint, repeat its exact `--dangerously-allow-api-key-to ORIGIN` approval on each status/retrieve/cancel/recover command. For loopback test endpoints, repeat `--allow-insecure-localhost`; trust approvals are intentionally not taken from an editable job file.
+
+Use `batch recover --job-file FILE --json` for a job left in the safe `input_uploaded` state. For an unknown upload outcome, first inspect the remote Files API and pass `--input-file-id FILE_ID`; for an unknown create outcome, inspect the remote Batches API and pass `--batch-id BATCH_ID`. These explicit reconciliation flags never cause an automatic upload or duplicate creation.
 
 ### Endpoint overrides (advanced) 🔐
 
@@ -246,7 +248,7 @@ The CLI rejects non-loopback HTTP, embedded URL credentials, query/fragment URLs
 | 7 | `output_commit_failed` | Valid returned data could not be completely published. **Do not retry automatically.** |
 | 8 | `batch_not_ready` | A Batch job is still processing or exceeded its bounded wait. Query it again later. |
 | 9 | `batch_observation_failed` | A read-only Batch status or output observation failed; retrying the observation is safe. |
-| 10 | `batch_failed` | A Batch reached a failed or expired terminal state; inspect its error file before deciding what to do next. |
+| 10 | `batch_failed` | A Batch reached a failed or expired terminal state, or its output expired; inspect its error/output file before deciding what to do next. |
 
 For codes 5–7, check API activity and inspect any `possibly_modified_paths` in JSON before deciding what to do next. Successful overwrites expose private backup paths in `retained_artifacts`; error paths retain only private transaction artifacts rather than performing unsafe pathname cleanup. Batch submission and cancellation outcomes are also never automatically retried. See [the complete contract](docs/API-CONTRACT.md).
 

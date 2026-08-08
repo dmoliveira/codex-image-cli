@@ -69,6 +69,7 @@ fn main() {
             BatchCommand::Status(args) => emit_batch(batch::status(&args), cli.json),
             BatchCommand::Retrieve(args) => emit_batch(batch::retrieve(&args), cli.json),
             BatchCommand::Cancel(args) => emit_batch(batch::cancel(&args), cli.json),
+            BatchCommand::Recover(args) => emit_batch(batch::recover(&args), cli.json),
         },
         Command::Doctor => run_doctor(cli.json),
         Command::AiHelp => run_ai_help(cli.json),
@@ -380,7 +381,7 @@ fn run_ai_help(json: bool) -> i32 {
             "Use --name only for one image; use --prefix for deterministic multi-image names.",
             "Never retry exit code 5, 6, or 7 automatically because a generation may have been billed.",
             "Use --confirm-high-quality with --quality high after reviewing the approximate cost warning.",
-            "Batch commands require --provider api; persist the returned job file and use batch status, retrieve, or cancel.",
+            "Batch commands require --provider api; persist the returned job file and use batch status, retrieve, cancel, or recover.",
             "Repeat custom-origin or loopback approval flags on each Batch operation; editable job files never grant credential-destination approval.",
         ],
     };

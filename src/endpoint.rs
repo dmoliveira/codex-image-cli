@@ -107,6 +107,11 @@ impl Endpoint {
         self.url_for(&format!("files/{file_id}/content"))
     }
 
+    pub fn file_url(&self, file_id: &str) -> Result<Url, AppError> {
+        validate_remote_id(file_id, "file_id")?;
+        self.url_for(&format!("files/{file_id}"))
+    }
+
     fn url_for(&self, path: &str) -> Result<Url, AppError> {
         self.base.join(path).map_err(|_| {
             AppError::usage(

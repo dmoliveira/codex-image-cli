@@ -27,7 +27,7 @@ codex-image generate \
   --dry-run \
   --json
 
-# Generate through the authenticated Codex subscription after the dry run is correct.
+# Generate through the direct Image API after the dry run is correct.
 codex-image generate \
   --prompt "<prompt>" \
   --output-dir ./artifacts/design \
@@ -36,7 +36,7 @@ codex-image generate \
   --json
 ```
 
-Use `--provider api` and set `OPENAI_API_KEY` explicitly when selecting API billing. Prefer `--request-file FILE` for typed generation parameters; keep endpoint and overwrite approvals on CLI flags.
+Use `--provider codex` for the authenticated Codex subscription, or omit it for the direct Image API and set `OPENAI_API_KEY` explicitly. Prefer `--request-file FILE` for typed generation parameters; keep endpoint and overwrite approvals on CLI flags. Use `batch recover` for explicit reconciliation of unknown Batch POST outcomes; it never retries an unknown POST and may create once only from a confirmed uploaded-input state.
 
 Create `--output-dir` explicitly. It must exist and contain no symlinked path components. Use `--name` only for a single image; use `--prefix` for deterministic multi-image names. Parse `retained_artifacts` and `possibly_modified_paths` before taking any cleanup action; the CLI deliberately avoids unsafe automatic deletion in a concurrently writable directory.
 

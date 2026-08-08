@@ -188,7 +188,7 @@ fn spawn_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
         let mut custom_ids = Vec::new();
-        for index in 0..5 {
+        for index in 0..6 {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_raw_request(&mut stream);
             if index == 0 {
@@ -203,6 +203,20 @@ fn spawn_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
                     r#"{"id":"batch-test","status":"completed","input_file_id":"file-input","output_file_id":"file-output"}"#.to_owned()
                 }
                 (4, "/v1/files/file-output/content") => custom_ids
+                    .iter()
+                    .map(|custom_id| {
+                        serde_json::json!({
+                            "custom_id": custom_id,
+                            "response": {
+                                "status_code": 200,
+                                "body": {"data": [{"b64_json": PNG_BASE64}]}
+                            }
+                        })
+                        .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                (5, "/v1/files/file-output/content") => custom_ids
                     .iter()
                     .map(|custom_id| {
                         serde_json::json!({
@@ -842,6 +856,29 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
         2
     );
 
+    let mut crashed_job: Value =
+        serde_json::from_str(&fs::read_to_string(&job_file).unwrap()).unwrap();
+    crashed_job["state"] = serde_json::json!("publishing");
+    crashed_job["retained_artifacts"] = crashed_job["publishing"]["retained_artifacts"].clone();
+    fs::write(&job_file, serde_json::to_vec_pretty(&crashed_job).unwrap()).unwrap();
+    fs::remove_file(output_dir.join("fox-01.png")).unwrap();
+    let recovered = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(recovered.status.success(), "{recovered:?}");
+    let recovered_report: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered_report["status"], "retrieved");
+    assert!(output_dir.join("fox-01.png").exists());
+
     let cancel = command()
         .env_remove("OPENAI_API_KEY")
         .args([
@@ -858,7 +895,7 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     assert_eq!(cancel_report["error"]["code"], "batch_already_terminal");
 
     let requests = server.join().unwrap();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 6);
     assert_eq!(requests[0].method, "POST");
     assert_eq!(requests[0].path, "/v1/files");
     assert!(String::from_utf8_lossy(&requests[0].body).contains("purpose"));
@@ -936,4 +973,69 @@ fn batch_request_file_resolves_during_dry_run_without_a_key() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "dry_run");
     assert_eq!(report["outputs"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn batch_recover_resumes_only_the_confirmed_input_uploaded_state() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let job_file = directory.path().join("recover-job.json");
+    let (url, server) = spawn_server(
+        "200 OK",
+        r#"{"id":"batch-recovered","status":"validating","input_file_id":"file-input"}"#.to_owned(),
+    );
+    let job = serde_json::json!({
+        "schema_version": 6,
+        "revision": 0,
+        "job_id": "job-recover",
+        "state": "input_uploaded",
+        "provider": "api",
+        "model": "gpt-image-2",
+        "api_base_url": url,
+        "output_dir": output_dir,
+        "output_names": ["fox.png"],
+        "overwrite": false,
+        "format": "png",
+        "image_count": 1,
+        "quality": "low",
+        "size": "auto",
+        "background": "auto",
+        "moderation": "auto",
+        "custom_ids": ["job-recover-00"],
+        "input_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "input_bytes": 1,
+        "input_file_id": "file-input",
+        "batch_id": null,
+        "output_file_id": null,
+        "error_file_id": null,
+        "remote_status": null,
+        "request_counts": null,
+        "publishing": null,
+        "retained_artifacts": [],
+        "created_at": 0,
+        "updated_at": 0
+    });
+    fs::write(&job_file, serde_json::to_vec_pretty(&job).unwrap()).unwrap();
+
+    let output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "recover",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["batch_id"], "batch-recovered");
+    assert_eq!(report["status"], "validating");
+    let request = server.join().unwrap();
+    assert!(request.authorization_was_present);
+    let saved: Value = serde_json::from_slice(&fs::read(&job_file).unwrap()).unwrap();
+    assert_eq!(saved["state"], "submitted");
 }

@@ -72,8 +72,9 @@ codex-image batch retrieve \
 - **No credential argument:** keys belong in the child process environment only.
 - **No hidden retry:** one command makes at most one image-generation operation.
 - **Batch recovery:** `batch submit` persists a job file; use `batch status`, `batch retrieve`, or `batch cancel` instead of resubmitting an unknown POST.
+- **Explicit reconciliation:** use `batch recover` with a manually verified `--input-file-id` or `--batch-id` for unknown POST outcomes. It never retries the unknown POST, and may issue one new creation POST only from the confirmed `input_uploaded` state.
 - **Endpoint trust:** repeat exact custom-origin or loopback approval flags on each Batch operation; never treat an editable job file as credential-destination approval.
-- **No unsafe cleanup:** private stages are reserved before the POST. A known non-overwrite collision yields code 3 and no request; a later competing target is protected by atomic no-clobber publication.
+- **No unsafe cleanup:** synchronous `generate` reserves private stages before its billable POST, so a known non-overwrite collision yields code 3 and no request. Batch output collisions are checked during retrieval, after remote Batch work may already have been billed; atomic no-clobber publication still protects competing writers.
 - **No silent partial success:** every returned image must decode and match the requested PNG/JPEG/WebP container before publishing. Multi-file publishing cannot be atomically visible as a set, so an error reports possibly modified/retained paths instead of claiming success or deleting a concurrent replacement.
 - **Provider choice:** the default selects API billing through `OPENAI_API_KEY`; `--provider codex` explicitly selects the authenticated Codex CLI subscription.
 - **Quality gate:** `low` is the default; `--quality high` requires `--confirm-high-quality` after reviewing the cost warning.

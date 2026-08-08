@@ -54,6 +54,8 @@ pub enum BatchCommand {
     Retrieve(BatchRetrieveArgs),
     /// Request cancellation for one persisted Batch job.
     Cancel(BatchCancelArgs),
+    /// Resume a safe local state or attach a manually reconciled remote ID.
+    Recover(Box<BatchRecoverArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -107,6 +109,20 @@ pub struct BatchRetrieveArgs {
 pub struct BatchCancelArgs {
     #[command(flatten)]
     pub job: BatchJobArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct BatchRecoverArgs {
+    #[command(flatten)]
+    pub job: BatchJobArgs,
+
+    /// Confirmed remote input file ID after inspecting the account/files API.
+    #[arg(long, value_name = "FILE_ID", conflicts_with = "batch_id")]
+    pub input_file_id: Option<String>,
+
+    /// Confirmed remote Batch ID after inspecting the account/Batches API.
+    #[arg(long, value_name = "BATCH_ID", conflicts_with = "input_file_id")]
+    pub batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]

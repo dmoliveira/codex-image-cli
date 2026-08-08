@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     env,
     fs::{self, File, OpenOptions},
     io::Write,
@@ -15,21 +15,25 @@ use sha2::{Digest, Sha256};
 use crate::{
     api::{
         ApiClient, BatchCreateRequest, BatchInfo, BatchRequestCounts, FileInfo,
-        ImageGenerationRequest, OutputExpiresAfter, MAX_BATCH_CONTENT_BYTES,
+        ImageGenerationRequest, OutputExpiresAfter, MAX_BATCH_CONTENT_BYTES, MAX_BATCH_INPUT_BYTES,
     },
     cli::{
-        BatchCancelArgs, BatchJobArgs, BatchRetrieveArgs, BatchSubmitArgs, GenerateArgs,
-        OutputFormat, Provider,
+        BatchCancelArgs, BatchJobArgs, BatchRecoverArgs, BatchRetrieveArgs, BatchSubmitArgs,
+        GenerateArgs, OutputFormat, Provider,
     },
     endpoint::{validate_remote_id, Endpoint},
-    image::decode_images,
-    output::{derive_file_names, derive_output_paths, OutputTransaction},
+    image::decode_base64_image,
+    output::{
+        derive_file_names, derive_output_paths, inspect_recovery_plan, read_regular_file,
+        read_regular_file_with_identity, verify_and_sync_plan, OutputIdentity, OutputTransaction,
+        OutputVerificationArtifact, RecoveryArtifact, RecoveryVerificationArtifact,
+    },
     report::{AppError, BatchContext, BatchReport},
     MODEL,
 };
 
-pub const JOB_SCHEMA_VERSION: u8 = 2;
-const MAX_BATCH_INPUT_BYTES: usize = 8 * 1024 * 1024;
+pub const JOB_SCHEMA_VERSION: u8 = 6;
+const MAX_JOB_FILE_BYTES: usize = 256 * 1024;
 const MAX_RESULT_LINE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_OUTPUT_EXPIRY_SECONDS: u32 = 30 * 24 * 60 * 60;
 
@@ -53,6 +57,7 @@ pub enum JobState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchJob {
     pub schema_version: u8,
     pub revision: u64,
@@ -71,12 +76,14 @@ pub struct BatchJob {
     pub background: crate::cli::Background,
     pub moderation: crate::cli::Moderation,
     pub custom_ids: Vec<String>,
+    pub input_sha256: String,
+    pub input_bytes: u64,
     pub input_file_id: Option<String>,
     pub batch_id: Option<String>,
     pub output_file_id: Option<String>,
     pub error_file_id: Option<String>,
     pub remote_status: Option<String>,
-    pub request_counts: Option<BatchRequestCounts>,
+    pub request_counts: Option<PersistedBatchRequestCounts>,
     pub publishing: Option<PublishingPlan>,
     pub retained_artifacts: Vec<String>,
     pub created_at: u64,
@@ -84,14 +91,49 @@ pub struct BatchJob {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PublishingPlan {
-    pub artifacts: Vec<PublishingArtifact>,
+#[serde(deny_unknown_fields)]
+pub struct PersistedBatchRequestCounts {
+    pub completed: u32,
+    pub failed: u32,
+    pub total: u32,
+}
+
+impl From<BatchRequestCounts> for PersistedBatchRequestCounts {
+    fn from(counts: BatchRequestCounts) -> Self {
+        Self {
+            completed: counts.completed,
+            failed: counts.failed,
+            total: counts.total,
+        }
+    }
+}
+
+impl From<&PersistedBatchRequestCounts> for BatchRequestCounts {
+    fn from(counts: &PersistedBatchRequestCounts) -> Self {
+        Self {
+            completed: counts.completed,
+            failed: counts.failed,
+            total: counts.total,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishingPlan {
+    pub artifacts: Vec<PublishingArtifact>,
+    pub staged_artifacts: Vec<String>,
+    pub retained_artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishingArtifact {
     pub path: String,
     pub sha256: String,
+    pub staged_path: String,
+    pub staged_identity: OutputIdentity,
+    pub expected_target: Option<OutputIdentity>,
 }
 
 #[derive(Debug)]
@@ -184,6 +226,8 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         background: generation.background,
         moderation: generation.moderation,
         custom_ids,
+        input_sha256: sha256(&input),
+        input_bytes: input.len() as u64,
         input_file_id: None,
         batch_id: None,
         output_file_id: None,
@@ -368,34 +412,38 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
             ));
         }
     };
-    let batch_info: BatchInfo = match parse_batch_create_info(&created.body, &file_info.id) {
-        Ok(info) => info,
-        Err(error) => {
-            let error = mark_unknown(
-                &job_file,
-                create_in_flight.revision,
-                JobState::CreateOutcomeUnknown,
-                error,
-            );
-            return Err(failure(
-                error,
-                "batch.submit",
-                Some(context_for_job(
-                    &base_context,
-                    &job_id,
-                    Some(&file_info.id),
-                    Some(&job_file),
-                )),
-            ));
-        }
-    };
+    let batch_info: BatchInfo =
+        match parse_batch_create_info(&created.body, &file_info.id, generation.n) {
+            Ok(info) => info,
+            Err(error) => {
+                let error = mark_unknown(
+                    &job_file,
+                    create_in_flight.revision,
+                    JobState::CreateOutcomeUnknown,
+                    error,
+                );
+                return Err(failure(
+                    error,
+                    "batch.submit",
+                    Some(context_for_job(
+                        &base_context,
+                        &job_id,
+                        Some(&file_info.id),
+                        Some(&job_file),
+                    )),
+                ));
+            }
+        };
     job = transition_if_revision(&job_file, create_in_flight.revision, |job| {
-        job.state = JobState::Submitted;
+        job.state = state_for_remote_status(&batch_info.status);
         job.batch_id = Some(batch_info.id.clone());
         job.remote_status = Some(batch_info.status.clone());
         job.output_file_id = batch_info.output_file_id.clone();
         job.error_file_id = batch_info.error_file_id.clone();
-        job.request_counts = batch_info.request_counts.clone();
+        job.request_counts = batch_info
+            .request_counts
+            .clone()
+            .map(PersistedBatchRequestCounts::from);
         Ok(())
     })
     .map_err(|error| {
@@ -425,9 +473,292 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     report_context.error_file_id = job.error_file_id.clone();
     report_context.http_status = Some(created.status);
     report_context.request_id = created.request_id;
+    if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
+        report_context.next_action =
+            Some("inspect the Batch error file and run batch status".to_owned());
+        return Err(BatchFailure::new(
+            terminal_batch_error(job.remote_status.as_deref().unwrap_or_default()),
+            report_context,
+        ));
+    }
     report_context.next_action =
         Some("run batch status or batch retrieve with this job file".to_owned());
     Ok(report_context.report(None))
+}
+
+pub fn recover(args: &BatchRecoverArgs) -> Result<BatchReport, BatchFailure> {
+    validate_timeout(args.job.timeout_seconds)
+        .map_err(|error| failure(error, "batch.recover", None))?;
+    let (job_file, mut job) = load_job(&args.job, "batch.recover")?;
+    let mut context = context_from_job("batch.recover", &job_file, &job);
+
+    if let Some(input_file_id) = args.input_file_id.as_deref() {
+        validate_remote_id(input_file_id, "input_file_id")
+            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        if !matches!(
+            job.state,
+            JobState::UploadInFlight | JobState::UploadOutcomeUnknown
+        ) {
+            return Err(BatchFailure::new(
+                AppError::preflight(
+                    "batch_input_recovery_not_applicable",
+                    "--input-file-id is only valid for a job whose upload outcome is unknown.",
+                ),
+                context,
+            ));
+        }
+        let endpoint = endpoint_from_job(&job, &context, &args.job)?;
+        let key = api_key().map_err(|error| BatchFailure::new(error, context.clone()))?;
+        let client = ApiClient::new(args.job.timeout_seconds)
+            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        context.attempted = true;
+        let response = client
+            .get_file(&endpoint, &key, input_file_id)
+            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        let file_info: FileInfo = serde_json::from_slice(&response.body).map_err(|_| {
+            BatchFailure::new(
+                AppError::observation(
+                    "batch_input_file_invalid",
+                    "The confirmed input file lookup returned an invalid file object; retrying the read-only operation is safe.",
+                ),
+                context.clone(),
+            )
+        })?;
+        if file_info.id != input_file_id || file_info.purpose.as_deref() != Some("batch") {
+            return Err(BatchFailure::new(
+                AppError::observation(
+                    "batch_input_file_mismatch",
+                    "The confirmed input file is not a Batch-purpose file owned by the expected remote ID; retrying the read-only operation is safe.",
+                ),
+                context,
+            ));
+        }
+        let content = client
+            .get_input_file_content(&endpoint, &key, input_file_id)
+            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        context.http_status = Some(content.status);
+        context.request_id = content.request_id;
+        if content.body.len() as u64 != job.input_bytes || sha256(&content.body) != job.input_sha256
+        {
+            return Err(BatchFailure::new(
+                AppError::observation(
+                    "batch_input_file_content_mismatch",
+                    "The confirmed input file content does not match the persisted request fingerprint; retrying the read-only operation is safe.",
+                ),
+                context,
+            ));
+        }
+        job = transition_if_revision(&job_file, job.revision, |job| {
+            job.state = JobState::InputUploaded;
+            job.input_file_id = Some(input_file_id.to_owned());
+            Ok(())
+        })
+        .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    }
+
+    if let Some(batch_id) = args.batch_id.as_deref() {
+        validate_remote_id(batch_id, "batch_id")
+            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        if !matches!(
+            job.state,
+            JobState::CreateInFlight | JobState::CreateOutcomeUnknown
+        ) {
+            return Err(BatchFailure::new(
+                AppError::preflight(
+                    "batch_creation_recovery_not_applicable",
+                    "--batch-id is only valid for a job whose Batch creation outcome is unknown.",
+                ),
+                context,
+            ));
+        }
+        let endpoint = endpoint_from_job(&job, &context, &args.job)?;
+        let key = api_key().map_err(|error| BatchFailure::new(error, context.clone()))?;
+        let client = ApiClient::new(args.job.timeout_seconds)
+            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        context.attempted = true;
+        let response = client
+            .get_batch(&endpoint, &key, batch_id)
+            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        let info = parse_batch_info(
+            &response.body,
+            Some(batch_id),
+            job.input_file_id.as_deref(),
+            job.image_count,
+        )
+        .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        validate_remote_transition(&job, &info)
+            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        job = persist_batch_observation(
+            &job_file,
+            &job,
+            &info,
+            response.status,
+            response.request_id.clone(),
+            &context,
+        )?;
+        context = context_from_job("batch.recover", &job_file, &job);
+        context.attempted = true;
+        context.http_status = Some(response.status);
+        context.request_id = response.request_id;
+        if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
+            context.next_action =
+                Some("inspect the Batch error file and run batch status".to_owned());
+            return Err(BatchFailure::new(
+                terminal_batch_error(job.remote_status.as_deref().unwrap_or_default()),
+                context,
+            ));
+        }
+        context.next_action =
+            Some("run batch status or batch retrieve with this job file".to_owned());
+        return Ok(context.report(None));
+    }
+
+    if job.state == JobState::InputUploaded {
+        return create_batch_from_job(&args.job, &job_file, job);
+    }
+    if matches!(
+        job.state,
+        JobState::UploadInFlight | JobState::UploadOutcomeUnknown
+    ) {
+        return Err(BatchFailure::new(
+            AppError::preflight(
+                "batch_input_reconciliation_required",
+                "The upload outcome is unknown. Inspect the remote files API, then rerun batch recover with the confirmed --input-file-id; no upload was retried.",
+            ),
+            context,
+        ));
+    }
+    if matches!(
+        job.state,
+        JobState::CreateInFlight | JobState::CreateOutcomeUnknown
+    ) {
+        return Err(BatchFailure::new(
+            AppError::preflight(
+                "batch_creation_reconciliation_required",
+                "The Batch creation outcome is unknown. Inspect the remote Batches API, then rerun batch recover with the confirmed --batch-id; no creation was retried.",
+            ),
+            context,
+        ));
+    }
+    if job.state == JobState::Prepared {
+        return Err(BatchFailure::new(
+            AppError::preflight(
+                "batch_prompt_not_persisted",
+                "This prepared job has no persisted prompt or input file. Rerun batch submit with the original prompt instead of resubmitting this job record.",
+            ),
+            context,
+        ));
+    }
+    Ok(context.report(None))
+}
+
+fn create_batch_from_job(
+    args: &BatchJobArgs,
+    job_file: &Path,
+    mut job: BatchJob,
+) -> Result<BatchReport, BatchFailure> {
+    let mut context = context_from_job("batch.recover", job_file, &job);
+    let input_file_id = job.input_file_id.clone().ok_or_else(|| {
+        BatchFailure::new(
+            AppError::preflight(
+                "batch_input_file_missing",
+                "The recoverable job has no confirmed input file ID.",
+            ),
+            context.clone(),
+        )
+    })?;
+    let endpoint = endpoint_from_job(&job, &context, args)?;
+    let key = api_key().map_err(|error| BatchFailure::new(error, context.clone()))?;
+    let client = ApiClient::new(args.timeout_seconds)
+        .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    let create_in_flight = transition_if_revision(job_file, job.revision, |job| {
+        job.state = JobState::CreateInFlight;
+        Ok(())
+    })
+    .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    let request = BatchCreateRequest {
+        input_file_id: &input_file_id,
+        endpoint: "/v1/images/generations",
+        completion_window: "24h",
+        output_expires_after: OutputExpiresAfter {
+            anchor: "created_at",
+            seconds: DEFAULT_OUTPUT_EXPIRY_SECONDS,
+        },
+    };
+    context.attempted = true;
+    let response = match client.create_batch(&endpoint, &key, &request) {
+        Ok(response) => response,
+        Err(error) => {
+            let error = mark_unknown(
+                job_file,
+                create_in_flight.revision,
+                JobState::CreateOutcomeUnknown,
+                error,
+            );
+            return Err(BatchFailure::new(error, context));
+        }
+    };
+    let info = match parse_batch_create_info(&response.body, &input_file_id, job.image_count) {
+        Ok(info) => info,
+        Err(error) => {
+            let error = mark_unknown(
+                job_file,
+                create_in_flight.revision,
+                JobState::CreateOutcomeUnknown,
+                error,
+            );
+            return Err(BatchFailure::new(error, context));
+        }
+    };
+    job = persist_batch_observation(
+        job_file,
+        &create_in_flight,
+        &info,
+        response.status,
+        response.request_id.clone(),
+        &context,
+    )?;
+    context = context_from_job("batch.recover", job_file, &job);
+    context.attempted = true;
+    context.http_status = Some(response.status);
+    context.request_id = response.request_id;
+    if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
+        context.next_action = Some("inspect the Batch error file and run batch status".to_owned());
+        return Err(BatchFailure::new(
+            terminal_batch_error(job.remote_status.as_deref().unwrap_or_default()),
+            context,
+        ));
+    }
+    context.next_action = Some("run batch status or batch retrieve with this job file".to_owned());
+    Ok(context.report(None))
+}
+
+fn persist_batch_observation(
+    job_file: &Path,
+    job: &BatchJob,
+    info: &BatchInfo,
+    http_status: u16,
+    request_id: Option<String>,
+    context: &BatchContext,
+) -> Result<BatchJob, BatchFailure> {
+    transition_if_revision(job_file, job.revision, |job| {
+        job.state = state_for_remote_status(&info.status);
+        job.batch_id = Some(info.id.clone());
+        job.remote_status = Some(info.status.clone());
+        job.output_file_id = info.output_file_id.clone();
+        job.error_file_id = info.error_file_id.clone();
+        job.request_counts = info
+            .request_counts
+            .clone()
+            .map(PersistedBatchRequestCounts::from);
+        Ok(())
+    })
+    .map_err(|error| {
+        let mut recovery_error = state_persistence_error("Batch reconciliation", &info.id, error);
+        recovery_error.set_http_status(http_status);
+        recovery_error.set_request_id(request_id);
+        BatchFailure::new(recovery_error, context.clone())
+    })
 }
 
 pub fn status(args: &BatchJobArgs) -> Result<BatchReport, BatchFailure> {
@@ -453,6 +784,7 @@ pub fn status(args: &BatchJobArgs) -> Result<BatchReport, BatchFailure> {
         &response.body,
         Some(&batch_id),
         job.input_file_id.as_deref(),
+        job.image_count,
     )
     .map_err(|error| BatchFailure::new(error, context.clone()))?;
     validate_remote_transition(&job, &info)
@@ -464,7 +796,10 @@ pub fn status(args: &BatchJobArgs) -> Result<BatchReport, BatchFailure> {
         job.remote_status = Some(info.status.clone());
         job.output_file_id = info.output_file_id.clone();
         job.error_file_id = info.error_file_id.clone();
-        job.request_counts = info.request_counts.clone();
+        job.request_counts = info
+            .request_counts
+            .clone()
+            .map(PersistedBatchRequestCounts::from);
         Ok(())
     })
     .map_err(|error| BatchFailure::new(error, context.clone()))?;
@@ -492,7 +827,18 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
     let (job_file, job) = load_job(&args.job, "batch.retrieve")?;
     let mut context = context_from_job("batch.retrieve", &job_file, &job);
     if job.state == JobState::Publishing {
-        return recover_publishing(&job_file, &job, context);
+        return match recover_publishing(&job_file, &job, context.clone()) {
+            Ok(report) => Ok(report),
+            Err(failure)
+                if matches!(
+                    failure.error.code,
+                    "publishing_output_missing" | "publishing_recovery_required"
+                ) && job.output_file_id.is_some() =>
+            {
+                retrieve_publishing_output(args, &job_file, &job, context)
+            }
+            Err(failure) => Err(failure),
+        };
     }
     if job.state == JobState::Retrieved {
         return recover_retrieved(&job, context);
@@ -522,6 +868,7 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
             &response.body,
             Some(&batch_id),
             job.input_file_id.as_deref(),
+            job.image_count,
         )
         .map_err(|error| BatchFailure::new(error, context.clone()))?;
         validate_remote_transition(&job, &info)
@@ -558,7 +905,10 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
         job.remote_status = Some(info.status.clone());
         job.output_file_id = info.output_file_id.clone();
         job.error_file_id = info.error_file_id.clone();
-        job.request_counts = info.request_counts.clone();
+        job.request_counts = info
+            .request_counts
+            .clone()
+            .map(PersistedBatchRequestCounts::from);
         Ok(())
     })
     .map_err(|error| BatchFailure::new(error, context.clone()))?;
@@ -587,17 +937,14 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
         );
         return Err(BatchFailure::new(error, context));
     };
-    let content = client
-        .get_file_content(&endpoint, &key, output_file_id)
-        .map_err(|error| BatchFailure::new(error, context.clone()))?;
-    let images = parse_batch_output(&content.body, &updated).map_err(|mut failure| {
-        failure.context.job_file = Some(job_file.to_string_lossy().into_owned());
-        failure
-    })?;
-    publish_images(
+    let content = match client.get_file_content(&endpoint, &key, output_file_id) {
+        Ok(content) => content,
+        Err(error) => return Err(mark_output_unavailable(&job_file, &updated, context, error)),
+    };
+    publish_batch_content(
         &job_file,
         &updated,
-        images,
+        &content.body,
         context,
         content.status,
         content.request_id,
@@ -652,6 +999,7 @@ pub fn cancel(args: &BatchCancelArgs) -> Result<BatchReport, BatchFailure> {
         &response.body,
         Some(&batch_id),
         job.input_file_id.as_deref(),
+        job.image_count,
     ) {
         Ok(info) => {
             if let Err(error) = validate_remote_transition(&job, &info) {
@@ -683,7 +1031,10 @@ pub fn cancel(args: &BatchCancelArgs) -> Result<BatchReport, BatchFailure> {
         job.remote_status = Some(info.status.clone());
         job.output_file_id = info.output_file_id.clone();
         job.error_file_id = info.error_file_id.clone();
-        job.request_counts = info.request_counts.clone();
+        job.request_counts = info
+            .request_counts
+            .clone()
+            .map(PersistedBatchRequestCounts::from);
         Ok(())
     })
     .map_err(|error| {
@@ -707,65 +1058,157 @@ pub fn cancel(args: &BatchCancelArgs) -> Result<BatchReport, BatchFailure> {
     Ok(context.report(None))
 }
 
-fn publish_images(
+fn publish_batch_content(
     job_file: &Path,
     job: &BatchJob,
-    images: Vec<Vec<u8>>,
+    content: &[u8],
     mut context: BatchContext,
     http_status: u16,
     request_id: Option<String>,
 ) -> Result<BatchReport, BatchFailure> {
     let output_dir = PathBuf::from(&job.output_dir);
     let paths = derive_output_paths(&output_dir, &job.output_names);
-    let plan = PublishingPlan {
-        artifacts: paths
-            .iter()
-            .zip(&images)
-            .map(|(path, image)| PublishingArtifact {
-                path: path.to_string_lossy().into_owned(),
-                sha256: sha256(image),
-            })
-            .collect(),
-    };
-    let publishing_job = transition_if_revision(job_file, job.revision, |job| {
-        job.state = JobState::Publishing;
-        job.publishing = Some(plan.clone());
-        Ok(())
-    })
-    .map_err(|error| BatchFailure::new(error, context.clone()))?;
-    let mut transaction =
-        match OutputTransaction::reserve(&output_dir, job.output_names.clone(), job.overwrite) {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                let _ = transition_if_revision(job_file, publishing_job.revision, |job| {
-                    job.state = JobState::Failed;
-                    job.publishing = None;
-                    Ok(())
-                });
-                return Err(BatchFailure::new(error, context));
-            }
-        };
-    if let Err(mut error) = transaction.stage_all(&images) {
-        error.add_possibly_modified_paths(transaction.abort());
-        let _ = transition_if_revision(job_file, publishing_job.revision, |job| {
-            job.state = JobState::Failed;
-            job.publishing = None;
+    let images = parse_batch_output(content, job)?;
+    let digests = images.iter().map(|image| sha256(image)).collect::<Vec<_>>();
+    let previous_plan = job.publishing.as_ref();
+    let mut selected_indices = Vec::new();
+    for (index, digest) in digests.iter().enumerate() {
+        let already_published = previous_plan
+            .and_then(|plan| plan.artifacts.get(index))
+            .is_some_and(|artifact| {
+                artifact.sha256 == *digest
+                    && read_regular_file_with_identity(
+                        Path::new(&artifact.path),
+                        crate::image::MAX_IMAGE_BYTES,
+                    )
+                    .is_ok_and(|(bytes, identity)| {
+                        identity == artifact.staged_identity && sha256(&bytes) == *digest
+                    })
+            });
+        if !already_published {
+            selected_indices.push(index);
+        }
+    }
+
+    if selected_indices.is_empty() {
+        let plan = previous_plan.cloned().ok_or_else(|| {
+            BatchFailure::new(
+                AppError::output_commit(
+                    "publishing_plan_missing",
+                    "The output was already present but no persisted publication plan was available.",
+                ),
+                context.clone(),
+            )
+        })?;
+        let outputs = verify_publishing_plan(&output_dir, &plan, &mut context)?;
+        let updated = transition_if_revision(job_file, job.revision, |job| {
+            job.state = JobState::Retrieved;
+            job.retained_artifacts = plan.retained_artifacts.clone();
             Ok(())
-        });
+        })
+        .map_err(|error| {
+            let recovery_error = state_persistence_error("output publication", &job.job_id, error);
+            BatchFailure::new(recovery_error, context.clone())
+        })?;
+        context.outputs = outputs;
+        context.retained_artifacts = updated.retained_artifacts;
+        context.http_status = Some(http_status);
+        context.request_id = request_id;
+        context.remote_status = Some("retrieved".to_owned());
+        return Ok(context.report(None));
+    }
+
+    let selected_names = selected_indices
+        .iter()
+        .map(|index| job.output_names[*index].clone())
+        .collect::<Vec<_>>();
+    let mut selected_expected_ids = Vec::new();
+    if let Some(plan) = previous_plan {
+        for index in &selected_indices {
+            selected_expected_ids.push(plan.artifacts[*index].expected_target);
+        }
+    }
+    let mut transaction = if previous_plan.is_some() {
+        OutputTransaction::reserve_with_expected_targets(
+            &output_dir,
+            selected_names,
+            selected_expected_ids,
+        )
+    } else {
+        OutputTransaction::reserve(&output_dir, selected_names, job.overwrite)
+    }
+    .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    let selected_images = selected_indices
+        .iter()
+        .map(|index| images[*index].clone())
+        .collect::<Vec<_>>();
+    if let Err(mut error) = transaction.stage_all(&selected_images) {
+        error.add_possibly_modified_paths(transaction.abort());
+        error.set_http_status(http_status);
+        error.set_request_id(request_id.clone());
         return Err(BatchFailure::new(error, context));
     }
-    let result = match transaction.commit_all() {
-        Ok(result) => result,
-        Err(mut error) => {
-            error.add_possibly_modified_paths(transaction.abort());
-            return Err(BatchFailure::new(error, context));
-        }
-    };
-    let retained_artifacts = result
-        .retained_artifacts
+    let new_staged_paths = transaction
+        .staged_artifact_paths()
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
+    let new_expected_ids = transaction.expected_target_ids();
+    let new_staged_ids = transaction.staged_artifact_ids();
+    let mut selected_positions = vec![None; job.output_names.len()];
+    for (position, index) in selected_indices.iter().enumerate() {
+        selected_positions[*index] = Some(position);
+    }
+    let mut artifacts = Vec::with_capacity(job.output_names.len());
+    for (index, path) in paths.iter().enumerate() {
+        if let Some(position) = selected_positions[index] {
+            artifacts.push(PublishingArtifact {
+                path: path.to_string_lossy().into_owned(),
+                sha256: digests[index].clone(),
+                staged_path: new_staged_paths[position].clone(),
+                staged_identity: new_staged_ids[position],
+                expected_target: new_expected_ids[position],
+            });
+        } else if let Some(plan) = previous_plan {
+            artifacts.push(plan.artifacts[index].clone());
+        }
+    }
+    let staged_artifacts = artifacts
+        .iter()
+        .map(|artifact| artifact.staged_path.clone())
+        .collect::<Vec<_>>();
+    let retained_artifacts = artifacts
+        .iter()
+        .filter(|artifact| artifact.expected_target.is_some())
+        .map(|artifact| artifact.staged_path.clone())
+        .collect::<Vec<_>>();
+    let plan = PublishingPlan {
+        artifacts,
+        staged_artifacts,
+        retained_artifacts: retained_artifacts.clone(),
+    };
+    let publishing_job = match transition_if_revision(job_file, job.revision, |job| {
+        job.state = JobState::Publishing;
+        job.publishing = Some(plan.clone());
+        job.retained_artifacts = retained_artifacts.clone();
+        Ok(())
+    }) {
+        Ok(job) => job,
+        Err(error) => {
+            let mut recovery_error = state_persistence_error("output staging", &job.job_id, error);
+            recovery_error.add_possibly_modified_paths(transaction.abort());
+            recovery_error.set_http_status(http_status);
+            recovery_error.set_request_id(request_id.clone());
+            return Err(BatchFailure::new(recovery_error, context));
+        }
+    };
+    if let Err(mut error) = transaction.commit_all() {
+        error.add_possibly_modified_paths(transaction.abort());
+        return Err(BatchFailure::new(error, context));
+    }
+    context.http_status = Some(http_status);
+    context.request_id = request_id.clone();
+    let outputs = verify_publishing_plan(&output_dir, &plan, &mut context)?;
     let updated = transition_if_revision(job_file, publishing_job.revision, |job| {
         job.state = JobState::Retrieved;
         // Keep the digest plan so repeated retrieval can verify and report the
@@ -774,14 +1217,8 @@ fn publish_images(
         Ok(())
     });
     if let Err(error) = updated {
-        context.outputs = result
-            .outputs
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect();
+        context.outputs = outputs;
         context.retained_artifacts = retained_artifacts.clone();
-        context.http_status = Some(http_status);
-        context.request_id = request_id.clone();
         context.next_action =
             Some("rerun batch retrieve to reconcile the publishing state".to_owned());
         let mut recovery_error = state_persistence_error("output publication", &job.job_id, error);
@@ -789,14 +1226,8 @@ fn publish_images(
         recovery_error.set_request_id(request_id);
         return Err(BatchFailure::new(recovery_error, context));
     }
-    context.outputs = result
-        .outputs
-        .iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect();
+    context.outputs = outputs;
     context.retained_artifacts = retained_artifacts;
-    context.http_status = Some(http_status);
-    context.request_id = request_id;
     context.remote_status = Some("retrieved".to_owned());
     Ok(context.report(None))
 }
@@ -815,25 +1246,84 @@ fn recover_publishing(
             context,
         ));
     };
-    let mut outputs = Vec::new();
-    for artifact in &plan.artifacts {
-        let bytes = read_output_file(Path::new(&artifact.path)).map_err(|error| {
-            let mut error = error;
-            error.add_possibly_modified_paths(vec![PathBuf::from(&artifact.path)]);
-            BatchFailure::new(error, context.clone())
-        })?;
-        if sha256(&bytes) != artifact.sha256 {
-            let error = AppError::preflight(
-                "publishing_recovery_required",
-                "A published output does not match the persisted digest. No automatic overwrite was attempted; inspect the listed path and job record.",
-            );
+    let output_dir = PathBuf::from(&job.output_dir);
+    let mut recovery_checks = Vec::with_capacity(plan.artifacts.len());
+    for (index, artifact) in plan.artifacts.iter().enumerate() {
+        let stage_path = Path::new(&artifact.staged_path);
+        let Some(stage_name) = stage_path.file_name().and_then(|name| name.to_str()) else {
+            return Err(BatchFailure::new(
+                AppError::preflight(
+                    "publishing_recovery_invalid",
+                    "The persisted publication stage path is invalid.",
+                ),
+                context,
+            ));
+        };
+        if stage_path.parent() != Some(output_dir.as_path()) {
+            return Err(BatchFailure::new(
+                AppError::preflight(
+                    "publishing_recovery_invalid",
+                    "The persisted publication stage path does not belong to the output directory.",
+                ),
+                context,
+            ));
+        }
+        recovery_checks.push((
+            index,
+            RecoveryVerificationArtifact {
+                output_name: job.output_names[index].clone(),
+                expected_output_id: artifact.staged_identity,
+                expected_sha256: artifact.sha256.clone(),
+                stage_name: stage_name.to_owned(),
+                expected_stage_id: artifact.staged_identity,
+            },
+        ));
+    }
+    let observations = inspect_recovery_plan(
+        &output_dir,
+        &recovery_checks
+            .iter()
+            .map(|(_, check)| check.clone())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    let mut recovery_artifacts = Vec::new();
+    for ((index, check), observation) in recovery_checks.iter().zip(observations) {
+        if observation.final_matches {
+            continue;
+        }
+        if !observation.stage_matches {
+            let artifact = &plan.artifacts[*index];
             context.possibly_modified_paths.push(artifact.path.clone());
+            context
+                .possibly_modified_paths
+                .push(artifact.staged_path.clone());
+            let error = AppError::preflight(
+                "publishing_output_missing",
+                "A publication stage is missing or does not match its persisted digest; the remote Batch output will be used to repair it without replacing changed targets.",
+            );
             return Err(BatchFailure::new(error, context));
         }
-        outputs.push(artifact.path.clone());
+        let artifact = &plan.artifacts[*index];
+        recovery_artifacts.push(RecoveryArtifact {
+            final_name: check.output_name.clone(),
+            stage_name: check.stage_name.clone(),
+            expected_stage_id: check.expected_stage_id,
+            expected_id: artifact.expected_target,
+        });
     }
+    if !recovery_artifacts.is_empty() {
+        let mut transaction = OutputTransaction::recover(&output_dir, recovery_artifacts)
+            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        if let Err(mut error) = transaction.commit_all() {
+            error.add_possibly_modified_paths(transaction.abort());
+            return Err(BatchFailure::new(error, context));
+        }
+    }
+    let outputs = verify_publishing_plan(&output_dir, plan, &mut context)?;
     transition_if_revision(job_file, job.revision, |job| {
         job.state = JobState::Retrieved;
+        job.retained_artifacts = plan.retained_artifacts.clone();
         Ok(())
     })
     .map_err(|error| {
@@ -859,41 +1349,176 @@ fn recover_retrieved(
             context,
         ));
     };
-    let outputs = verify_publishing_plan(plan, &mut context)?;
+    let outputs = verify_publishing_plan(Path::new(&job.output_dir), plan, &mut context)?;
     context.outputs = outputs;
     context.remote_status = Some("retrieved".to_owned());
     context.next_action = None;
     Ok(context.report(None))
 }
 
+fn retrieve_publishing_output(
+    args: &BatchRetrieveArgs,
+    job_file: &Path,
+    job: &BatchJob,
+    mut context: BatchContext,
+) -> Result<BatchReport, BatchFailure> {
+    let output_file_id = job.output_file_id.as_deref().ok_or_else(|| {
+        BatchFailure::new(
+            AppError::preflight(
+                "batch_output_missing",
+                "The Publishing job has no confirmed output file ID to recover.",
+            ),
+            context.clone(),
+        )
+    })?;
+    let endpoint = endpoint_from_job(job, &context, &args.job)?;
+    let key = api_key().map_err(|error| BatchFailure::new(error, context.clone()))?;
+    let client = ApiClient::new(args.job.timeout_seconds)
+        .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    context.attempted = true;
+    let content = match client.get_file_content(&endpoint, &key, output_file_id) {
+        Ok(content) => content,
+        Err(error) => return Err(mark_output_unavailable(job_file, job, context, error)),
+    };
+    publish_batch_content(
+        job_file,
+        job,
+        &content.body,
+        context,
+        content.status,
+        content.request_id,
+    )
+}
+
+fn mark_output_unavailable(
+    job_file: &Path,
+    job: &BatchJob,
+    mut context: BatchContext,
+    mut error: AppError,
+) -> BatchFailure {
+    if matches!(
+        error.code,
+        "batch_output_unavailable" | "batch_output_expired"
+    ) {
+        if let Err(state_error) = transition_if_revision(job_file, job.revision, |job| {
+            job.state = JobState::Failed;
+            job.publishing = None;
+            Ok(())
+        }) {
+            error.message = format!(
+                "{} The output-unavailable state could not be persisted: {}",
+                error.message, state_error.message
+            );
+            error.automatic_retry_safe = false;
+        }
+        context.next_action =
+            Some("inspect the remote Batch record and error/output files".to_owned());
+    }
+    context.http_status = error.http_status.or(context.http_status);
+    context.request_id = error.request_id.clone().or(context.request_id);
+    BatchFailure::new(error, context)
+}
+
 fn verify_publishing_plan(
+    output_dir: &Path,
     plan: &PublishingPlan,
     context: &mut BatchContext,
 ) -> Result<Vec<String>, BatchFailure> {
-    let mut outputs = Vec::with_capacity(plan.artifacts.len());
+    let mut verification = Vec::with_capacity(plan.artifacts.len());
+    let mut possibly_modified_paths = Vec::with_capacity(plan.artifacts.len() * 2);
     for artifact in &plan.artifacts {
-        let bytes = read_output_file(Path::new(&artifact.path)).map_err(|error| {
-            let mut error = error;
-            error.add_possibly_modified_paths(vec![PathBuf::from(&artifact.path)]);
-            BatchFailure::new(error, context.clone())
-        })?;
-        if sha256(&bytes) != artifact.sha256 {
-            let error = AppError::preflight(
-                "publishing_recovery_required",
-                "A published output does not match the persisted digest. No automatic overwrite was attempted; inspect the listed path and job record.",
-            );
-            context.possibly_modified_paths.push(artifact.path.clone());
-            return Err(BatchFailure::new(error, context.clone()));
+        let output_path = Path::new(&artifact.path);
+        let Some(output_name) = output_path.file_name().and_then(|name| name.to_str()) else {
+            return Err(BatchFailure::new(
+                AppError::preflight(
+                    "publishing_journal_invalid",
+                    "The publication plan contains an invalid output path.",
+                ),
+                context.clone(),
+            ));
+        };
+        if output_path.parent() != Some(output_dir) {
+            return Err(BatchFailure::new(
+                AppError::preflight(
+                    "publishing_journal_invalid",
+                    "The publication plan output is outside the persisted output directory.",
+                ),
+                context.clone(),
+            ));
         }
-        outputs.push(artifact.path.clone());
+        let retained_name = if artifact.expected_target.is_some() {
+            if !plan.retained_artifacts.contains(&artifact.staged_path) {
+                return Err(BatchFailure::new(
+                    AppError::preflight(
+                        "publishing_journal_invalid",
+                        "The publication journal does not retain the identity-checked overwrite backup.",
+                    ),
+                    context.clone(),
+                ));
+            }
+            let retained_path = Path::new(&artifact.staged_path);
+            if retained_path.parent() != Some(output_dir) {
+                return Err(BatchFailure::new(
+                    AppError::preflight(
+                        "publishing_journal_invalid",
+                        "The publication plan retained artifact is outside the output directory.",
+                    ),
+                    context.clone(),
+                ));
+            }
+            Some(
+                retained_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        BatchFailure::new(
+                            AppError::preflight(
+                                "publishing_journal_invalid",
+                                "The publication plan contains an invalid retained path.",
+                            ),
+                            context.clone(),
+                        )
+                    })?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        possibly_modified_paths.push(PathBuf::from(&artifact.path));
+        if let Some(retained_name) = retained_name.as_ref() {
+            possibly_modified_paths.push(PathBuf::from(&artifact.staged_path));
+            if !retained_name.starts_with(".codex-image-stage-") {
+                return Err(BatchFailure::new(
+                    AppError::preflight(
+                        "publishing_journal_invalid",
+                        "The publication plan retained artifact name is unsafe.",
+                    ),
+                    context.clone(),
+                ));
+            }
+        }
+        verification.push(OutputVerificationArtifact {
+            output_name: output_name.to_owned(),
+            expected_output_id: artifact.staged_identity,
+            expected_sha256: artifact.sha256.clone(),
+            retained_name,
+            expected_retained_id: artifact.expected_target,
+        });
     }
-    Ok(outputs)
+    let outputs = verify_and_sync_plan(output_dir, &verification).map_err(|error| {
+        let mut error = error;
+        error.add_possibly_modified_paths(possibly_modified_paths);
+        BatchFailure::new(error, context.clone())
+    })?;
+    Ok(outputs
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
 }
 
 fn parse_batch_output(content: &[u8], job: &BatchJob) -> Result<Vec<Vec<u8>>, BatchFailure> {
-    let expected = job.custom_ids.iter().cloned().collect::<HashSet<_>>();
-    let mut seen = HashSet::new();
-    let mut images = HashMap::new();
+    let mut seen = vec![false; job.custom_ids.len()];
+    let mut images: Vec<Option<Vec<u8>>> = (0..job.custom_ids.len()).map(|_| None).collect();
     let mut total: usize = 0;
     for line in content.split(|byte| *byte == b'\n') {
         if line.is_empty() {
@@ -914,13 +1539,25 @@ fn parse_batch_output(content: &[u8], job: &BatchJob) -> Result<Vec<Vec<u8>>, Ba
                 job,
             )
         })?;
-        if !expected.contains(&result.custom_id) || !seen.insert(result.custom_id.clone()) {
+        let Some(index) = job
+            .custom_ids
+            .iter()
+            .position(|custom_id| custom_id == &result.custom_id)
+        else {
+            return Err(batch_result_failure(
+                "batch_result_ids_invalid",
+                "The Batch output contained an unknown or duplicate custom_id.",
+                job,
+            ));
+        };
+        if seen[index] {
             return Err(batch_result_failure(
                 "batch_result_ids_invalid",
                 "The Batch output contained an unknown or duplicate custom_id.",
                 job,
             ));
         }
+        seen[index] = true;
         if result.error.is_some() {
             return Err(batch_result_failure(
                 "batch_item_failed",
@@ -942,36 +1579,39 @@ fn parse_batch_output(content: &[u8], job: &BatchJob) -> Result<Vec<Vec<u8>>, Ba
                 job,
             ));
         }
-        let body = serde_json::to_vec(&response.body).map_err(|_| {
-            batch_result_failure(
+        if response.body.data.len() != 1 {
+            return Err(batch_result_failure(
                 "batch_result_body_invalid",
-                "A Batch response body could not be decoded safely.",
+                "A Batch response body did not contain exactly one image record.",
                 job,
-            )
-        })?;
-        let decoded = decode_images(&body, 1, job.format).map_err(|_| {
+            ));
+        }
+        let encoded = response
+            .body
+            .data
+            .into_iter()
+            .next()
+            .and_then(|image| image.b64_json);
+        let decoded = decode_base64_image(encoded, job.format).map_err(|_| {
             batch_result_failure(
                 "batch_image_invalid",
                 "A Batch image response was malformed or did not match the requested format. No partial output was published.",
                 job,
             )
         })?;
-        images.insert(
-            result.custom_id,
-            decoded.into_iter().next().expect("one image"),
-        );
+        images[index] = Some(decoded);
     }
-    if seen != expected {
+    if seen.iter().any(|seen| !seen) {
         return Err(batch_result_failure(
             "batch_result_incomplete",
             "The Batch output did not contain exactly one successful result for every requested image.",
             job,
         ));
     }
-    job.custom_ids
-        .iter()
-        .map(|custom_id| {
-            images.remove(custom_id).ok_or_else(|| {
+    images
+        .into_iter()
+        .map(|image| {
+            image.ok_or_else(|| {
                 batch_result_failure(
                     "batch_result_incomplete",
                     "The Batch output could not be mapped deterministically to the requested images.",
@@ -986,13 +1626,23 @@ fn parse_batch_output(content: &[u8], job: &BatchJob) -> Result<Vec<Vec<u8>>, Ba
 struct BatchResultLine {
     custom_id: String,
     response: Option<BatchItemResponse>,
-    error: Option<serde_json::Value>,
+    error: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BatchItemResponse {
     status_code: u16,
-    body: serde_json::Value,
+    body: BatchImageBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchImageBody {
+    data: Vec<BatchImageData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchImageData {
+    b64_json: Option<String>,
 }
 
 fn batch_result_failure(code: &'static str, message: &'static str, job: &BatchJob) -> BatchFailure {
@@ -1089,6 +1739,7 @@ fn parse_batch_info(
     body: &[u8],
     expected_batch_id: Option<&str>,
     expected_input_file_id: Option<&str>,
+    expected_image_count: u8,
 ) -> Result<BatchInfo, AppError> {
     let info = serde_json::from_slice(body).map_err(|_| {
         AppError::observation(
@@ -1096,13 +1747,19 @@ fn parse_batch_info(
             "The Batch endpoint returned an invalid status object; retrying the read-only operation is safe.",
         )
     })?;
-    validate_batch_info(&info, expected_batch_id, expected_input_file_id)?;
+    validate_batch_info(
+        &info,
+        expected_batch_id,
+        expected_input_file_id,
+        expected_image_count,
+    )?;
     Ok(info)
 }
 
 fn parse_batch_create_info(
     body: &[u8],
     expected_input_file_id: &str,
+    expected_image_count: u8,
 ) -> Result<BatchInfo, AppError> {
     let info = serde_json::from_slice(body).map_err(|_| {
         AppError::invalid_response(
@@ -1110,7 +1767,13 @@ fn parse_batch_create_info(
             "The batch-create response did not contain a valid Batch object; do not retry automatically. Inspect the persisted job.",
         )
     })?;
-    validate_batch_info(&info, None, Some(expected_input_file_id)).map_err(|_| {
+    validate_batch_info(
+        &info,
+        None,
+        Some(expected_input_file_id),
+        expected_image_count,
+    )
+    .map_err(|_| {
         AppError::invalid_response(
             "batch_create_invalid",
             "The batch-create response failed local identity or status validation; do not retry automatically. Inspect the persisted job.",
@@ -1123,6 +1786,7 @@ fn validate_batch_info(
     info: &BatchInfo,
     expected_batch_id: Option<&str>,
     expected_input_file_id: Option<&str>,
+    expected_image_count: u8,
 ) -> Result<(), AppError> {
     validate_remote_id(&info.id, "batch_id").map_err(|_| {
         AppError::observation(
@@ -1148,6 +1812,26 @@ fn validate_batch_info(
             "The Batch endpoint returned a different input file ID than the persisted job; retrying the read-only operation is safe.",
         ));
     }
+    if info
+        .endpoint
+        .as_deref()
+        .is_some_and(|endpoint| endpoint != "/v1/images/generations")
+    {
+        return Err(AppError::observation(
+            "batch_endpoint_mismatch",
+            "The Batch endpoint returned a different generation endpoint; retrying the read-only operation is safe.",
+        ));
+    }
+    if info
+        .completion_window
+        .as_deref()
+        .is_some_and(|window| window != "24h")
+    {
+        return Err(AppError::observation(
+            "batch_window_mismatch",
+            "The Batch endpoint returned a different completion window; retrying the read-only operation is safe.",
+        ));
+    }
     if !is_known_remote_status(&info.status) {
         return Err(AppError::observation(
             "batch_status_invalid",
@@ -1168,7 +1852,8 @@ fn validate_batch_info(
         }
     }
     if let Some(counts) = &info.request_counts {
-        if counts.completed > counts.total
+        if counts.total != u32::from(expected_image_count)
+            || counts.completed > counts.total
             || counts.failed > counts.total
             || counts.completed.saturating_add(counts.failed) > counts.total
         {
@@ -1182,11 +1867,12 @@ fn validate_batch_info(
 }
 
 fn validate_remote_transition(job: &BatchJob, info: &BatchInfo) -> Result<(), AppError> {
+    let previous_counts = job.request_counts.as_ref().map(BatchRequestCounts::from);
     validate_observation_progress(
         job.remote_status.as_deref(),
         job.output_file_id.as_deref(),
         job.error_file_id.as_deref(),
-        job.request_counts.as_ref(),
+        previous_counts.as_ref(),
         info,
     )
 }
@@ -1522,33 +2208,6 @@ fn sha256(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn read_output_file(path: &Path) -> Result<Vec<u8>, AppError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| {
-        AppError::preflight(
-            "publishing_output_missing",
-            "A persisted publishing output is missing; no automatic overwrite was attempted.",
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(AppError::preflight(
-            "publishing_output_unsafe",
-            "A persisted publishing output is not a regular non-symlink file.",
-        ));
-    }
-    if metadata.len() > crate::image::MAX_IMAGE_BYTES as u64 {
-        return Err(AppError::preflight(
-            "publishing_output_too_large",
-            "A persisted publishing output exceeds the local image safety limit.",
-        ));
-    }
-    fs::read(path).map_err(|_| {
-        AppError::preflight(
-            "publishing_output_unreadable",
-            "A persisted publishing output could not be read safely.",
-        )
-    })
-}
-
 struct JobStore;
 
 fn validate_job(job: &BatchJob) -> Result<(), AppError> {
@@ -1606,6 +2265,18 @@ fn validate_job(job: &BatchJob) -> Result<(), AppError> {
             ));
         }
     }
+    if job.input_bytes == 0
+        || job.input_bytes > MAX_BATCH_INPUT_BYTES as u64
+        || job.input_sha256.len() != 64
+        || !job
+            .input_sha256
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(invalid_job(
+            "The Batch job input integrity metadata is invalid.",
+        ));
+    }
     for (id, name) in [
         (job.input_file_id.as_deref(), "input_file_id"),
         (job.batch_id.as_deref(), "batch_id"),
@@ -1625,7 +2296,8 @@ fn validate_job(job: &BatchJob) -> Result<(), AppError> {
         }
     }
     if let Some(counts) = &job.request_counts {
-        if counts.completed > counts.total
+        if counts.total != u32::from(job.image_count)
+            || counts.completed > counts.total
             || counts.failed > counts.total
             || counts.completed.saturating_add(counts.failed) > counts.total
         {
@@ -1642,17 +2314,78 @@ fn validate_job(job: &BatchJob) -> Result<(), AppError> {
                 "The Batch job publication plan is inconsistent.",
             ));
         }
+        let expected_staged = plan
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.staged_path.clone())
+            .collect::<Vec<_>>();
+        let expected_retained = plan
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.expected_target.is_some())
+            .map(|artifact| artifact.staged_path.clone())
+            .collect::<Vec<_>>();
+        if expected_staged.iter().collect::<HashSet<_>>().len() != expected_staged.len()
+            || expected_retained.iter().collect::<HashSet<_>>().len() != expected_retained.len()
+            || plan.staged_artifacts != expected_staged
+            || plan.retained_artifacts != expected_retained
+        {
+            return Err(invalid_job(
+                "The Batch job publication journal does not match its per-output plan.",
+            ));
+        }
+        let mut journal_names = HashSet::new();
         for (artifact, name) in plan.artifacts.iter().zip(&job.output_names) {
             let expected = Path::new(&job.output_dir).join(name);
+            let staged = Path::new(&artifact.staged_path);
+            let Some(staged_name) = staged.file_name().and_then(|name| name.to_str()) else {
+                return Err(invalid_job(
+                    "The Batch job publication stage filename is invalid.",
+                ));
+            };
+            if !journal_names.insert(name.clone()) || !journal_names.insert(staged_name.to_owned())
+            {
+                return Err(invalid_job(
+                    "The Batch job publication journal contains colliding artifact names.",
+                ));
+            }
             if artifact.path != expected.to_string_lossy()
                 || artifact.sha256.len() != 64
                 || !artifact
                     .sha256
                     .chars()
                     .all(|character| character.is_ascii_hexdigit())
+                || !staged.is_absolute()
+                || staged.parent() != Some(Path::new(&job.output_dir))
+                || staged
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|name| !name.starts_with(".codex-image-stage-"))
             {
                 return Err(invalid_job(
                     "The Batch job publication digest plan is invalid.",
+                ));
+            }
+        }
+        if job.retained_artifacts != plan.retained_artifacts {
+            return Err(invalid_job(
+                "The Batch job retained-artifact journal does not match its publication plan.",
+            ));
+        }
+        for path in plan
+            .staged_artifacts
+            .iter()
+            .chain(plan.retained_artifacts.iter())
+        {
+            let path = Path::new(path);
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+                || !path.starts_with(&job.output_dir)
+            {
+                return Err(invalid_job(
+                    "The Batch job publication journal contains an unsafe artifact path.",
                 ));
             }
         }
@@ -1674,11 +2407,93 @@ fn validate_job(job: &BatchJob) -> Result<(), AppError> {
             ));
         }
     }
+    validate_state_invariants(job)?;
     Ok(())
 }
 
 fn invalid_job(message: &'static str) -> AppError {
     AppError::preflight("job_file_invalid", message)
+}
+
+fn validate_state_invariants(job: &BatchJob) -> Result<(), AppError> {
+    let has_input = job.input_file_id.is_some();
+    let has_batch = job.batch_id.is_some();
+    let status = job.remote_status.as_deref();
+    let valid = match job.state {
+        JobState::Prepared | JobState::UploadInFlight | JobState::UploadOutcomeUnknown => {
+            !has_input
+                && !has_batch
+                && status.is_none()
+                && job.output_file_id.is_none()
+                && job.error_file_id.is_none()
+                && job.request_counts.is_none()
+                && job.publishing.is_none()
+        }
+        JobState::InputUploaded => {
+            has_input
+                && !has_batch
+                && status.is_none()
+                && job.output_file_id.is_none()
+                && job.error_file_id.is_none()
+                && job.request_counts.is_none()
+                && job.publishing.is_none()
+        }
+        JobState::CreateInFlight | JobState::CreateOutcomeUnknown => {
+            has_input
+                && !has_batch
+                && status.is_none()
+                && job.output_file_id.is_none()
+                && job.error_file_id.is_none()
+                && job.request_counts.is_none()
+                && job.publishing.is_none()
+        }
+        JobState::Submitted => {
+            has_input && has_batch && status.is_some() && job.publishing.is_none()
+        }
+        JobState::Completed => {
+            has_input && has_batch && status == Some("completed") && job.publishing.is_none()
+        }
+        JobState::Publishing | JobState::Retrieved => {
+            has_input
+                && has_batch
+                && matches!(status, Some("completed" | "cancelled"))
+                && job.publishing.is_some()
+        }
+        JobState::Failed => {
+            has_input
+                && has_batch
+                && matches!(
+                    status,
+                    Some("completed" | "failed" | "expired" | "cancelled")
+                )
+                && job.publishing.is_none()
+        }
+        JobState::CancelInFlight | JobState::CancelOutcomeUnknown => {
+            has_input
+                && has_batch
+                && matches!(
+                    status,
+                    Some("validating" | "in_progress" | "finalizing" | "cancelling")
+                )
+                && job.publishing.is_none()
+        }
+        JobState::Cancelled => {
+            has_input && has_batch && status == Some("cancelled") && job.publishing.is_none()
+        }
+    };
+    if !valid {
+        return Err(invalid_job(
+            "The Batch job state is inconsistent with its persisted remote IDs and status.",
+        ));
+    }
+    if !matches!(job.state, JobState::Publishing | JobState::Retrieved)
+        && !job.retained_artifacts.is_empty()
+    {
+        return Err(invalid_job(
+            "Retained artifacts are only valid after a completed local publication.",
+        ));
+    }
+    Ok(())
 }
 
 impl JobStore {
@@ -1701,14 +2516,18 @@ impl JobStore {
                 "The requested job file already exists; refusing to replace an existing Batch record.",
             ));
         }
-        write_atomic(path, job)
+        write_atomic(path, job, true)
     }
 
     fn load(path: &Path) -> Result<BatchJob, AppError> {
-        let bytes = fs::read(path).map_err(|_| {
+        let bytes = read_regular_file(path, MAX_JOB_FILE_BYTES).map_err(|error| {
             AppError::preflight(
-                "job_file_unreadable",
-                "The Batch job record could not be read.",
+                if error.code == "publishing_output_too_large" {
+                    "job_file_too_large"
+                } else {
+                    "job_file_unreadable"
+                },
+                "The Batch job record could not be read safely.",
             )
         })?;
         let job: BatchJob = serde_json::from_slice(&bytes).map_err(|_| {
@@ -1759,7 +2578,7 @@ impl JobStore {
         })?;
         job.updated_at = now_seconds();
         validate_job(&job)?;
-        write_atomic(path, &job)?;
+        write_atomic(path, &job, false)?;
         Ok(job)
     }
 
@@ -1860,7 +2679,7 @@ fn validate_no_symlink_components(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn write_atomic(path: &Path, value: &BatchJob) -> Result<(), AppError> {
+fn write_atomic(path: &Path, value: &BatchJob, no_clobber: bool) -> Result<(), AppError> {
     let parent = path.parent().ok_or_else(|| {
         AppError::preflight(
             "job_path_invalid",
@@ -1885,12 +2704,6 @@ fn write_atomic(path: &Path, value: &BatchJob) -> Result<(), AppError> {
             "The Batch job record could not be written safely.",
         )
     })?;
-    temporary.as_file().sync_all().map_err(|_| {
-        AppError::preflight(
-            "job_write_failed",
-            "The Batch job record could not be synchronized safely.",
-        )
-    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1901,15 +2714,35 @@ fn write_atomic(path: &Path, value: &BatchJob) -> Result<(), AppError> {
             )
         })?;
     }
-    temporary.persist(path).map_err(|_| {
+    temporary.as_file().sync_all().map_err(|_| {
+        AppError::preflight(
+            "job_write_failed",
+            "The Batch job record could not be synchronized safely.",
+        )
+    })?;
+    let persist = if no_clobber {
+        temporary.persist_noclobber(path)
+    } else {
+        temporary.persist(path)
+    };
+    persist.map_err(|_| {
         AppError::preflight(
             "job_write_failed",
             "The Batch job record could not be committed atomically.",
         )
     })?;
-    if let Ok(directory) = File::open(parent) {
-        let _ = directory.sync_all();
-    }
+    let directory = File::open(parent).map_err(|_| {
+        AppError::preflight(
+            "job_directory_sync_failed",
+            "The Batch job directory could not be opened for durability verification.",
+        )
+    })?;
+    directory.sync_all().map_err(|_| {
+        AppError::preflight(
+            "job_directory_sync_failed",
+            "The Batch job directory could not be synchronized after the atomic update.",
+        )
+    })?;
     Ok(())
 }
 
@@ -1946,6 +2779,8 @@ mod tests {
             background: crate::cli::Background::Auto,
             moderation: crate::cli::Moderation::Auto,
             custom_ids: vec!["job-test-00".to_owned()],
+            input_sha256: "0".repeat(64),
+            input_bytes: 1,
             input_file_id: None,
             batch_id: None,
             output_file_id: None,
@@ -1963,6 +2798,36 @@ mod tests {
             serde_json::from_value::<BatchJob>(value).unwrap().job_id,
             "job-test"
         );
+        let mut invalid = serde_json::to_value(&job).unwrap();
+        invalid["state"] = serde_json::json!("input_uploaded");
+        assert!(validate_job(&serde_json::from_value(invalid).unwrap()).is_err());
+
+        let mut unknown_job = serde_json::to_value(&job).unwrap();
+        unknown_job["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<BatchJob>(unknown_job).is_err());
+
+        let artifact = PublishingArtifact {
+            path: "/tmp/images/one.png".to_owned(),
+            sha256: "0".repeat(64),
+            staged_path: "/tmp/images/.codex-image-stage-test".to_owned(),
+            staged_identity: OutputIdentity {
+                device: 1,
+                inode: 2,
+            },
+            expected_target: None,
+        };
+        let mut unknown_artifact = serde_json::to_value(&artifact).unwrap();
+        unknown_artifact["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<PublishingArtifact>(unknown_artifact).is_err());
+
+        let plan = PublishingPlan {
+            artifacts: vec![artifact],
+            staged_artifacts: vec!["/tmp/images/.codex-image-stage-test".to_owned()],
+            retained_artifacts: Vec::new(),
+        };
+        let mut unknown_plan = serde_json::to_value(&plan).unwrap();
+        unknown_plan["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<PublishingPlan>(unknown_plan).is_err());
     }
 
     #[test]
@@ -1985,6 +2850,8 @@ mod tests {
             background: crate::cli::Background::Auto,
             moderation: crate::cli::Moderation::Auto,
             custom_ids: vec!["job-test-00".to_owned()],
+            input_sha256: "0".repeat(64),
+            input_bytes: 1,
             input_file_id: None,
             batch_id: None,
             output_file_id: None,

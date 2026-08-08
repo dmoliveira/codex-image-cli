@@ -69,6 +69,8 @@ pub struct BatchInfo {
     pub id: String,
     pub status: String,
     pub input_file_id: String,
+    pub endpoint: Option<String>,
+    pub completion_window: Option<String>,
     pub output_file_id: Option<String>,
     pub error_file_id: Option<String>,
     pub request_counts: Option<BatchRequestCounts>,
@@ -84,12 +86,14 @@ pub struct BatchRequestCounts {
 #[derive(Debug, Deserialize)]
 pub struct FileInfo {
     pub id: String,
+    pub purpose: Option<String>,
 }
 
 pub struct ApiClient {
     client: Client,
 }
 
+#[derive(Debug)]
 pub struct ApiResponse {
     pub body: Vec<u8>,
     pub request_id: Option<String>,
@@ -280,8 +284,40 @@ impl ApiClient {
             endpoint.file_content_url(file_id)?,
             api_key,
             RequestPayload::Empty,
-            RequestKind::Observation,
+            RequestKind::FileContent,
             MAX_BATCH_CONTENT_BYTES,
+        )
+    }
+
+    pub fn get_input_file_content(
+        &self,
+        endpoint: &Endpoint,
+        api_key: &str,
+        file_id: &str,
+    ) -> Result<ApiResponse, AppError> {
+        self.send_request(
+            Method::GET,
+            endpoint.file_content_url(file_id)?,
+            api_key,
+            RequestPayload::Empty,
+            RequestKind::InputFileContent,
+            MAX_BATCH_INPUT_BYTES,
+        )
+    }
+
+    pub fn get_file(
+        &self,
+        endpoint: &Endpoint,
+        api_key: &str,
+        file_id: &str,
+    ) -> Result<ApiResponse, AppError> {
+        self.send_request(
+            Method::GET,
+            endpoint.file_url(file_id)?,
+            api_key,
+            RequestPayload::Empty,
+            RequestKind::Observation,
+            MAX_BATCH_RESPONSE_BYTES,
         )
     }
 
@@ -358,7 +394,21 @@ impl ApiClient {
         }
         if status.is_client_error() {
             let code = safe_error_code(response, api_key);
-            if matches!(kind, RequestKind::Observation) {
+            if matches!(kind, RequestKind::FileContent) && matches!(status.as_u16(), 404 | 410) {
+                return Err(AppError::batch_failed(
+                    if status.as_u16() == 410 {
+                        "batch_output_expired"
+                    } else {
+                        "batch_output_unavailable"
+                    },
+                    "The completed Batch output file is unavailable (404/410). Inspect the Batch record and error file before deciding what to do next.",
+                )
+                .with_http(status.as_u16(), request_id));
+            }
+            if matches!(
+                kind,
+                RequestKind::Observation | RequestKind::FileContent | RequestKind::InputFileContent
+            ) {
                 return Err(AppError::observation(
                     "batch_observation_rejected",
                     format!(
@@ -415,6 +465,7 @@ enum RequestPayload {
 }
 
 pub const MAX_BATCH_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BATCH_INPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_BATCH_CONTENT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
@@ -422,6 +473,8 @@ enum RequestKind {
     BillablePost,
     ControlPost,
     Observation,
+    FileContent,
+    InputFileContent,
 }
 
 impl RequestKind {
@@ -439,6 +492,14 @@ impl RequestKind {
                 "batch_observation_failed",
                 "The batch status or output could not be observed. Retrying this read-only operation is safe.",
             ),
+            Self::FileContent => AppError::observation(
+                "batch_output_observation_failed",
+                "The Batch output could not be observed. Retrying this read-only operation is safe.",
+            ),
+            Self::InputFileContent => AppError::observation(
+                "batch_input_observation_failed",
+                "The Batch input file could not be observed. Retrying this read-only operation is safe.",
+            ),
         }
     }
 
@@ -455,6 +516,14 @@ impl RequestKind {
             Self::Observation => AppError::observation(
                 "batch_observation_redirected",
                 "The batch observation returned a redirect. Credentials were not forwarded; retrying the read-only operation is safe.",
+            ),
+            Self::FileContent => AppError::observation(
+                "batch_output_redirected",
+                "The Batch output returned a redirect. Credentials were not forwarded; retrying the read-only operation is safe.",
+            ),
+            Self::InputFileContent => AppError::observation(
+                "batch_input_redirected",
+                "The Batch input file returned a redirect. Credentials were not forwarded; retrying the read-only operation is safe.",
             ),
         }
     }
@@ -476,6 +545,16 @@ impl RequestKind {
                 format!("The batch endpoint returned HTTP {status}; retrying this read-only operation is safe."),
             )
             .with_http(status, request_id),
+            Self::FileContent => AppError::observation(
+                "batch_output_server_error",
+                format!("The Batch output endpoint returned HTTP {status}; retrying this read-only operation is safe."),
+            )
+            .with_http(status, request_id),
+            Self::InputFileContent => AppError::observation(
+                "batch_input_server_error",
+                format!("The Batch input endpoint returned HTTP {status}; retrying this read-only operation is safe."),
+            )
+            .with_http(status, request_id),
         }
     }
 
@@ -493,6 +572,14 @@ impl RequestKind {
                 "batch_response_too_large",
                 format!("The batch response exceeded the {max}-byte safety limit; retrying the observation is safe."),
             ),
+            Self::FileContent => AppError::observation(
+                "batch_output_too_large",
+                format!("The Batch output exceeded the {max}-byte safety limit; retrying the observation is safe."),
+            ),
+            Self::InputFileContent => AppError::observation(
+                "batch_input_too_large",
+                format!("The Batch input exceeded the {max}-byte safety limit; retrying the observation is safe."),
+            ),
         }
     }
 
@@ -509,6 +596,14 @@ impl RequestKind {
             Self::Observation => AppError::observation(
                 "batch_response_read_failed",
                 "The batch response could not be read completely; retrying the observation is safe.",
+            ),
+            Self::FileContent => AppError::observation(
+                "batch_output_read_failed",
+                "The Batch output could not be read completely; retrying the observation is safe.",
+            ),
+            Self::InputFileContent => AppError::observation(
+                "batch_input_read_failed",
+                "The Batch input could not be read completely; retrying the observation is safe.",
             ),
         }
     }
@@ -621,5 +716,30 @@ mod tests {
         let error = RequestKind::ControlPost.status_error(500, None);
         assert_eq!(error.status, crate::report::Status::OutcomeIndeterminate);
         assert!(!error.automatic_retry_safe);
+    }
+
+    #[test]
+    fn input_file_not_found_is_a_retryable_observation() {
+        use std::{io::Write, net::TcpListener, thread};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let endpoint = Endpoint::authorize(&format!("http://{address}/v1"), None, true).unwrap();
+        let client = ApiClient::new(5).unwrap();
+        let error = client
+            .get_input_file_content(&endpoint, "test-key", "file-input")
+            .unwrap_err();
+        assert_eq!(error.status, crate::report::Status::BatchObservationFailed);
+        assert!(error.automatic_retry_safe);
+        assert_eq!(error.code, "batch_observation_rejected");
+        server.join().unwrap();
     }
 }

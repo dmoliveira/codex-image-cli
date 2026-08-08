@@ -40,7 +40,7 @@ Failure reports add:
 
 `outputs` is populated only after all requested files are published. `retained_artifacts` lists private backups deliberately retained after a successful overwrite; they are not automatically unlinked because a pathname-only cleanup can race a competing writer. `possibly_modified_paths` lists outputs/private artifacts that need inspection after a failure. The CLI never calls a multi-file result successful after a partial publication.
 
-Batch reports add `operation`, job/remote IDs, `remote_status`, `next_action`, and the same `outputs`, `retained_artifacts`, and `possibly_modified_paths` fields. `batch submit` uploads bounded JSONL input and creates a 24-hour Batch job with output retention configured for 30 days. `batch status` performs one read, `batch retrieve` can poll with `--wait` and a bounded `--max-wait-seconds`, and `batch cancel` sends one cancellation request. Batch is API-only, locally limited to 8 image requests, and its job record never stores the prompt, API key, or image bytes. Remote POST outcomes are never automatically retried. Custom HTTPS and loopback endpoint approvals must be repeated explicitly on each operation; editable job records never grant credential-destination approval.
+Batch reports add `operation`, job/remote IDs, `remote_status`, `next_action`, and the same `outputs`, `retained_artifacts`, and `possibly_modified_paths` fields. `batch submit` uploads bounded JSONL input and creates a 24-hour Batch job with output retention configured for 30 days. `batch status` performs one read, `batch retrieve` can poll with `--wait` and a bounded `--max-wait-seconds`, `batch cancel` sends one cancellation request, and `batch recover` resumes only a confirmed-safe local state or attaches a manually reconciled remote ID after a read-only verification. Batch is API-only, locally limited to 8 image requests, and its job record never stores the prompt, API key, or image bytes. Remote POST outcomes are never automatically retried. Custom HTTPS and loopback endpoint approvals must be repeated explicitly on each operation; editable job records never grant credential-destination approval.
 
 ```json
 {
@@ -78,7 +78,7 @@ Batch reports add `operation`, job/remote IDs, `remote_status`, `next_action`, a
 | 7 | `output_commit_failed` | yes | Do **not** auto-retry; inspect paths and determine whether output is recoverable. |
 | 8 | `batch_not_ready` | read-only | The Batch is still processing or the bounded wait elapsed; query it again later. |
 | 9 | `batch_observation_failed` | read-only | A Batch read failed; retrying the observation is safe. |
-| 10 | `batch_failed` | read-only | The Batch reached a failed or expired terminal state; inspect its error file before deciding what to do next. |
+| 10 | `batch_failed` | read-only | The Batch failed, expired, or its output file is unavailable; inspect remote error/output metadata before deciding what to do next. |
 
 A redirect is refused without forwarding credentials, but it is classified as code 5 rather than code 4 because a POST may have been processed before the redirect response arrived.
 
@@ -123,4 +123,4 @@ Custom endpoint approval is an explicit trust decision, not a statement of OpenA
 
 ## Secure output-platform support
 
-Actual generation currently supports macOS and Linux. Those builds pin every output-directory component with descriptor-relative `openat` operations, reject symlinks, preflight-check final targets, reserve private stages before the POST, and use atomic no-clobber/exchange publication with identity checks. Private stages/backups are retained rather than automatically deleted when a name could have been concurrently replaced. On other platforms the CLI fails closed with `secure_output_transactions_unsupported` before the API request; `--dry-run` remains available.
+Synchronous `generate` currently supports macOS and Linux. Those builds pin every output-directory component with descriptor-relative `openat` operations, reject symlinks, preflight-check final targets, reserve private stages before the billable POST, and use atomic no-clobber/exchange publication with identity checks. Batch output reservation happens during retrieval after remote work may have been billed, but uses the same atomic publication protections. Private stages/backups are retained rather than automatically deleted when a name could have been concurrently replaced. On other platforms the CLI fails closed with `secure_output_transactions_unsupported` before the API request; `--dry-run` remains available.

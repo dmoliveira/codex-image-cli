@@ -77,6 +77,14 @@ fn decode_one(encoded: Option<String>, format: OutputFormat) -> Result<Vec<u8>, 
     validate_image_bytes(decoded, format)
 }
 
+/// Decode one already-parsed image record without reserializing its JSON body.
+pub fn decode_base64_image(
+    encoded: Option<String>,
+    format: OutputFormat,
+) -> Result<Vec<u8>, AppError> {
+    decode_one(encoded, format)
+}
+
 pub fn validate_image_bytes(bytes: Vec<u8>, format: OutputFormat) -> Result<Vec<u8>, AppError> {
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(AppError::invalid_response(
