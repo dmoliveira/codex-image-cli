@@ -83,6 +83,25 @@ pub struct BatchRequestCounts {
     pub total: u32,
 }
 
+/// Token accounting returned by Image API responses and Batch JSONL items.
+/// The API may omit this object on older responses or compatible test
+/// endpoints, so every component is optional and callers must treat missing
+/// usage as unpriced rather than infer a charge.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub input_tokens_details: Option<TokenUsageDetails>,
+    pub output_tokens_details: Option<TokenUsageDetails>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TokenUsageDetails {
+    pub text_tokens: Option<u64>,
+    pub image_tokens: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FileInfo {
     pub id: String,

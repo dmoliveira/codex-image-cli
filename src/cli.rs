@@ -40,6 +40,8 @@ pub enum Command {
     },
     /// Check local configuration without sending a request or spending credits.
     Doctor,
+    /// Report locally recorded API image usage and estimated costs.
+    Cost(CostArgs),
     /// Print the non-interactive contract that AI agents can consume.
     AiHelp,
 }
@@ -56,6 +58,46 @@ pub enum BatchCommand {
     Cancel(BatchCancelArgs),
     /// Resume a safe local state or attach a manually reconciled remote ID.
     Recover(Box<BatchRecoverArgs>),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CostPeriod {
+    #[value(alias = "daily", alias = "day")]
+    Today,
+    #[value(alias = "weekly")]
+    Week,
+    #[value(alias = "monthly")]
+    Month,
+    #[value(alias = "yearly")]
+    Year,
+    All,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CostArgs {
+    /// Period to summarize. Dates are interpreted as UTC calendar dates.
+    #[arg(long, value_enum, default_value_t = CostPeriod::Today)]
+    pub period: CostPeriod,
+
+    /// Inclusive UTC start date in YYYY-MM-DD form. Overrides the period start.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub from: Option<String>,
+
+    /// Inclusive UTC end date in YYYY-MM-DD form. Overrides the period end.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub to: Option<String>,
+
+    /// Include one row for each calendar day in the selected range.
+    #[arg(long)]
+    pub day_by_day: bool,
+
+    /// Include one row for each recorded image-generation request.
+    #[arg(long)]
+    pub per_request: bool,
+
+    /// Read a specific ledger instead of the default local state ledger.
+    #[arg(long, value_name = "FILE")]
+    pub ledger_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

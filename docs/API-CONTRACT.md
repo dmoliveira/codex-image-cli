@@ -42,6 +42,24 @@ Failure reports add:
 
 Batch reports add `operation`, job/remote IDs, `remote_status`, `next_action`, and the same `outputs`, `retained_artifacts`, and `possibly_modified_paths` fields. `batch submit` uploads bounded JSONL input and creates a 24-hour Batch job with output retention configured for 30 days. `batch status` performs one read, `batch retrieve` can poll with `--wait` and a bounded `--max-wait-seconds`, `batch cancel` sends one cancellation request, and `batch recover` resumes only a confirmed-safe local state or attaches a manually reconciled remote ID after a read-only verification. Batch is API-only, locally limited to 8 image requests, and its job record never stores the prompt, API key, or image bytes. Remote POST outcomes are never automatically retried. Custom HTTPS and loopback endpoint approvals must be repeated explicitly on each operation; editable job records never grant credential-destination approval.
 
+## Cost tracking
+
+Every direct API image POST and every Batch image request gets an immutable local ledger record. A durable `started` record is synchronized before a potentially billable POST; later response/output observations resolve that record without double-counting repeated status, retrieval, or recovery operations. Unknown POST outcomes remain pending/unknown and are never silently treated as zero.
+
+The default ledger is `XDG_STATE_HOME/codex-image/costs.jsonl`, falling back to `XDG_CONFIG_HOME/codex-image/costs.jsonl` and then `$HOME/.local/state/codex-image/costs.jsonl`. It is append-only JSONL protected by a sidecar lock and contains request metadata, safe request IDs, Batch/custom IDs, optional token usage, outcome, and estimate metadata. Prompts, API keys, authorization headers, image bytes, and response bodies are never recorded. Use `--ledger-file FILE` to inspect another ledger.
+
+`cost` never reads a key or uses the network. Dates are inclusive UTC calendar dates. Examples:
+
+```bash
+codex-image cost --period today --json
+codex-image cost --period week --day-by-day --json
+codex-image cost --period month --per-request --json
+codex-image cost --period year --day-by-day --per-request --json
+codex-image cost --from 2026-08-01 --to 2026-08-08 --day-by-day --per-request --json
+```
+
+The report separates live and Batch totals and includes requests, image counts, priced/unpriced/pending/unknown counts, day rows, and optional per-request rows. Amounts are local estimates in USD, calculated from recorded token usage using the versioned GPT Image 2 rate snapshot; OpenAI billing/dashboard records remain authoritative. Missing usage is unpriced. Compatible loopback/custom origins are recorded but unpriced because the OpenAI rate card is not assumed for non-canonical endpoints. Batch uses the documented discounted rate card. The CLI does not infer a fixed per-image charge when token usage is absent. `--day-by-day` emits every selected UTC calendar day and rejects ranges longer than 3,700 days instead of silently omitting zero-usage days.
+
 ```json
 {
   "schema_version": 2,

@@ -66,6 +66,12 @@ codex-image batch retrieve \
   --json
 ```
 
+To inspect local API estimates without a key or network access, use `cost`. Add `--day-by-day` and `--per-request` when a detailed audit is needed:
+
+```bash
+codex-image cost --period week --day-by-day --per-request --json
+```
+
 ## Contract for tool authors
 
 - **No interaction:** do not use `stdin`; `--prompt-file -` is deliberately rejected to prevent blocking.
@@ -78,5 +84,6 @@ codex-image batch retrieve \
 - **No silent partial success:** every returned image must decode and match the requested PNG/JPEG/WebP container before publishing. Multi-file publishing cannot be atomically visible as a set, so an error reports possibly modified/retained paths instead of claiming success or deleting a concurrent replacement.
 - **Provider choice:** the default selects API billing through `OPENAI_API_KEY`; `--provider codex` explicitly selects the authenticated Codex CLI subscription.
 - **Quality gate:** `low` is the default; `--quality high` requires `--confirm-high-quality` after reviewing the cost warning.
+- **Cost accounting:** `cost` reads only the local append-only ledger; missing token usage, unknown outcomes, and custom origins are reported as unpriced/pending rather than guessed.
 
 See [API contract](API-CONTRACT.md) for schemas and exit-code semantics.

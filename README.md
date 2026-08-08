@@ -233,6 +233,20 @@ codex-image generate ... \
 
 The CLI rejects non-loopback HTTP, embedded URL credentials, query/fragment URLs, redirects, and proxy use. Treat a custom origin as a deliberate decision to send your API key to that service.
 
+### Cost reports 💰
+
+API image requests are recorded locally without prompts, keys, image bytes, or response bodies. Inspect the current day, calendar week/month/year, or an explicit UTC range without a network call:
+
+```bash
+codex-image cost --period today --json
+codex-image cost --period week --day-by-day --json
+codex-image cost --period month --per-request --json
+codex-image cost --period year --day-by-day --per-request --json
+codex-image cost --from 2026-08-01 --to 2026-08-08 --day-by-day --per-request --json
+```
+
+Reports separate live and Batch requests and show priced, unpriced, pending, and unknown outcomes. Amounts are local USD estimates from returned token usage and the versioned GPT Image 2 rate snapshot; OpenAI billing records remain authoritative. Missing usage and compatible custom/loopback origins are recorded but unpriced. The append-only ledger defaults to `XDG_STATE_HOME/codex-image/costs.jsonl`, with documented fallbacks in [the API contract](docs/API-CONTRACT.md).
+
 ## Cost and failure safety 🧯
 
 `codex-image` never retries the API POST. It uses these stable exit codes:

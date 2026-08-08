@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -105,6 +105,14 @@ fn read_request(stream: &mut TcpStream) -> RecordedRequest {
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codex-image"));
     command.stdin(Stdio::null());
+    command.env(
+        "XDG_STATE_HOME",
+        std::env::var_os("CODEX_IMAGE_TEST_STATE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("target/cost-test-state")
+            }),
+    );
     command
 }
 
@@ -264,7 +272,14 @@ fn spawn_batch_server_with_second_content_status(
                             "custom_id": custom_id,
                             "response": {
                                 "status_code": 200,
-                                "body": {"data": [{"b64_json": PNG_BASE64}]}
+                                "body": {
+                                    "data": [{"b64_json": PNG_BASE64}],
+                                    "usage": {
+                                        "input_tokens": 10,
+                                        "output_tokens": 20,
+                                        "total_tokens": 30
+                                    }
+                                }
                             }
                         })
                         .to_string()
@@ -280,7 +295,14 @@ fn spawn_batch_server_with_second_content_status(
                                 "custom_id": custom_id,
                                 "response": {
                                     "status_code": 200,
-                                    "body": {"data": [{"b64_json": PNG_BASE64}]}
+                                    "body": {
+                                        "data": [{"b64_json": PNG_BASE64}],
+                                        "usage": {
+                                            "input_tokens": 10,
+                                            "output_tokens": 20,
+                                            "total_tokens": 30
+                                        }
+                                    }
                                 }
                             })
                             .to_string()
@@ -372,7 +394,14 @@ fn spawn_terminal_batch_server_with_content_status(
                             "custom_id": custom_id,
                             "response": {
                                 "status_code": 200,
-                                "body": {"data": [{"b64_json": PNG_BASE64}]}
+                        "body": {
+                            "data": [{"b64_json": PNG_BASE64}],
+                            "usage": {
+                                "input_tokens": 10,
+                                "output_tokens": 20,
+                                "total_tokens": 30
+                            }
+                        }
                             }
                         })
                         .to_string()
@@ -614,7 +643,9 @@ fn codex_timeout_reports_non_retryable_process_metadata() {
 
 #[test]
 fn generate_writes_a_valid_png_from_a_loopback_mock() {
-    let body = format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#);
+    let body = format!(
+        r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}],"usage":{{"input_tokens":10,"output_tokens":20,"total_tokens":30}}}}"#
+    );
     let (url, server) = spawn_server("200 OK", body);
     let directory = safe_tempdir();
 
@@ -651,6 +682,56 @@ fn generate_writes_a_valid_png_from_a_loopback_mock() {
     assert!(request.authorization_was_present);
     assert_eq!(request.request_json["model"], "gpt-image-2");
     assert_eq!(request.request_json["n"], 1);
+}
+
+#[test]
+fn live_api_usage_is_recorded_without_pricing_custom_origins() {
+    let body = format!(
+        r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}],"usage":{{"input_tokens":10,"output_tokens":20,"total_tokens":30}}}}"#
+    );
+    let (url, server) = spawn_server("200 OK", body);
+    let directory = safe_tempdir();
+    let state_dir = directory.path().join("state");
+
+    let output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .env("XDG_STATE_HOME", &state_dir)
+        .args([
+            "generate",
+            "--provider",
+            "api",
+            "--prompt",
+            "account this image",
+            "--output-dir",
+            directory.path().to_str().unwrap(),
+            "--name",
+            "accounted",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(server.join().unwrap().path_is_correct);
+
+    let report_output = command()
+        .env_remove("OPENAI_API_KEY")
+        .env("XDG_STATE_HOME", &state_dir)
+        .args(["cost", "--period", "all", "--per-request", "--json"])
+        .output()
+        .unwrap();
+    assert!(report_output.status.success(), "{report_output:?}");
+    let report: Value = serde_json::from_slice(&report_output.stdout).unwrap();
+    assert_eq!(report["status"], "cost_report");
+    assert_eq!(report["totals"]["requests"], 1);
+    assert_eq!(report["totals"]["images"], 1);
+    assert_eq!(report["totals"]["priced_requests"], 0);
+    assert_eq!(report["totals"]["unpriced_requests"], 1);
+    assert_eq!(report["requests"][0]["transport"], "live");
+    assert_eq!(report["requests"][0]["usage"]["input_tokens"], 10);
+    assert!(report["requests"][0]["estimated_usd"].is_null());
 }
 
 #[test]
@@ -1002,6 +1083,29 @@ fn cancelled_batch_without_output_is_a_terminal_empty_success() {
     let repeated_report: Value = serde_json::from_slice(&repeated.stdout).unwrap();
     assert_eq!(repeated_report["status"], "cancelled");
     assert_eq!(repeated_report["request"]["attempted"], false);
+
+    let costs = command()
+        .env_remove("OPENAI_API_KEY")
+        .args(["cost", "--period", "all", "--per-request", "--json"])
+        .output()
+        .unwrap();
+    assert!(costs.status.success(), "{costs:?}");
+    let cost_report: Value = serde_json::from_slice(&costs.stdout).unwrap();
+    let operation = cost_report["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|request| {
+            request["operation_id"]
+                .as_str()
+                .is_some_and(|operation_id| {
+                    operation_id.contains(saved["job_id"].as_str().unwrap())
+                })
+        })
+        .unwrap();
+    assert_eq!(operation["outcome"], "unknown");
+    assert_eq!(operation["finalized"], true);
+    assert!(operation["estimated_usd"].is_null());
 }
 
 #[test]
