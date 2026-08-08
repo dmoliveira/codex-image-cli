@@ -720,12 +720,39 @@ mod tests {
 
     #[test]
     fn input_file_not_found_is_a_retryable_observation() {
-        use std::{io::Write, net::TcpListener, thread};
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+            time::{Duration, Instant},
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "test server timed out waiting for request"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0_u8; 2048];
+            let bytes = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..bytes])
+                .starts_with("GET /v1/files/file-input/content HTTP/"));
             stream
                 .write_all(
                     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

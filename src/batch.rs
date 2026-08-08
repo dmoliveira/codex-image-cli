@@ -25,14 +25,15 @@ use crate::{
     image::decode_base64_image,
     output::{
         derive_file_names, derive_output_paths, inspect_recovery_plan, read_regular_file,
-        read_regular_file_with_identity, verify_and_sync_plan, OutputIdentity, OutputTransaction,
-        OutputVerificationArtifact, RecoveryArtifact, RecoveryVerificationArtifact,
+        read_regular_file_with_identity, verify_and_sync_plan, verify_regular_file_identity,
+        OutputIdentity, OutputTransaction, OutputVerificationArtifact, RecoveryArtifact,
+        RecoveryVerificationArtifact, RetainedVerificationArtifact,
     },
     report::{AppError, BatchContext, BatchReport},
     MODEL,
 };
 
-pub const JOB_SCHEMA_VERSION: u8 = 6;
+pub const JOB_SCHEMA_VERSION: u8 = 7;
 const MAX_JOB_FILE_BYTES: usize = 256 * 1024;
 const MAX_RESULT_LINE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_OUTPUT_EXPIRY_SECONDS: u32 = 30 * 24 * 60 * 60;
@@ -124,6 +125,7 @@ pub struct PublishingPlan {
     pub artifacts: Vec<PublishingArtifact>,
     pub staged_artifacts: Vec<String>,
     pub retained_artifacts: Vec<String>,
+    pub retained_artifact_ids: Vec<OutputIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +150,30 @@ impl BatchFailure {
             error: Box::new(error),
             context: Box::new(context),
         }
+    }
+}
+
+fn attach_response_metadata(
+    failure: &mut BatchFailure,
+    http_status: u16,
+    request_id: Option<&str>,
+) {
+    let request_id = request_id.map(str::to_owned);
+    failure.error.set_http_status(http_status);
+    failure.error.set_request_id(request_id.clone());
+    failure.context.http_status = Some(http_status);
+    failure.context.request_id = request_id;
+}
+
+fn retain_artifact(
+    paths: &mut Vec<String>,
+    identities: &mut Vec<OutputIdentity>,
+    path: String,
+    identity: OutputIdentity,
+) {
+    if !paths.contains(&path) {
+        paths.push(path);
+        identities.push(identity);
     }
 }
 
@@ -325,14 +351,17 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     let file_info: FileInfo = match serde_json::from_slice::<FileInfo>(&upload.body) {
         Ok(file_info) if validate_remote_id(&file_info.id, "file_id").is_ok() => file_info,
         _ => {
+            let mut response_error = AppError::invalid_response(
+                "batch_input_upload_invalid",
+                "The file-upload response did not contain a safe file ID; do not retry automatically. Inspect the job and account files.",
+            );
+            response_error.set_http_status(upload.status);
+            response_error.set_request_id(upload.request_id.clone());
             let error = mark_unknown(
                 &job_file,
                 upload_in_flight.revision,
                 JobState::UploadOutcomeUnknown,
-                AppError::invalid_response(
-                    "batch_input_upload_invalid",
-                    "The file-upload response did not contain a safe file ID; do not retry automatically. Inspect the job and account files.",
-                ),
+                response_error,
             );
             return Err(failure(
                 error,
@@ -416,6 +445,9 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         match parse_batch_create_info(&created.body, &file_info.id, generation.n) {
             Ok(info) => info,
             Err(error) => {
+                let mut error = error;
+                error.set_http_status(created.status);
+                error.set_request_id(created.request_id.clone());
                 let error = mark_unknown(
                     &job_file,
                     create_in_flight.revision,
@@ -475,7 +507,7 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     report_context.request_id = created.request_id;
     if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
         report_context.next_action =
-            Some("inspect the Batch error file and run batch status".to_owned());
+            Some(terminal_batch_next_action(job.output_file_id.as_deref()).to_owned());
         return Err(BatchFailure::new(
             terminal_batch_error(job.remote_status.as_deref().unwrap_or_default()),
             report_context,
@@ -516,22 +548,30 @@ pub fn recover(args: &BatchRecoverArgs) -> Result<BatchReport, BatchFailure> {
             .get_file(&endpoint, &key, input_file_id)
             .map_err(|error| BatchFailure::new(error, context.clone()))?;
         let file_info: FileInfo = serde_json::from_slice(&response.body).map_err(|_| {
-            BatchFailure::new(
+            let mut failure = BatchFailure::new(
                 AppError::observation(
                     "batch_input_file_invalid",
                     "The confirmed input file lookup returned an invalid file object; retrying the read-only operation is safe.",
                 ),
                 context.clone(),
-            )
+            );
+            attach_response_metadata(&mut failure, response.status, response.request_id.as_deref());
+            failure
         })?;
         if file_info.id != input_file_id || file_info.purpose.as_deref() != Some("batch") {
-            return Err(BatchFailure::new(
+            let mut failure = BatchFailure::new(
                 AppError::observation(
                     "batch_input_file_mismatch",
                     "The confirmed input file is not a Batch-purpose file owned by the expected remote ID; retrying the read-only operation is safe.",
                 ),
-                context,
-            ));
+                context.clone(),
+            );
+            attach_response_metadata(
+                &mut failure,
+                response.status,
+                response.request_id.as_deref(),
+            );
+            return Err(failure);
         }
         let content = client
             .get_input_file_content(&endpoint, &key, input_file_id)
@@ -585,9 +625,24 @@ pub fn recover(args: &BatchRecoverArgs) -> Result<BatchReport, BatchFailure> {
             job.input_file_id.as_deref(),
             job.image_count,
         )
-        .map_err(|error| BatchFailure::new(error, context.clone()))?;
-        validate_remote_transition(&job, &info)
-            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        .map_err(|error| {
+            let mut failure = BatchFailure::new(error, context.clone());
+            attach_response_metadata(
+                &mut failure,
+                response.status,
+                response.request_id.as_deref(),
+            );
+            failure
+        })?;
+        validate_remote_transition(&job, &info).map_err(|error| {
+            let mut failure = BatchFailure::new(error, context.clone());
+            attach_response_metadata(
+                &mut failure,
+                response.status,
+                response.request_id.as_deref(),
+            );
+            failure
+        })?;
         job = persist_batch_observation(
             &job_file,
             &job,
@@ -602,7 +657,7 @@ pub fn recover(args: &BatchRecoverArgs) -> Result<BatchReport, BatchFailure> {
         context.request_id = response.request_id;
         if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
             context.next_action =
-                Some("inspect the Batch error file and run batch status".to_owned());
+                Some(terminal_batch_next_action(job.output_file_id.as_deref()).to_owned());
             return Err(BatchFailure::new(
                 terminal_batch_error(job.remote_status.as_deref().unwrap_or_default()),
                 context,
@@ -701,6 +756,9 @@ fn create_batch_from_job(
     let info = match parse_batch_create_info(&response.body, &input_file_id, job.image_count) {
         Ok(info) => info,
         Err(error) => {
+            let mut error = error;
+            error.set_http_status(response.status);
+            error.set_request_id(response.request_id.clone());
             let error = mark_unknown(
                 job_file,
                 create_in_flight.revision,
@@ -723,7 +781,8 @@ fn create_batch_from_job(
     context.http_status = Some(response.status);
     context.request_id = response.request_id;
     if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
-        context.next_action = Some("inspect the Batch error file and run batch status".to_owned());
+        context.next_action =
+            Some(terminal_batch_next_action(job.output_file_id.as_deref()).to_owned());
         return Err(BatchFailure::new(
             terminal_batch_error(job.remote_status.as_deref().unwrap_or_default()),
             context,
@@ -786,10 +845,27 @@ pub fn status(args: &BatchJobArgs) -> Result<BatchReport, BatchFailure> {
         job.input_file_id.as_deref(),
         job.image_count,
     )
-    .map_err(|error| BatchFailure::new(error, context.clone()))?;
-    validate_remote_transition(&job, &info)
-        .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    .map_err(|error| {
+        let mut failure = BatchFailure::new(error, context.clone());
+        attach_response_metadata(
+            &mut failure,
+            response.status,
+            response.request_id.as_deref(),
+        );
+        failure
+    })?;
+    validate_remote_transition(&job, &info).map_err(|error| {
+        let mut failure = BatchFailure::new(error, context.clone());
+        attach_response_metadata(
+            &mut failure,
+            response.status,
+            response.request_id.as_deref(),
+        );
+        failure
+    })?;
     set_context_from_info(&mut context, &info);
+    context.http_status = Some(response.status);
+    context.request_id = response.request_id.clone();
     let state = state_for_remote_status(&info.status);
     let updated = transition_if_revision(&job_file, job.revision, |job| {
         job.state = state;
@@ -802,12 +878,21 @@ pub fn status(args: &BatchJobArgs) -> Result<BatchReport, BatchFailure> {
             .map(PersistedBatchRequestCounts::from);
         Ok(())
     })
-    .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    .map_err(|error| {
+        let mut failure = BatchFailure::new(error, context.clone());
+        attach_response_metadata(
+            &mut failure,
+            response.status,
+            response.request_id.as_deref(),
+        );
+        failure
+    })?;
     context = context_from_job("batch.status", &job_file, &updated);
     context.http_status = Some(response.status);
-    context.request_id = response.request_id;
+    context.request_id = response.request_id.clone();
     if matches!(updated.remote_status.as_deref(), Some("failed" | "expired")) {
-        context.next_action = Some("inspect the Batch error file and run batch status".to_owned());
+        context.next_action =
+            Some(terminal_batch_next_action(updated.output_file_id.as_deref()).to_owned());
         return Err(BatchFailure::new(
             terminal_batch_error(updated.remote_status.as_deref().unwrap_or_default()),
             context,
@@ -843,6 +928,9 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
     if job.state == JobState::Retrieved {
         return recover_retrieved(&job, context);
     }
+    if job.state == JobState::Cancelled && job.output_file_id.is_none() {
+        return Ok(context.report(None));
+    }
     let batch_id = require_batch_id(&job, &context)?;
     let endpoint = endpoint_from_job(&job, &context, &args.job)?;
     let key = api_key().map_err(|error| BatchFailure::new(error, context.clone()))?;
@@ -870,9 +958,24 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
             job.input_file_id.as_deref(),
             job.image_count,
         )
-        .map_err(|error| BatchFailure::new(error, context.clone()))?;
-        validate_remote_transition(&job, &info)
-            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+        .map_err(|error| {
+            let mut failure = BatchFailure::new(error, context.clone());
+            attach_response_metadata(
+                &mut failure,
+                response.status,
+                response.request_id.as_deref(),
+            );
+            failure
+        })?;
+        validate_remote_transition(&job, &info).map_err(|error| {
+            let mut failure = BatchFailure::new(error, context.clone());
+            attach_response_metadata(
+                &mut failure,
+                response.status,
+                response.request_id.as_deref(),
+            );
+            failure
+        })?;
         if let Some(previous) = previous_info.as_ref() {
             validate_observation_progress(
                 Some(&previous.status),
@@ -881,14 +984,22 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
                 previous.request_counts.as_ref(),
                 &info,
             )
-            .map_err(|error| BatchFailure::new(error, context.clone()))?;
+            .map_err(|error| {
+                let mut failure = BatchFailure::new(error, context.clone());
+                attach_response_metadata(
+                    &mut failure,
+                    response.status,
+                    response.request_id.as_deref(),
+                );
+                failure
+            })?;
         }
         previous_info = Some(info.clone());
         context.http_status = Some(response.status);
-        context.request_id = response.request_id;
+        context.request_id = response.request_id.clone();
         set_context_from_info(&mut context, &info);
         if is_terminal_remote_status(&info.status) || !args.wait {
-            break info;
+            break (info, response.status, response.request_id.clone());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -900,6 +1011,7 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
         }
         thread::sleep(remaining.min(Duration::from_secs(args.poll_interval_seconds)));
     };
+    let (info, last_http_status, last_request_id) = info;
     let updated = transition_if_revision(&job_file, job.revision, |job| {
         job.state = state_for_remote_status(&info.status);
         job.remote_status = Some(info.status.clone());
@@ -911,18 +1023,16 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
             .map(PersistedBatchRequestCounts::from);
         Ok(())
     })
-    .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    .map_err(|error| {
+        let mut failure = BatchFailure::new(error, context.clone());
+        attach_response_metadata(&mut failure, last_http_status, last_request_id.as_deref());
+        failure
+    })?;
     context = context_from_job("batch.retrieve", &job_file, &updated);
-    if !matches!(
-        updated.remote_status.as_deref(),
-        Some("completed" | "cancelled")
-    ) {
-        if matches!(updated.remote_status.as_deref(), Some("failed" | "expired")) {
-            let error = terminal_batch_error(updated.remote_status.as_deref().unwrap_or_default());
-            context.next_action =
-                Some("inspect the Batch error file and run batch status".to_owned());
-            return Err(BatchFailure::new(error, context));
-        }
+    context.attempted = true;
+    context.http_status = Some(last_http_status);
+    context.request_id = last_request_id;
+    if !is_terminal_remote_status(updated.remote_status.as_deref().unwrap_or_default()) {
         let error = AppError::not_ready(
             "batch_not_ready",
             "The batch is still processing. Run batch retrieve again or add --wait with a bounded timeout.",
@@ -930,11 +1040,24 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
         context.next_action = Some("run batch retrieve --wait".to_owned());
         return Err(BatchFailure::new(error, context));
     }
+    if matches!(updated.remote_status.as_deref(), Some("failed" | "expired"))
+        && updated.output_file_id.is_none()
+    {
+        let error = terminal_batch_error(updated.remote_status.as_deref().unwrap_or_default());
+        context.next_action = Some(terminal_batch_next_action(None).to_owned());
+        return Err(BatchFailure::new(error, context));
+    }
+    if updated.remote_status.as_deref() == Some("cancelled") && updated.output_file_id.is_none() {
+        context.next_action = None;
+        return Ok(context.report(None));
+    }
     let Some(output_file_id) = updated.output_file_id.as_deref() else {
-        let error = AppError::invalid_response(
+        let error = AppError::batch_failed(
             "batch_output_missing",
-            "The batch reached a terminal state without an output file. Inspect the batch status and error file before retrying.",
+            "The completed Batch has no output file. Inspect the Batch status, request counts, and any error file before deciding what to do next.",
         );
+        context.next_action =
+            Some("inspect the Batch status, request counts, and error file".to_owned());
         return Err(BatchFailure::new(error, context));
     };
     let content = match client.get_file_content(&endpoint, &key, output_file_id) {
@@ -959,7 +1082,7 @@ pub fn cancel(args: &BatchCancelArgs) -> Result<BatchReport, BatchFailure> {
     if let Some(status) = job.remote_status.as_deref() {
         if matches!(status, "failed" | "expired") {
             context.next_action =
-                Some("inspect the Batch error file and run batch status".to_owned());
+                Some(terminal_batch_next_action(job.output_file_id.as_deref()).to_owned());
             return Err(BatchFailure::new(terminal_batch_error(status), context));
         }
         if matches!(status, "completed" | "cancelled") {
@@ -1047,7 +1170,8 @@ pub fn cancel(args: &BatchCancelArgs) -> Result<BatchReport, BatchFailure> {
     context.http_status = Some(response.status);
     context.request_id = response.request_id;
     if matches!(updated.remote_status.as_deref(), Some("failed" | "expired")) {
-        context.next_action = Some("inspect the Batch error file and run batch status".to_owned());
+        context.next_action =
+            Some(terminal_batch_next_action(updated.output_file_id.as_deref()).to_owned());
         return Err(BatchFailure::new(
             terminal_batch_error(updated.remote_status.as_deref().unwrap_or_default()),
             context,
@@ -1066,9 +1190,21 @@ fn publish_batch_content(
     http_status: u16,
     request_id: Option<String>,
 ) -> Result<BatchReport, BatchFailure> {
+    context.http_status = Some(http_status);
+    context.request_id = request_id.clone();
     let output_dir = PathBuf::from(&job.output_dir);
     let paths = derive_output_paths(&output_dir, &job.output_names);
-    let images = parse_batch_output(content, job)?;
+    let images = match parse_batch_output(content, job) {
+        Ok(images) => images,
+        Err(mut failure) => {
+            let next_action = failure.context.next_action.clone();
+            let mut parse_context = context.clone();
+            parse_context.next_action = next_action;
+            failure.context = Box::new(parse_context);
+            attach_response_metadata(&mut failure, http_status, request_id.as_deref());
+            return Err(failure);
+        }
+    };
     let digests = images.iter().map(|image| sha256(image)).collect::<Vec<_>>();
     let previous_plan = job.publishing.as_ref();
     let mut selected_indices = Vec::new();
@@ -1137,7 +1273,11 @@ fn publish_batch_content(
     } else {
         OutputTransaction::reserve(&output_dir, selected_names, job.overwrite)
     }
-    .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    .map_err(|error| {
+        let mut failure = BatchFailure::new(error, context.clone());
+        attach_response_metadata(&mut failure, http_status, request_id.as_deref());
+        failure
+    })?;
     let selected_images = selected_indices
         .iter()
         .map(|index| images[*index].clone())
@@ -1177,15 +1317,61 @@ fn publish_batch_content(
         .iter()
         .map(|artifact| artifact.staged_path.clone())
         .collect::<Vec<_>>();
-    let retained_artifacts = artifacts
-        .iter()
-        .filter(|artifact| artifact.expected_target.is_some())
-        .map(|artifact| artifact.staged_path.clone())
-        .collect::<Vec<_>>();
+    let mut retained_artifacts = Vec::new();
+    let mut retained_artifact_ids = Vec::new();
+    if let Some(previous_plan) = previous_plan {
+        for (path, identity) in previous_plan
+            .retained_artifacts
+            .iter()
+            .zip(&previous_plan.retained_artifact_ids)
+        {
+            let selected = selected_indices
+                .iter()
+                .any(|index| previous_plan.artifacts[*index].staged_path == *path);
+            if !selected {
+                retain_artifact(
+                    &mut retained_artifacts,
+                    &mut retained_artifact_ids,
+                    path.clone(),
+                    *identity,
+                );
+            }
+        }
+        for index in &selected_indices {
+            let previous_artifact = &previous_plan.artifacts[*index];
+            if let Some(expected_id) = previous_artifact.expected_target {
+                if verify_regular_file_identity(
+                    Path::new(&previous_artifact.staged_path),
+                    expected_id,
+                )
+                .is_ok()
+                {
+                    retain_artifact(
+                        &mut retained_artifacts,
+                        &mut retained_artifact_ids,
+                        previous_artifact.staged_path.clone(),
+                        expected_id,
+                    );
+                }
+            }
+        }
+    }
+    for (position, index) in selected_indices.iter().enumerate() {
+        if let Some(expected_id) = new_expected_ids[position] {
+            retain_artifact(
+                &mut retained_artifacts,
+                &mut retained_artifact_ids,
+                new_staged_paths[position].clone(),
+                expected_id,
+            );
+        }
+        debug_assert_eq!(artifacts[*index].staged_path, new_staged_paths[position]);
+    }
     let plan = PublishingPlan {
         artifacts,
         staged_artifacts,
         retained_artifacts: retained_artifacts.clone(),
+        retained_artifact_ids,
     };
     let publishing_job = match transition_if_revision(job_file, job.revision, |job| {
         job.state = JobState::Publishing;
@@ -1400,7 +1586,12 @@ fn mark_output_unavailable(
         error.code,
         "batch_output_unavailable" | "batch_output_expired"
     ) {
-        if let Err(state_error) = transition_if_revision(job_file, job.revision, |job| {
+        if job.state == JobState::Publishing {
+            context.next_action = Some(
+                "inspect the local publication journal and remote Batch output before retrying"
+                    .to_owned(),
+            );
+        } else if let Err(state_error) = transition_if_revision(job_file, job.revision, |job| {
             job.state = JobState::Failed;
             job.publishing = None;
             Ok(())
@@ -1410,9 +1601,10 @@ fn mark_output_unavailable(
                 error.message, state_error.message
             );
             error.automatic_retry_safe = false;
+        } else {
+            context.next_action =
+                Some("inspect the remote Batch record and error/output files".to_owned());
         }
-        context.next_action =
-            Some("inspect the remote Batch record and error/output files".to_owned());
     }
     context.http_status = error.http_status.or(context.http_status);
     context.request_id = error.request_id.clone().or(context.request_id);
@@ -1425,7 +1617,19 @@ fn verify_publishing_plan(
     context: &mut BatchContext,
 ) -> Result<Vec<String>, BatchFailure> {
     let mut verification = Vec::with_capacity(plan.artifacts.len());
-    let mut possibly_modified_paths = Vec::with_capacity(plan.artifacts.len() * 2);
+    let mut retained_verification: Vec<RetainedVerificationArtifact> =
+        Vec::with_capacity(plan.retained_artifacts.len());
+    let mut possibly_modified_paths =
+        Vec::with_capacity(plan.artifacts.len() + plan.retained_artifacts.len());
+    if plan.retained_artifacts.len() != plan.retained_artifact_ids.len() {
+        return Err(BatchFailure::new(
+            AppError::preflight(
+                "publishing_journal_invalid",
+                "The publication journal retained-artifact identity count is inconsistent.",
+            ),
+            context.clone(),
+        ));
+    }
     for artifact in &plan.artifacts {
         let output_path = Path::new(&artifact.path);
         let Some(output_name) = output_path.file_name().and_then(|name| name.to_str()) else {
@@ -1446,8 +1650,13 @@ fn verify_publishing_plan(
                 context.clone(),
             ));
         }
-        let retained_name = if artifact.expected_target.is_some() {
-            if !plan.retained_artifacts.contains(&artifact.staged_path) {
+        if let Some(expected_id) = artifact.expected_target {
+            let retained_id = plan
+                .retained_artifacts
+                .iter()
+                .zip(&plan.retained_artifact_ids)
+                .find_map(|(path, identity)| (path == &artifact.staged_path).then_some(*identity));
+            if retained_id != Some(expected_id) {
                 return Err(BatchFailure::new(
                     AppError::preflight(
                         "publishing_journal_invalid",
@@ -1456,60 +1665,65 @@ fn verify_publishing_plan(
                     context.clone(),
                 ));
             }
-            let retained_path = Path::new(&artifact.staged_path);
-            if retained_path.parent() != Some(output_dir) {
-                return Err(BatchFailure::new(
-                    AppError::preflight(
-                        "publishing_journal_invalid",
-                        "The publication plan retained artifact is outside the output directory.",
-                    ),
-                    context.clone(),
-                ));
-            }
-            Some(
-                retained_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| {
-                        BatchFailure::new(
-                            AppError::preflight(
-                                "publishing_journal_invalid",
-                                "The publication plan contains an invalid retained path.",
-                            ),
-                            context.clone(),
-                        )
-                    })?
-                    .to_owned(),
-            )
-        } else {
-            None
-        };
-        possibly_modified_paths.push(PathBuf::from(&artifact.path));
-        if let Some(retained_name) = retained_name.as_ref() {
-            possibly_modified_paths.push(PathBuf::from(&artifact.staged_path));
-            if !retained_name.starts_with(".codex-image-stage-") {
-                return Err(BatchFailure::new(
-                    AppError::preflight(
-                        "publishing_journal_invalid",
-                        "The publication plan retained artifact name is unsafe.",
-                    ),
-                    context.clone(),
-                ));
-            }
         }
+        possibly_modified_paths.push(PathBuf::from(&artifact.path));
         verification.push(OutputVerificationArtifact {
             output_name: output_name.to_owned(),
             expected_output_id: artifact.staged_identity,
             expected_sha256: artifact.sha256.clone(),
-            retained_name,
-            expected_retained_id: artifact.expected_target,
         });
     }
-    let outputs = verify_and_sync_plan(output_dir, &verification).map_err(|error| {
-        let mut error = error;
-        error.add_possibly_modified_paths(possibly_modified_paths);
-        BatchFailure::new(error, context.clone())
-    })?;
+    for (path, expected_id) in plan
+        .retained_artifacts
+        .iter()
+        .zip(&plan.retained_artifact_ids)
+    {
+        let retained_path = Path::new(path);
+        let Some(retained_name) = retained_path.file_name().and_then(|name| name.to_str()) else {
+            return Err(BatchFailure::new(
+                AppError::preflight(
+                    "publishing_journal_invalid",
+                    "The publication plan contains an invalid retained path.",
+                ),
+                context.clone(),
+            ));
+        };
+        if retained_path.parent() != Some(output_dir)
+            || !retained_name.starts_with(".codex-image-stage-")
+        {
+            return Err(BatchFailure::new(
+                AppError::preflight(
+                    "publishing_journal_invalid",
+                    "The publication plan retained artifact path is unsafe.",
+                ),
+                context.clone(),
+            ));
+        }
+        if retained_verification
+            .iter()
+            .any(|artifact| artifact.name == retained_name)
+        {
+            return Err(BatchFailure::new(
+                AppError::preflight(
+                    "publishing_journal_invalid",
+                    "The publication plan contains duplicate retained artifacts.",
+                ),
+                context.clone(),
+            ));
+        }
+        possibly_modified_paths.push(PathBuf::from(path));
+        retained_verification.push(RetainedVerificationArtifact {
+            name: retained_name.to_owned(),
+            expected_id: *expected_id,
+        });
+    }
+    let outputs = verify_and_sync_plan(output_dir, &verification, &retained_verification).map_err(
+        |error| {
+            let mut error = error;
+            error.add_possibly_modified_paths(possibly_modified_paths);
+            BatchFailure::new(error, context.clone())
+        },
+    )?;
     Ok(outputs
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -1965,6 +2179,14 @@ fn terminal_batch_error(status: &str) -> AppError {
     }
 }
 
+fn terminal_batch_next_action(output_file_id: Option<&str>) -> &'static str {
+    if output_file_id.is_some() {
+        "run batch retrieve to publish any available results"
+    } else {
+        "inspect the Batch error file and run batch status"
+    }
+}
+
 fn is_known_remote_status(status: &str) -> bool {
     matches!(
         status,
@@ -2319,16 +2541,11 @@ fn validate_job(job: &BatchJob) -> Result<(), AppError> {
             .iter()
             .map(|artifact| artifact.staged_path.clone())
             .collect::<Vec<_>>();
-        let expected_retained = plan
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.expected_target.is_some())
-            .map(|artifact| artifact.staged_path.clone())
-            .collect::<Vec<_>>();
         if expected_staged.iter().collect::<HashSet<_>>().len() != expected_staged.len()
-            || expected_retained.iter().collect::<HashSet<_>>().len() != expected_retained.len()
+            || plan.retained_artifacts.len() != plan.retained_artifact_ids.len()
+            || plan.retained_artifacts.iter().collect::<HashSet<_>>().len()
+                != plan.retained_artifacts.len()
             || plan.staged_artifacts != expected_staged
-            || plan.retained_artifacts != expected_retained
         {
             return Err(invalid_job(
                 "The Batch job publication journal does not match its per-output plan.",
@@ -2366,11 +2583,47 @@ fn validate_job(job: &BatchJob) -> Result<(), AppError> {
                     "The Batch job publication digest plan is invalid.",
                 ));
             }
+            if let Some(expected_id) = artifact.expected_target {
+                let retained = plan
+                    .retained_artifacts
+                    .iter()
+                    .zip(&plan.retained_artifact_ids)
+                    .any(|(path, identity)| {
+                        path == &artifact.staged_path && *identity == expected_id
+                    });
+                if !retained {
+                    return Err(invalid_job(
+                        "The Batch job overwrite backup identity is not retained.",
+                    ));
+                }
+            }
         }
         if job.retained_artifacts != plan.retained_artifacts {
             return Err(invalid_job(
                 "The Batch job retained-artifact journal does not match its publication plan.",
             ));
+        }
+        let staged_names = expected_staged
+            .iter()
+            .filter_map(|path| Path::new(path).file_name()?.to_str())
+            .collect::<HashSet<_>>();
+        let mut retained_names = HashSet::new();
+        for path in &plan.retained_artifacts {
+            let path = Path::new(path);
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return Err(invalid_job(
+                    "The Batch job retained-artifact filename is invalid.",
+                ));
+            };
+            if path.parent() != Some(Path::new(&job.output_dir))
+                || !name.starts_with(".codex-image-stage-")
+                || !retained_names.insert(name)
+                || (journal_names.contains(name) && !staged_names.contains(name))
+            {
+                return Err(invalid_job(
+                    "The Batch job retained-artifact journal contains an unsafe or colliding name.",
+                ));
+            }
         }
         for path in plan
             .staged_artifacts
@@ -2456,7 +2709,10 @@ fn validate_state_invariants(job: &BatchJob) -> Result<(), AppError> {
         JobState::Publishing | JobState::Retrieved => {
             has_input
                 && has_batch
-                && matches!(status, Some("completed" | "cancelled"))
+                && matches!(
+                    status,
+                    Some("completed" | "failed" | "expired" | "cancelled")
+                )
                 && job.publishing.is_some()
         }
         JobState::Failed => {
@@ -2798,6 +3054,22 @@ mod tests {
             serde_json::from_value::<BatchJob>(value).unwrap().job_id,
             "job-test"
         );
+        let job_file = Path::new("/tmp/job-test.json");
+        let failure = publish_batch_content(
+            job_file,
+            &job,
+            b"not-json",
+            context_from_job("batch.retrieve", job_file, &job),
+            200,
+            Some("request-test".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(failure.error.code, "batch_result_invalid_json");
+        assert_eq!(
+            failure.context.job_file.as_deref(),
+            Some("/tmp/job-test.json")
+        );
+        assert_eq!(failure.context.request_id.as_deref(), Some("request-test"));
         let mut invalid = serde_json::to_value(&job).unwrap();
         invalid["state"] = serde_json::json!("input_uploaded");
         assert!(validate_job(&serde_json::from_value(invalid).unwrap()).is_err());
@@ -2824,6 +3096,7 @@ mod tests {
             artifacts: vec![artifact],
             staged_artifacts: vec!["/tmp/images/.codex-image-stage-test".to_owned()],
             retained_artifacts: Vec::new(),
+            retained_artifact_ids: Vec::new(),
         };
         let mut unknown_plan = serde_json::to_value(&plan).unwrap();
         unknown_plan["unexpected"] = serde_json::json!(true);

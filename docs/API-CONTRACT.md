@@ -65,6 +65,10 @@ Batch reports add `operation`, job/remote IDs, `remote_status`, `next_action`, a
 
 `request.provider` is `api` or `codex`. `request.model` is present only when the provider guarantees the model (`gpt-image-2` for `api`); Codex's built-in image model is intentionally not claimed. `http.status` is present only for API responses. Codex process failures may add `process_exit_code`, `process_timed_out`, `diagnostics_bytes`, and `diagnostics_truncated` to `error`.
 
+A cancelled Batch without an output file is a successful terminal observation with `status: "cancelled"` and an empty `outputs` array. If a cancelled Batch has an output file, retrieval uses the same all-or-nothing result validation as other Batch outputs; partial JSONL results are not published.
+
+Terminal `failed` or `expired` Batches are also retrieved when `output_file_id` is present, so available completed results are not discarded. Without an output file, retrieval reports the terminal Batch failure and retains any available error metadata.
+
 ## Exit codes
 
 | Code | Status | API request attempted? | Agent behavior |

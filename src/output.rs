@@ -27,8 +27,12 @@ pub struct OutputVerificationArtifact {
     pub output_name: String,
     pub expected_output_id: OutputIdentity,
     pub expected_sha256: String,
-    pub retained_name: Option<String>,
-    pub expected_retained_id: Option<OutputIdentity>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetainedVerificationArtifact {
+    pub name: String,
+    pub expected_id: OutputIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +113,7 @@ mod secure {
 
     use super::{
         HashSet, OutputIdentity, OutputVerificationArtifact, RecoveryArtifact, RecoveryObservation,
-        RecoveryVerificationArtifact,
+        RecoveryVerificationArtifact, RetainedVerificationArtifact,
     };
 
     type FileId = OutputIdentity;
@@ -1160,6 +1164,7 @@ mod secure {
     pub fn verify_and_sync_plan(
         output_dir: &Path,
         artifacts: &[OutputVerificationArtifact],
+        retained_artifacts: &[RetainedVerificationArtifact],
     ) -> Result<Vec<PathBuf>, AppError> {
         let directory = PinnedDirectory::open(output_dir).map_err(|_| {
             AppError::output_commit(
@@ -1168,7 +1173,7 @@ mod secure {
             )
         })?;
         let mut seen_names = HashSet::new();
-        let mut checked = Vec::with_capacity(artifacts.len() * 2);
+        let mut checked = Vec::with_capacity(artifacts.len() + retained_artifacts.len());
         let mut outputs = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
             if !is_safe_output_name(&artifact.output_name)
@@ -1254,51 +1259,49 @@ mod secure {
             })?;
             checked.push((artifact.output_name.clone(), identity));
             outputs.push(directory.display_path(&artifact.output_name));
-
-            if let (Some(retained_name), Some(expected_retained_id)) =
-                (&artifact.retained_name, artifact.expected_retained_id)
+        }
+        for retained_artifact in retained_artifacts {
+            if !is_private_stage_name(&retained_artifact.name)
+                || !seen_names.insert(retained_artifact.name.clone())
             {
-                if !is_private_stage_name(retained_name)
-                    || !seen_names.insert(retained_name.clone())
-                {
-                    return Err(AppError::preflight(
-                        "publishing_journal_invalid",
-                        "The publication plan contains an unsafe or duplicate retained artifact name.",
-                    ));
-                }
-                let retained = open_file_component(directory.directory(), retained_name.as_ref())
-                    .map_err(|_| {
-                    AppError::output_commit(
-                        "publishing_retained_changed",
-                        "A retained publication artifact is missing or could not be opened safely.",
-                    )
-                })?;
-                let retained_metadata = retained.metadata().map_err(|_| {
-                    AppError::output_commit(
-                        "publishing_retained_changed",
-                        "A retained publication artifact could not be inspected safely.",
-                    )
-                })?;
-                let retained_identity = OutputIdentity {
-                    device: retained_metadata.dev(),
-                    inode: retained_metadata.ino(),
-                };
-                if !retained_metadata.file_type().is_file()
-                    || retained_identity != expected_retained_id
-                {
-                    return Err(AppError::output_commit(
-                        "publishing_retained_changed",
-                        "A retained publication artifact changed since it was recorded.",
-                    ));
-                }
-                retained.sync_all().map_err(|_| {
-                    AppError::output_commit(
-                        "publishing_retained_changed",
-                        "A retained publication artifact could not be synchronized safely.",
-                    )
-                })?;
-                checked.push((retained_name.clone(), retained_identity));
+                return Err(AppError::preflight(
+                    "publishing_journal_invalid",
+                    "The publication plan contains an unsafe or duplicate retained artifact name.",
+                ));
             }
+            let retained =
+                open_file_component(directory.directory(), retained_artifact.name.as_ref())
+                    .map_err(|_| {
+                        AppError::output_commit(
+                    "publishing_retained_changed",
+                    "A retained publication artifact is missing or could not be opened safely.",
+                )
+                    })?;
+            let retained_metadata = retained.metadata().map_err(|_| {
+                AppError::output_commit(
+                    "publishing_retained_changed",
+                    "A retained publication artifact could not be inspected safely.",
+                )
+            })?;
+            let retained_identity = OutputIdentity {
+                device: retained_metadata.dev(),
+                inode: retained_metadata.ino(),
+            };
+            if !retained_metadata.file_type().is_file()
+                || retained_identity != retained_artifact.expected_id
+            {
+                return Err(AppError::output_commit(
+                    "publishing_retained_changed",
+                    "A retained publication artifact changed since it was recorded.",
+                ));
+            }
+            retained.sync_all().map_err(|_| {
+                AppError::output_commit(
+                    "publishing_retained_changed",
+                    "A retained publication artifact could not be synchronized safely.",
+                )
+            })?;
+            checked.push((retained_artifact.name.clone(), retained_identity));
         }
         directory.directory().sync_all().map_err(|_| {
             AppError::output_commit(
@@ -1933,6 +1936,7 @@ pub fn sync_regular_file_identity(
 pub fn verify_and_sync_plan(
     _output_dir: &Path,
     _artifacts: &[OutputVerificationArtifact],
+    _retained_artifacts: &[RetainedVerificationArtifact],
 ) -> Result<Vec<PathBuf>, AppError> {
     Err(AppError::preflight(
         "secure_output_transactions_unsupported",

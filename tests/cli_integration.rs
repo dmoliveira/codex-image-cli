@@ -5,7 +5,7 @@ use std::{
     path::Path,
     process::{Command, Stdio},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -182,27 +182,82 @@ fn custom_ids_from_multipart(body: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn spawn_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+fn spawn_fixed_response_server(
+    method: &str,
+    path: &str,
+    status: &str,
+    body: &str,
+) -> (String, JoinHandle<RawHttpRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let method = method.to_owned();
+    let path = path.to_owned();
+    let status = status.to_owned();
+    let body = body.to_owned();
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "fixed test server timed out");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fixed test server accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        let request = read_raw_request(&mut stream);
+        assert_eq!(request.method, method);
+        assert_eq!(request.path, path);
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: recovery-test\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        request
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+fn spawn_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    spawn_batch_server_with_second_content_status("200 OK")
+}
+
+fn spawn_batch_server_with_second_content_status(
+    second_content_status: &str,
+) -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let second_content_status = second_content_status.to_owned();
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
         let mut custom_ids = Vec::new();
-        for index in 0..6 {
-            let (mut stream, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while requests.len() < 6 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let index = requests.len();
             let request = read_raw_request(&mut stream);
             if index == 0 {
                 custom_ids = custom_ids_from_multipart(&request.body);
             }
-            let body = match (index, request.path.as_str()) {
-                (0, "/v1/files") => r#"{"id":"file-input"}"#.to_owned(),
-                (1, "/v1/batches") => {
+            let body = match (index, request.method.as_str(), request.path.as_str()) {
+                (0, "POST", "/v1/files") => r#"{"id":"file-input"}"#.to_owned(),
+                (1, "POST", "/v1/batches") => {
                     r#"{"id":"batch-test","status":"validating","input_file_id":"file-input"}"#.to_owned()
                 }
-                (2, "/v1/batches/batch-test") | (3, "/v1/batches/batch-test") => {
+                (2, "GET", "/v1/batches/batch-test")
+                | (3, "GET", "/v1/batches/batch-test") => {
                     r#"{"id":"batch-test","status":"completed","input_file_id":"file-input","output_file_id":"file-output"}"#.to_owned()
                 }
-                (4, "/v1/files/file-output/content") => custom_ids
+                (4, "GET", "/v1/files/file-output/content") => custom_ids
                     .iter()
                     .map(|custom_id| {
                         serde_json::json!({
@@ -216,35 +271,156 @@ fn spawn_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
                     })
                     .collect::<Vec<_>>()
                     .join("\n"),
-                (5, "/v1/files/file-output/content") => custom_ids
-                    .iter()
-                    .map(|custom_id| {
-                        serde_json::json!({
-                            "custom_id": custom_id,
-                            "response": {
-                                "status_code": 200,
-                                "body": {"data": [{"b64_json": PNG_BASE64}]}
-                            }
+                (5, "GET", "/v1/files/file-output/content")
+                    if second_content_status.starts_with("200") =>
+                    custom_ids
+                        .iter()
+                        .map(|custom_id| {
+                            serde_json::json!({
+                                "custom_id": custom_id,
+                                "response": {
+                                    "status_code": 200,
+                                    "body": {"data": [{"b64_json": PNG_BASE64}]}
+                                }
+                            })
+                            .to_string()
                         })
-                        .to_string()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                (5, "GET", "/v1/files/file-output/content") => "{}".to_owned(),
                 _ => panic!("unexpected batch request {index} {}", request.path),
             };
-            let content_type = if index == 4 {
+            let content_type = if index == 4 && second_content_status.starts_with("200") {
                 "application/jsonl"
             } else {
                 "application/json"
             };
+            let response_status = if index == 5 {
+                second_content_status.as_str()
+            } else {
+                "200 OK"
+            };
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: batch-test\r\n\r\n{body}",
+                "HTTP/1.1 {response_status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: batch-test\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(response.as_bytes()).unwrap();
             stream.flush().unwrap();
             requests.push(request);
         }
+        assert_eq!(requests.len(), 6, "batch test server timed out");
+        requests
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+fn spawn_terminal_batch_server(
+    status: &str,
+    output_file_id: Option<&str>,
+) -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    spawn_terminal_batch_server_with_content_status(status, output_file_id, "200 OK")
+}
+
+fn spawn_terminal_batch_server_with_content_status(
+    status: &str,
+    output_file_id: Option<&str>,
+    content_status: &str,
+) -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let status = status.to_owned();
+    let output_file_id = output_file_id.map(str::to_owned);
+    let content_status = content_status.to_owned();
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let request_count = if output_file_id.is_some() { 4 } else { 3 };
+        let mut requests = Vec::new();
+        let mut custom_ids = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while requests.len() < request_count && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let index = requests.len();
+            let request = read_raw_request(&mut stream);
+            if index == 0 {
+                custom_ids = custom_ids_from_multipart(&request.body);
+            }
+            let body = match (index, request.method.as_str(), request.path.as_str()) {
+                (0, "POST", "/v1/files") => r#"{"id":"file-input"}"#.to_owned(),
+                (1, "POST", "/v1/batches") => {
+                    r#"{"id":"batch-terminal","status":"validating","input_file_id":"file-input"}"#
+                        .to_owned()
+                }
+                (2, "GET", "/v1/batches/batch-terminal") => {
+                    let mut value = serde_json::json!({
+                        "id": "batch-terminal",
+                        "status": status,
+                        "input_file_id": "file-input"
+                    });
+                    if let Some(output_file_id) = output_file_id.as_deref() {
+                        value["output_file_id"] = serde_json::json!(output_file_id);
+                    }
+                    value.to_string()
+                }
+                (3, "GET", "/v1/files/file-output/content") => custom_ids
+                    .iter()
+                    .map(|custom_id| {
+                        serde_json::json!({
+                            "custom_id": custom_id,
+                            "response": {
+                                "status_code": 200,
+                                "body": {"data": [{"b64_json": PNG_BASE64}]}
+                            }
+                        })
+                        .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => panic!(
+                    "unexpected terminal batch request {index}: {} {}",
+                    request.method, request.path
+                ),
+            };
+            let content_type = if index == 3 {
+                if content_status.starts_with("200") {
+                    "application/jsonl"
+                } else {
+                    "application/json"
+                }
+            } else {
+                "application/json"
+            };
+            let response_status = if index == 3 {
+                content_status.as_str()
+            } else {
+                "200 OK"
+            };
+            let body = if index == 3 && !content_status.starts_with("200") {
+                "{}".to_owned()
+            } else {
+                body
+            };
+            let request_id = if index == 3 {
+                "content-test"
+            } else {
+                "terminal-test"
+            };
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: {request_id}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            requests.push(request);
+        }
+        assert_eq!(
+            requests.len(),
+            request_count,
+            "terminal test server timed out"
+        );
         requests
     });
     (format!("http://{address}/v1"), handle)
@@ -752,6 +928,449 @@ fn clap_parse_failure_respects_the_json_contract() {
 }
 
 #[test]
+fn cancelled_batch_without_output_is_a_terminal_empty_success() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let job_file = directory.path().join("cancelled-job.json");
+    let (url, server) = spawn_terminal_batch_server("cancelled", None);
+
+    let submitted = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "submit",
+            "--provider",
+            "api",
+            "--prompt",
+            "cancel me",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--name",
+            "cancelled",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(submitted.status.success(), "{submitted:?}");
+
+    let retrieved = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(retrieved.status.success(), "{retrieved:?}");
+    let report: Value = serde_json::from_slice(&retrieved.stdout).unwrap();
+    assert_eq!(report["status"], "cancelled");
+    assert_eq!(report["remote_status"], "cancelled");
+    assert!(report["outputs"].as_array().unwrap().is_empty());
+    assert_eq!(report["http"]["status"], 200);
+    assert_eq!(report["request"]["request_id"], "terminal-test");
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests
+        .iter()
+        .all(|request| !request.path.contains("content")));
+
+    let saved: Value = serde_json::from_slice(&fs::read(&job_file).unwrap()).unwrap();
+    assert_eq!(saved["state"], "cancelled");
+
+    let repeated = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success(), "{repeated:?}");
+    let repeated_report: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated_report["status"], "cancelled");
+    assert_eq!(repeated_report["request"]["attempted"], false);
+}
+
+#[test]
+fn completed_batch_without_output_is_a_terminal_batch_failure() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let job_file = directory.path().join("completed-job.json");
+    let (url, server) = spawn_terminal_batch_server("completed", None);
+
+    let submitted = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "submit",
+            "--provider",
+            "api",
+            "--prompt",
+            "complete without output",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--name",
+            "completed",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(submitted.status.success(), "{submitted:?}");
+
+    let retrieved = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(retrieved.status.code(), Some(10), "{retrieved:?}");
+    let report: Value = serde_json::from_slice(&retrieved.stdout).unwrap();
+    assert_eq!(report["status"], "batch_failed");
+    assert_eq!(report["error"]["code"], "batch_output_missing");
+    assert_eq!(report["http"]["status"], 200);
+    assert_eq!(report["request"]["request_id"], "terminal-test");
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests
+        .iter()
+        .all(|request| !request.path.contains("content")));
+}
+
+fn assert_terminal_batch_with_output(status: &str) {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let job_file = directory.path().join(format!("{status}-job.json"));
+    let (url, server) = spawn_terminal_batch_server(status, Some("file-output"));
+
+    let submitted = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "submit",
+            "--provider",
+            "api",
+            "--prompt",
+            status,
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--name",
+            status,
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(submitted.status.success(), "{submitted:?}");
+
+    let retrieved = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(retrieved.status.success(), "{retrieved:?}");
+    let report: Value = serde_json::from_slice(&retrieved.stdout).unwrap();
+    assert_eq!(report["status"], "retrieved");
+    assert_eq!(report["remote_status"], "retrieved");
+    assert_eq!(report["outputs"].as_array().unwrap().len(), 1);
+    assert_eq!(report["request"]["request_id"], "content-test");
+    assert!(output_dir.join(format!("{status}.png")).exists());
+    assert_eq!(server.join().unwrap().len(), 4);
+}
+
+#[test]
+fn expired_batch_with_output_publishes_available_results() {
+    assert_terminal_batch_with_output("expired");
+}
+
+#[test]
+fn failed_batch_with_output_publishes_available_results() {
+    assert_terminal_batch_with_output("failed");
+}
+
+#[test]
+fn batch_output_reservation_failure_keeps_content_response_metadata() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    fs::write(output_dir.join("collision.png"), b"keep me").unwrap();
+    let job_file = directory.path().join("collision-job.json");
+    let (url, server) = spawn_terminal_batch_server("completed", Some("file-output"));
+
+    let submitted = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "submit",
+            "--provider",
+            "api",
+            "--prompt",
+            "collision after remote work",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--name",
+            "collision",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(submitted.status.success(), "{submitted:?}");
+
+    let retrieved = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(retrieved.status.code(), Some(3), "{retrieved:?}");
+    let report: Value = serde_json::from_slice(&retrieved.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "output_path_exists");
+    assert_eq!(report["http"]["status"], 200);
+    assert_eq!(report["request"]["request_id"], "content-test");
+    assert_eq!(
+        fs::read(output_dir.join("collision.png")).unwrap(),
+        b"keep me"
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests
+        .iter()
+        .any(|request| request.path.contains("content")));
+}
+
+#[test]
+fn unavailable_batch_output_is_persisted_as_terminal_failure() {
+    for (content_status, expected_code) in [
+        ("404 Not Found", "batch_output_unavailable"),
+        ("410 Gone", "batch_output_expired"),
+    ] {
+        let directory = safe_tempdir();
+        let output_dir = directory.path().join("images");
+        fs::create_dir(&output_dir).unwrap();
+        let job_file = directory.path().join(format!(
+            "unavailable-{}.json",
+            content_status[..3].replace(' ', "")
+        ));
+        let (url, server) = spawn_terminal_batch_server_with_content_status(
+            "completed",
+            Some("file-output"),
+            content_status,
+        );
+
+        let submitted = command()
+            .env("OPENAI_API_KEY", "test-key")
+            .args([
+                "batch",
+                "submit",
+                "--provider",
+                "api",
+                "--prompt",
+                "unavailable output",
+                "--output-dir",
+                output_dir.to_str().unwrap(),
+                "--name",
+                "unavailable",
+                "--job-file",
+                job_file.to_str().unwrap(),
+                "--api-base-url",
+                &url,
+                "--allow-insecure-localhost",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(submitted.status.success(), "{submitted:?}");
+
+        let retrieved = command()
+            .env("OPENAI_API_KEY", "test-key")
+            .args([
+                "batch",
+                "retrieve",
+                "--job-file",
+                job_file.to_str().unwrap(),
+                "--allow-insecure-localhost",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(retrieved.status.code(), Some(10), "{retrieved:?}");
+        let report: Value = serde_json::from_slice(&retrieved.stdout).unwrap();
+        assert_eq!(report["error"]["code"], expected_code);
+        assert_eq!(
+            report["http"]["status"],
+            content_status[..3].parse::<u16>().unwrap()
+        );
+        assert_eq!(report["request"]["request_id"], "content-test");
+        assert_eq!(report["remote_status"], "completed");
+        assert_eq!(server.join().unwrap().len(), 4);
+        let saved: Value = serde_json::from_slice(&fs::read(&job_file).unwrap()).unwrap();
+        assert_eq!(saved["state"], "failed");
+    }
+}
+
+fn assert_publishing_output_unavailable_preserves_the_local_recovery_journal(
+    content_status: &str,
+    expected_code: &str,
+) {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    fs::write(output_dir.join("fox-01.png"), b"old-one").unwrap();
+    fs::write(output_dir.join("fox-02.png"), b"old-two").unwrap();
+    let job_file = directory.path().join("publishing-unavailable-job.json");
+    let (url, server) = spawn_batch_server_with_second_content_status(content_status);
+
+    let submitted = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "submit",
+            "--provider",
+            "api",
+            "--prompt",
+            "publishing output unavailable",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--prefix",
+            "fox",
+            "--n",
+            "2",
+            "--overwrite",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(submitted.status.success(), "{submitted:?}");
+
+    let status = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "status",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+
+    let retrieved = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(retrieved.status.success(), "{retrieved:?}");
+
+    let mut publishing_job: Value = serde_json::from_slice(&fs::read(&job_file).unwrap()).unwrap();
+    publishing_job["state"] = serde_json::json!("publishing");
+    fs::write(
+        &job_file,
+        serde_json::to_vec_pretty(&publishing_job).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(output_dir.join("fox-01.png")).unwrap();
+
+    let unavailable = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(unavailable.status.code(), Some(10), "{unavailable:?}");
+    let report: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
+    assert_eq!(report["error"]["code"], expected_code);
+    assert_eq!(
+        report["http"]["status"],
+        content_status[..3].parse::<u16>().unwrap()
+    );
+    let saved: Value = serde_json::from_slice(&fs::read(&job_file).unwrap()).unwrap();
+    assert_eq!(saved["state"], "publishing");
+    assert!(saved["publishing"].is_object());
+    assert_eq!(saved["retained_artifacts"].as_array().unwrap().len(), 2);
+    assert_eq!(server.join().unwrap().len(), 6);
+}
+
+#[test]
+fn publishing_output_expiry_preserves_the_local_recovery_journal() {
+    for (content_status, expected_code) in [
+        ("404 Not Found", "batch_output_unavailable"),
+        ("410 Gone", "batch_output_expired"),
+    ] {
+        assert_publishing_output_unavailable_preserves_the_local_recovery_journal(
+            content_status,
+            expected_code,
+        );
+    }
+}
+
+#[test]
 fn batch_submit_status_and_retrieve_publish_in_order() {
     let directory = safe_tempdir();
     let output_dir = directory.path().join("images");
@@ -833,6 +1452,10 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
             .len(),
         2
     );
+    let original_retained = retrieved_report["retained_artifacts"]
+        .as_array()
+        .unwrap()
+        .clone();
 
     let repeated = command()
         .env_remove("OPENAI_API_KEY")
@@ -878,6 +1501,18 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     let recovered_report: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(recovered_report["status"], "retrieved");
     assert!(output_dir.join("fox-01.png").exists());
+    let recovered_retained = recovered_report["retained_artifacts"].as_array().unwrap();
+    assert_eq!(recovered_retained.len(), original_retained.len());
+    for artifact in &original_retained {
+        assert!(recovered_retained.contains(artifact));
+    }
+    let saved: Value = serde_json::from_slice(&fs::read(&job_file).unwrap()).unwrap();
+    assert_eq!(
+        saved["publishing"]["retained_artifacts"]
+            .as_array()
+            .unwrap(),
+        recovered_retained
+    );
 
     let cancel = command()
         .env_remove("OPENAI_API_KEY")
@@ -981,12 +1616,14 @@ fn batch_recover_resumes_only_the_confirmed_input_uploaded_state() {
     let output_dir = directory.path().join("images");
     fs::create_dir(&output_dir).unwrap();
     let job_file = directory.path().join("recover-job.json");
-    let (url, server) = spawn_server(
+    let (url, server) = spawn_fixed_response_server(
+        "POST",
+        "/v1/batches",
         "200 OK",
-        r#"{"id":"batch-recovered","status":"validating","input_file_id":"file-input"}"#.to_owned(),
+        r#"{"id":"batch-recovered","status":"validating","input_file_id":"file-input"}"#,
     );
     let job = serde_json::json!({
-        "schema_version": 6,
+        "schema_version": 7,
         "revision": 0,
         "job_id": "job-recover",
         "state": "input_uploaded",
@@ -1035,7 +1672,117 @@ fn batch_recover_resumes_only_the_confirmed_input_uploaded_state() {
     assert_eq!(report["batch_id"], "batch-recovered");
     assert_eq!(report["status"], "validating");
     let request = server.join().unwrap();
-    assert!(request.authorization_was_present);
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/v1/batches");
     let saved: Value = serde_json::from_slice(&fs::read(&job_file).unwrap()).unwrap();
     assert_eq!(saved["state"], "submitted");
+}
+
+#[test]
+fn batch_recover_malformed_observations_keep_response_metadata() {
+    let cases = [
+        (
+            "upload_outcome_unknown",
+            None,
+            vec!["--input-file-id", "file-input"],
+            "GET",
+            "/v1/files/file-input",
+            "batch_input_file_invalid",
+            9,
+            "upload_outcome_unknown",
+        ),
+        (
+            "create_outcome_unknown",
+            Some("file-input"),
+            vec!["--batch-id", "batch-recover"],
+            "GET",
+            "/v1/batches/batch-recover",
+            "batch_status_invalid",
+            9,
+            "create_outcome_unknown",
+        ),
+        (
+            "input_uploaded",
+            Some("file-input"),
+            Vec::new(),
+            "POST",
+            "/v1/batches",
+            "batch_create_invalid",
+            6,
+            "create_outcome_unknown",
+        ),
+    ];
+
+    for (
+        state,
+        input_file_id,
+        recovery_args,
+        method,
+        path,
+        expected_code,
+        expected_exit,
+        expected_state,
+    ) in cases
+    {
+        let directory = safe_tempdir();
+        let output_dir = directory.path().join("images");
+        fs::create_dir(&output_dir).unwrap();
+        let job_file = directory.path().join("recover-malformed-job.json");
+        let (url, server) = spawn_fixed_response_server(method, path, "200 OK", "{}");
+        let job = serde_json::json!({
+            "schema_version": 7,
+            "revision": 0,
+            "job_id": "job-recover-malformed",
+            "state": state,
+            "provider": "api",
+            "model": "gpt-image-2",
+            "api_base_url": url,
+            "output_dir": output_dir,
+            "output_names": ["fox.png"],
+            "overwrite": false,
+            "format": "png",
+            "image_count": 1,
+            "quality": "low",
+            "size": "auto",
+            "background": "auto",
+            "moderation": "auto",
+            "custom_ids": ["job-recover-malformed-00"],
+            "input_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "input_bytes": 1,
+            "input_file_id": input_file_id,
+            "batch_id": null,
+            "output_file_id": null,
+            "error_file_id": null,
+            "remote_status": null,
+            "request_counts": null,
+            "publishing": null,
+            "retained_artifacts": [],
+            "created_at": 0,
+            "updated_at": 0
+        });
+        fs::write(&job_file, serde_json::to_vec_pretty(&job).unwrap()).unwrap();
+
+        let mut args = vec![
+            "batch".to_owned(),
+            "recover".to_owned(),
+            "--job-file".to_owned(),
+            job_file.to_str().unwrap().to_owned(),
+            "--allow-insecure-localhost".to_owned(),
+            "--json".to_owned(),
+        ];
+        args.extend(recovery_args.into_iter().map(str::to_owned));
+        let output = command()
+            .env("OPENAI_API_KEY", "test-key")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected_exit), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["error"]["code"], expected_code);
+        assert_eq!(report["http"]["status"], 200);
+        assert_eq!(report["request"]["request_id"], "recovery-test");
+        assert_eq!(server.join().unwrap().method, method);
+        let saved: Value = serde_json::from_slice(&fs::read(&job_file).unwrap()).unwrap();
+        assert_eq!(saved["state"], expected_state);
+    }
 }
