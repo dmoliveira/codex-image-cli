@@ -1,6 +1,6 @@
 # CLI API contract 📐
 
-This document describes the stable behavior of version 2 JSON reports for synchronous generation and the durable Batch lifecycle.
+This document describes the stable behavior of version 3 JSON reports for synchronous generation and the durable Batch lifecycle.
 
 ## JSON rules
 
@@ -10,7 +10,7 @@ Every generation report includes:
 
 ```json
 {
-  "schema_version": 2,
+   "schema_version": 3,
   "ok": true,
   "status": "success",
   "exit_code": 0,
@@ -24,7 +24,22 @@ Every generation report includes:
   "http": { "status": 200 },
   "outputs": ["artifacts/design/hero.png"],
   "retained_artifacts": [],
-  "possibly_modified_paths": []
+   "possibly_modified_paths": [],
+   "cost_preview": {
+     "status": "estimated",
+     "currency": "USD",
+     "model": "gpt-image-2",
+     "transport": "live",
+     "image_count": 1,
+     "quality": "medium",
+     "size": "1536x1024",
+     "pricing_version": "openai-gpt-image-2-2026-08",
+     "pricing_source": "https://developers.openai.com/api/docs/guides/image-generation#calculating-costs",
+     "basis": "official_per_image_output_price_table",
+     "estimated_output_nano_usd": 41000000,
+     "estimated_output_usd": "$0.041000",
+     "excluded_charges": ["text_input_tokens", "image_input_tokens"]
+   }
 }
 ```
 
@@ -39,6 +54,8 @@ Failure reports add:
 ```
 
 `outputs` is populated only after all requested files are published. `retained_artifacts` lists private backups deliberately retained after a successful overwrite; they are not automatically unlinked because a pathname-only cleanup can race a competing writer. `possibly_modified_paths` lists outputs/private artifacts that need inspection after a failure. The CLI never calls a multi-file result successful after a partial publication.
+
+`cost_preview` is a non-binding preflight estimate of image-output charges. It is included in dry-run, successful generation, and Batch lifecycle reports after request validation. The estimate uses the official GPT Image 2 per-image output table only for `1024x1024`, `1024x1536`, and `1536x1024`; Batch applies the documented 50% rate. Prompt text and input-image charges are excluded because the CLI cannot derive authoritative pre-request token usage. `status: "unavailable"` includes a machine-readable `reason` such as `custom_endpoint_unpriced`, `auto_size_not_in_official_table`, or `size_or_quality_not_in_official_table`. An unavailable preview is not a safety failure and does not imply zero cost.
 
 Batch reports add `operation`, job/remote IDs, `remote_status`, `next_action`, and the same `outputs`, `retained_artifacts`, and `possibly_modified_paths` fields. `batch submit` uploads bounded JSONL input and creates a 24-hour Batch job with output retention configured for 30 days. `batch status` performs one read, `batch retrieve` can poll with `--wait` and a bounded `--max-wait-seconds`, `batch cancel` sends one cancellation request, and `batch recover` resumes only a confirmed-safe local state or attaches a manually reconciled remote ID after a read-only verification. Batch is API-only, locally limited to 8 image requests, and its job record never stores the prompt, API key, or image bytes. Remote POST outcomes are never automatically retried. Custom HTTPS and loopback endpoint approvals must be repeated explicitly on each operation; editable job records never grant credential-destination approval.
 
@@ -62,7 +79,7 @@ The report separates live and Batch totals and includes requests, image counts, 
 
 ```json
 {
-  "schema_version": 2,
+   "schema_version": 3,
   "operation": "batch.submit",
   "ok": true,
   "status": "validating",

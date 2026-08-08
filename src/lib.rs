@@ -61,6 +61,17 @@ pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
     })
 }
 
+fn request_cost_preview(args: &GenerateArgs) -> cost::CostPreview {
+    cost::preflight_preview(
+        CostTransport::Live,
+        MODEL,
+        args.n,
+        args.quality.as_api_value(),
+        &args.size,
+        args.provider == Provider::Api && cost::pricing_eligible_for_base_url(&args.api_base_url),
+    )
+}
+
 fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
     let prompt = args.read_prompt()?;
     let file_names = derive_file_names(
@@ -73,8 +84,14 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
 
     let planned_outputs = derive_output_paths(&args.output_dir, &file_names);
     provider::validate(args)?;
+    let cost_preview = request_cost_preview(args);
     if args.dry_run {
-        return Ok(RunReport::dry_run(args.n, planned_outputs, args.provider));
+        return Ok(RunReport::dry_run(
+            args.n,
+            planned_outputs,
+            args.provider,
+            cost_preview,
+        ));
     }
 
     let api_key = if args.provider == Provider::Api {
@@ -224,6 +241,7 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
             request_id,
             http_status,
             args.provider,
+            cost_preview,
         )),
         Err(mut error) => {
             error.set_request_id(request_id);

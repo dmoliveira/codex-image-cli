@@ -404,6 +404,14 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         image_count: generation.n,
         ..BatchContext::default()
     };
+    base_context.cost_preview = Some(cost::preflight_preview(
+        CostTransport::Batch,
+        MODEL,
+        generation.n,
+        generation.quality.as_api_value(),
+        &generation.size,
+        endpoint.is_canonical_openai(),
+    ));
 
     let job_id = new_job_id();
     let job_file = JobStore::resolve(args.job_file.as_deref(), &job_id).map_err(|error| {
@@ -2653,6 +2661,14 @@ fn context_from_job(operation: &'static str, path: &Path, job: &BatchJob) -> Bat
         image_count: job.image_count,
         attempted: false,
         retained_artifacts: job.retained_artifacts.clone(),
+        cost_preview: Some(cost::preflight_preview(
+            CostTransport::Batch,
+            &job.model,
+            job.image_count,
+            job.quality.as_api_value(),
+            &job.size,
+            cost::pricing_eligible_for_base_url(&job.api_base_url),
+        )),
         ..BatchContext::default()
     }
 }

@@ -765,12 +765,75 @@ fn dry_run_does_not_connect_or_require_a_key() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "dry_run");
     assert_eq!(report["request"]["attempted"], false);
+    assert_eq!(report["cost_preview"]["status"], "unavailable");
+    assert_eq!(report["cost_preview"]["reason"], "custom_endpoint_unpriced");
     assert!(!directory.path().join("draft.png").exists());
     listener.set_nonblocking(true).unwrap();
     assert!(
         listener.accept().is_err(),
         "dry run made a network connection"
     );
+}
+
+#[test]
+fn canonical_dry_run_includes_non_binding_output_cost_preview() {
+    let directory = safe_tempdir();
+    let output = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "generate",
+            "--prompt",
+            "estimate this",
+            "--output-dir",
+            directory.path().to_str().unwrap(),
+            "--prefix",
+            "estimate",
+            "--n",
+            "2",
+            "--size",
+            "1024x1024",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "dry_run");
+    assert_eq!(report["cost_preview"]["status"], "estimated");
+    assert_eq!(report["cost_preview"]["transport"], "live");
+    assert_eq!(report["cost_preview"]["image_count"], 2);
+    assert_eq!(
+        report["cost_preview"]["estimated_output_nano_usd"],
+        12_000_000
+    );
+    assert_eq!(report["cost_preview"]["estimated_output_usd"], "$0.012000");
+    assert_eq!(
+        report["cost_preview"]["basis"],
+        "official_per_image_output_price_table"
+    );
+    assert!(!directory.path().join("estimate-01.png").exists());
+
+    let text = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "generate",
+            "--prompt",
+            "estimate this",
+            "--output-dir",
+            directory.path().to_str().unwrap(),
+            "--prefix",
+            "estimate-text",
+            "--n",
+            "1",
+            "--size",
+            "1024x1024",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(text.status.success(), "{text:?}");
+    assert!(String::from_utf8_lossy(&text.stdout).contains("estimated output cost: $0.006000"));
 }
 
 #[test]
@@ -1002,7 +1065,7 @@ fn clap_parse_failure_respects_the_json_contract() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     assert_eq!(report["status"], "usage_error");
     assert_eq!(report["error"]["code"], "cli_parse_error");
     assert_eq!(report["request"]["attempted"], false);
@@ -1687,6 +1750,7 @@ fn batch_request_file_resolves_during_dry_run_without_a_key() {
             "prompt": "batch request file",
             "n": 2,
             "format": "png",
+            "size": "1024x1024",
             "quality": "low"
         })
         .to_string(),
@@ -1712,6 +1776,12 @@ fn batch_request_file_resolves_during_dry_run_without_a_key() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "dry_run");
     assert_eq!(report["outputs"].as_array().unwrap().len(), 2);
+    assert_eq!(report["cost_preview"]["status"], "estimated");
+    assert_eq!(report["cost_preview"]["transport"], "batch");
+    assert_eq!(
+        report["cost_preview"]["estimated_output_nano_usd"],
+        6_000_000
+    );
 }
 
 #[test]

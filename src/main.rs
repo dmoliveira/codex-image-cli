@@ -10,7 +10,7 @@ use clap::{error::ErrorKind, Parser};
 use codex_image_cli::{
     batch,
     cli::{BatchCommand, Cli, Command},
-    cost::{run_cost, CostReport, CostTransport},
+    cost::{run_cost, CostPreview, CostPreviewStatus, CostReport, CostTransport},
     provider,
     report::{AppError, BatchReport, RunReport, SCHEMA_VERSION},
     run_generate,
@@ -155,6 +155,9 @@ fn emit_batch(
             if json {
                 print_json(&report);
             } else if report.ok {
+                if let Some(preview) = &report.cost_preview {
+                    emit_cost_preview(preview);
+                }
                 if let Some(job_file) = report.job_file {
                     println!("job: {job_file}");
                 }
@@ -169,6 +172,9 @@ fn emit_batch(
                 }
             } else {
                 eprintln!("{}", report.status);
+                if let Some(preview) = &report.cost_preview {
+                    emit_cost_preview_stderr(preview);
+                }
             }
             exit_code
         }
@@ -179,6 +185,9 @@ fn emit_batch(
                 print_json(&report);
             } else {
                 eprintln!("{}: {}", failure.error.code, failure.error.message);
+                if let Some(preview) = &report.cost_preview {
+                    emit_cost_preview_stderr(preview);
+                }
                 if let Some(job_file) = report.job_file {
                     eprintln!("job: {job_file}");
                 }
@@ -209,6 +218,9 @@ fn emit_run_report(report: &RunReport, json: bool) {
             "DRY RUN: no key was read, no network request was sent, and no files were reserved."
         );
     }
+    if let Some(preview) = &report.cost_preview {
+        emit_cost_preview(preview);
+    }
     for output in &report.outputs {
         println!("{output}");
     }
@@ -228,6 +240,40 @@ fn emit_error(error: &AppError, image_count: u8, json: bool) {
         for path in &error.possibly_modified_paths {
             eprintln!("  {}", path.display());
         }
+    }
+}
+
+fn emit_cost_preview(preview: &CostPreview) {
+    match preview.status {
+        CostPreviewStatus::Estimated => println!(
+            "estimated output cost: {} {} image(s); input charges excluded",
+            preview
+                .estimated_output_usd
+                .as_deref()
+                .unwrap_or("unpriced"),
+            preview.image_count
+        ),
+        CostPreviewStatus::Unavailable => println!(
+            "estimated output cost: unavailable ({})",
+            preview.reason.unwrap_or("pricing_unavailable")
+        ),
+    }
+}
+
+fn emit_cost_preview_stderr(preview: &CostPreview) {
+    match preview.status {
+        CostPreviewStatus::Estimated => eprintln!(
+            "estimated output cost: {} {} image(s); input charges excluded",
+            preview
+                .estimated_output_usd
+                .as_deref()
+                .unwrap_or("unpriced"),
+            preview.image_count
+        ),
+        CostPreviewStatus::Unavailable => eprintln!(
+            "estimated output cost: unavailable ({})",
+            preview.reason.unwrap_or("pricing_unavailable")
+        ),
     }
 }
 
@@ -446,6 +492,7 @@ fn run_ai_help(json: bool) -> i32 {
         rules: vec![
             "The default provider is the direct Image API and reads OPENAI_API_KEY only from the environment; --provider codex explicitly selects the local subscription path.",
             "Use --dry-run --json to validate names and parameters without reading a key or using a network.",
+            "Parse cost_preview from dry-run and generation/Batch reports; it is a non-binding output-only estimate and unavailable never means zero.",
             "Create --output-dir explicitly; the CLI refuses missing or symlinked output directories.",
             "Use --name only for one image; use --prefix for deterministic multi-image names.",
             "Never retry exit code 5, 6, or 7 automatically because a generation may have been billed.",

@@ -29,6 +29,8 @@ use crate::{
 };
 
 pub const COST_REPORT_SCHEMA_VERSION: u8 = 1;
+pub const COST_PREVIEW_SOURCE: &str =
+    "https://developers.openai.com/api/docs/guides/image-generation#calculating-costs";
 const LEDGER_SCHEMA_VERSION: u8 = 1;
 const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LEDGER_LINE_BYTES: usize = 256 * 1024;
@@ -42,6 +44,118 @@ static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub enum CostTransport {
     Live,
     Batch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostPreviewStatus {
+    Estimated,
+    Unavailable,
+}
+
+/// A non-binding preflight estimate of image-output charges.
+///
+/// The official GPT Image 2 guide publishes per-image output prices for a
+/// small set of standard sizes. It does not publish a deterministic token
+/// formula for every supported resolution, so prompt and input-image charges
+/// are deliberately excluded rather than guessed.
+#[derive(Debug, Clone, Serialize)]
+pub struct CostPreview {
+    pub status: CostPreviewStatus,
+    pub currency: &'static str,
+    pub model: String,
+    pub transport: CostTransport,
+    pub image_count: u8,
+    pub quality: String,
+    pub size: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing_version: Option<String>,
+    pub pricing_source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_output_nano_usd: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_output_usd: Option<String>,
+    pub excluded_charges: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+pub fn preflight_preview(
+    transport: CostTransport,
+    model: &str,
+    image_count: u8,
+    quality: &str,
+    size: &str,
+    pricing_eligible: bool,
+) -> CostPreview {
+    let common = || CostPreview {
+        status: CostPreviewStatus::Unavailable,
+        currency: "USD",
+        model: model.to_owned(),
+        transport,
+        image_count,
+        quality: quality.to_owned(),
+        size: size.to_owned(),
+        pricing_version: None,
+        pricing_source: COST_PREVIEW_SOURCE,
+        basis: None,
+        estimated_output_nano_usd: None,
+        estimated_output_usd: None,
+        excluded_charges: vec!["text_input_tokens", "image_input_tokens"],
+        reason: None,
+    };
+    let unavailable = |reason| {
+        let mut preview = common();
+        preview.reason = Some(reason);
+        preview
+    };
+    if !pricing_eligible {
+        return unavailable("custom_endpoint_unpriced");
+    }
+    if model != "gpt-image-2" {
+        return unavailable("model_unpriced");
+    }
+    if image_count == 0 {
+        return unavailable("invalid_image_count");
+    }
+    if quality == "auto" {
+        return unavailable("auto_quality_not_in_official_table");
+    }
+    if size == "auto" {
+        return unavailable("auto_size_not_in_official_table");
+    }
+    let Some(per_image_nano_usd) = official_output_price_nano_usd(quality, size) else {
+        return unavailable("size_or_quality_not_in_official_table");
+    };
+    let per_image_nano_usd = match transport {
+        CostTransport::Live => per_image_nano_usd,
+        CostTransport::Batch => per_image_nano_usd / 2,
+    };
+    let Some(total_nano_usd) = per_image_nano_usd.checked_mul(u64::from(image_count)) else {
+        return unavailable("estimate_overflow");
+    };
+    let mut preview = common();
+    preview.status = CostPreviewStatus::Estimated;
+    preview.pricing_version = Some(PRICING_VERSION.to_owned());
+    preview.basis = Some("official_per_image_output_price_table");
+    preview.estimated_output_nano_usd = Some(total_nano_usd);
+    preview.estimated_output_usd = Some(format_usd(total_nano_usd));
+    preview
+}
+
+fn official_output_price_nano_usd(quality: &str, size: &str) -> Option<u64> {
+    // Official table column order: 1024x1024, 1024x1536, 1536x1024.
+    match (quality, size) {
+        ("low", "1024x1024") => Some(6_000_000),
+        ("low", "1024x1536" | "1536x1024") => Some(5_000_000),
+        ("medium", "1024x1024") => Some(53_000_000),
+        ("medium", "1024x1536" | "1536x1024") => Some(41_000_000),
+        ("high", "1024x1024") => Some(211_000_000),
+        ("high", "1024x1536" | "1536x1024") => Some(165_000_000),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,7 +886,10 @@ fn secure_open_directory(path: &Path) -> Result<File, Errno> {
         ) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => {
-                mkdirat(&current, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+                match mkdirat(&current, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(error) => return Err(error),
+                }
                 openat(
                     &current,
                     name,
@@ -1729,6 +1846,57 @@ mod tests {
             estimate_nano_usd(Some(&usage(10, 20)), CostTransport::Batch, true),
             Some(325_000)
         );
+    }
+
+    #[test]
+    fn previews_official_output_prices_without_inventing_input_tokens() {
+        let expected = [
+            ("low", "1024x1024", 6_000_000),
+            ("low", "1024x1536", 5_000_000),
+            ("low", "1536x1024", 5_000_000),
+            ("medium", "1024x1024", 53_000_000),
+            ("medium", "1024x1536", 41_000_000),
+            ("medium", "1536x1024", 41_000_000),
+            ("high", "1024x1024", 211_000_000),
+            ("high", "1024x1536", 165_000_000),
+            ("high", "1536x1024", 165_000_000),
+        ];
+        for (quality, size, price) in expected {
+            let preview =
+                preflight_preview(CostTransport::Live, "gpt-image-2", 1, quality, size, true);
+            assert_eq!(preview.status, CostPreviewStatus::Estimated);
+            assert_eq!(preview.estimated_output_nano_usd, Some(price));
+        }
+
+        let live = preflight_preview(
+            CostTransport::Live,
+            "gpt-image-2",
+            2,
+            "low",
+            "1024x1024",
+            true,
+        );
+        assert_eq!(live.status, CostPreviewStatus::Estimated);
+        assert_eq!(live.estimated_output_nano_usd, Some(12_000_000));
+        assert_eq!(live.estimated_output_usd.as_deref(), Some("$0.012000"));
+        assert!(live.excluded_charges.contains(&"text_input_tokens"));
+
+        let batch = preflight_preview(
+            CostTransport::Batch,
+            "gpt-image-2",
+            2,
+            "medium",
+            "1024x1536",
+            true,
+        );
+        assert_eq!(batch.status, CostPreviewStatus::Estimated);
+        assert_eq!(batch.estimated_output_nano_usd, Some(41_000_000));
+
+        let unavailable =
+            preflight_preview(CostTransport::Live, "gpt-image-2", 1, "low", "auto", true);
+        assert_eq!(unavailable.status, CostPreviewStatus::Unavailable);
+        assert_eq!(unavailable.reason, Some("auto_size_not_in_official_table"));
+        assert!(unavailable.estimated_output_usd.is_none());
     }
 
     #[test]

@@ -2,9 +2,10 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::cli::Provider;
+use crate::cost::CostPreview;
 use crate::provider;
 
-pub const SCHEMA_VERSION: u8 = 2;
+pub const SCHEMA_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -198,6 +199,7 @@ impl AppError {
             outputs: Vec::new(),
             retained_artifacts: Vec::new(),
             possibly_modified_paths: path_strings(&self.possibly_modified_paths),
+            cost_preview: None,
             error: Some(ErrorInfo {
                 code: self.code,
                 message: self.message.clone(),
@@ -224,11 +226,18 @@ pub struct RunReport {
     pub retained_artifacts: Vec<String>,
     pub possibly_modified_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_preview: Option<CostPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
 }
 
 impl RunReport {
-    pub fn dry_run(image_count: u8, outputs: Vec<PathBuf>, provider: Provider) -> Self {
+    pub fn dry_run(
+        image_count: u8,
+        outputs: Vec<PathBuf>,
+        provider: Provider,
+        cost_preview: CostPreview,
+    ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             ok: true,
@@ -245,6 +254,7 @@ impl RunReport {
             outputs: path_strings(&outputs),
             retained_artifacts: Vec::new(),
             possibly_modified_paths: Vec::new(),
+            cost_preview: Some(cost_preview),
             error: None,
         }
     }
@@ -256,6 +266,7 @@ impl RunReport {
         request_id: Option<String>,
         http_status: Option<u16>,
         provider: Provider,
+        cost_preview: CostPreview,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -275,6 +286,7 @@ impl RunReport {
             outputs: path_strings(&outputs),
             retained_artifacts: path_strings(&retained_artifacts),
             possibly_modified_paths: Vec::new(),
+            cost_preview: Some(cost_preview),
             error: None,
         }
     }
@@ -331,6 +343,7 @@ pub struct BatchContext {
     pub retained_artifacts: Vec<String>,
     pub possibly_modified_paths: Vec<String>,
     pub next_action: Option<String>,
+    pub cost_preview: Option<CostPreview>,
 }
 
 #[derive(Debug, Serialize)]
@@ -352,6 +365,8 @@ pub struct BatchReport {
     pub outputs: Vec<String>,
     pub retained_artifacts: Vec<String>,
     pub possibly_modified_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_preview: Option<CostPreview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -429,6 +444,7 @@ impl BatchContext {
             outputs: self.outputs.clone(),
             retained_artifacts: self.retained_artifacts.clone(),
             possibly_modified_paths,
+            cost_preview: self.cost_preview.clone(),
             next_action: self.next_action.clone(),
             error: error_info,
         }
