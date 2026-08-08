@@ -118,6 +118,124 @@ fn safe_tempdir() -> tempfile::TempDir {
         .unwrap()
 }
 
+#[derive(Debug)]
+struct RawHttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+fn read_raw_request(stream: &mut TcpStream) -> RawHttpRequest {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut data = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let header_end;
+    loop {
+        let bytes = stream.read(&mut buffer).unwrap();
+        assert!(bytes > 0, "request ended before headers");
+        data.extend_from_slice(&buffer[..bytes]);
+        if let Some(position) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+            header_end = position + 4;
+            break;
+        }
+        assert!(data.len() < 128 * 1024, "headers exceeded test limit");
+    }
+    let headers = String::from_utf8_lossy(&data[..header_end]).into_owned();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("content-length: ")
+                .or_else(|| line.strip_prefix("Content-Length: "))
+        })
+        .unwrap_or("0")
+        .trim()
+        .parse::<usize>()
+        .unwrap();
+    while data.len() < header_end + content_length {
+        let bytes = stream.read(&mut buffer).unwrap();
+        assert!(bytes > 0, "request ended before body");
+        data.extend_from_slice(&buffer[..bytes]);
+    }
+    let first_line = headers.lines().next().unwrap_or_default();
+    let mut parts = first_line.split_whitespace();
+    RawHttpRequest {
+        method: parts.next().unwrap_or_default().to_owned(),
+        path: parts.next().unwrap_or_default().to_owned(),
+        body: data[header_end..header_end + content_length].to_vec(),
+    }
+}
+
+fn custom_ids_from_multipart(body: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .filter_map(|line| {
+            let start = line.find('{')?;
+            let end = line.rfind('}')? + 1;
+            serde_json::from_str::<Value>(&line[start..end])
+                .ok()?
+                .get("custom_id")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn spawn_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let mut custom_ids = Vec::new();
+        for index in 0..5 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_raw_request(&mut stream);
+            if index == 0 {
+                custom_ids = custom_ids_from_multipart(&request.body);
+            }
+            let body = match (index, request.path.as_str()) {
+                (0, "/v1/files") => r#"{"id":"file-input"}"#.to_owned(),
+                (1, "/v1/batches") => {
+                    r#"{"id":"batch-test","status":"validating","input_file_id":"file-input"}"#.to_owned()
+                }
+                (2, "/v1/batches/batch-test") | (3, "/v1/batches/batch-test") => {
+                    r#"{"id":"batch-test","status":"completed","input_file_id":"file-input","output_file_id":"file-output"}"#.to_owned()
+                }
+                (4, "/v1/files/file-output/content") => custom_ids
+                    .iter()
+                    .map(|custom_id| {
+                        serde_json::json!({
+                            "custom_id": custom_id,
+                            "response": {
+                                "status_code": 200,
+                                "body": {"data": [{"b64_json": PNG_BASE64}]}
+                            }
+                        })
+                        .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => panic!("unexpected batch request {index} {}", request.path),
+            };
+            let content_type = if index == 4 {
+                "application/jsonl"
+            } else {
+                "application/json"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: batch-test\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            requests.push(request);
+        }
+        requests
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
 #[cfg(unix)]
 fn fake_codex_script(directory: &Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -177,6 +295,8 @@ fn codex_provider_uses_fake_structured_request_without_api_key() {
         .env("OPENAI_API_KEY", "must-not-reach-codex")
         .args([
             "generate",
+            "--provider",
+            "codex",
             "--prompt",
             "quoted \"prompt\"\n日本語",
             "--output-dir",
@@ -187,6 +307,7 @@ fn codex_provider_uses_fake_structured_request_without_api_key() {
             "1024x1024",
             "--quality",
             "high",
+            "--confirm-high-quality",
             "--json",
         ])
         .output()
@@ -226,6 +347,7 @@ fn request_file_resolves_structured_generation_parameters() {
             "--name",
             "request",
             "--dry-run",
+            "--confirm-high-quality",
             "--json",
         ])
         .output()
@@ -279,6 +401,8 @@ fn codex_timeout_reports_non_retryable_process_metadata() {
         .env("FAKE_CODEX_MODE", "hang")
         .args([
             "generate",
+            "--provider",
+            "codex",
             "--prompt",
             "timeout test",
             "--output-dir",
@@ -611,4 +735,205 @@ fn clap_parse_failure_respects_the_json_contract() {
     assert_eq!(report["status"], "usage_error");
     assert_eq!(report["error"]["code"], "cli_parse_error");
     assert_eq!(report["request"]["attempted"], false);
+}
+
+#[test]
+fn batch_submit_status_and_retrieve_publish_in_order() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    fs::write(output_dir.join("fox-01.png"), b"old-one").unwrap();
+    fs::write(output_dir.join("fox-02.png"), b"old-two").unwrap();
+    let job_file = directory.path().join("batch-job.json");
+    let (url, server) = spawn_batch_server();
+
+    let submitted = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "submit",
+            "--provider",
+            "api",
+            "--prompt",
+            "batch fox",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--prefix",
+            "fox",
+            "--n",
+            "2",
+            "--overwrite",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(submitted.status.success(), "{submitted:?}");
+    let submitted_report: Value = serde_json::from_slice(&submitted.stdout).unwrap();
+    assert_eq!(submitted_report["status"], "validating");
+    assert_eq!(submitted_report["batch_id"], "batch-test");
+    let job_body = fs::read_to_string(&job_file).unwrap();
+    assert!(!job_body.contains("batch fox"));
+
+    let status = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "status",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let status_report: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status_report["status"], "completed");
+
+    let retrieved = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(retrieved.status.success(), "{retrieved:?}");
+    let retrieved_report: Value = serde_json::from_slice(&retrieved.stdout).unwrap();
+    assert_eq!(retrieved_report["status"], "retrieved");
+    assert!(output_dir.join("fox-01.png").exists());
+    assert!(output_dir.join("fox-02.png").exists());
+    assert_eq!(
+        retrieved_report["retained_artifacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let repeated = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "batch",
+            "retrieve",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success(), "{repeated:?}");
+    let repeated_report: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated_report["status"], "retrieved");
+    assert_eq!(
+        repeated_report["retained_artifacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let cancel = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "batch",
+            "cancel",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(cancel.status.code(), Some(3));
+    let cancel_report: Value = serde_json::from_slice(&cancel.stdout).unwrap();
+    assert_eq!(cancel_report["error"]["code"], "batch_already_terminal");
+
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/v1/files");
+    assert!(String::from_utf8_lossy(&requests[0].body).contains("purpose"));
+    assert_eq!(requests[1].path, "/v1/batches");
+    assert_eq!(requests[2].path, "/v1/batches/batch-test");
+    assert_eq!(requests[3].path, "/v1/batches/batch-test");
+    assert_eq!(requests[4].path, "/v1/files/file-output/content");
+}
+
+#[test]
+fn batch_rejects_more_than_the_local_image_limit_before_network() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let directory = safe_tempdir();
+    let output = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "batch",
+            "submit",
+            "--prompt",
+            "too many",
+            "--output-dir",
+            directory.path().to_str().unwrap(),
+            "--n",
+            "9",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "invalid_image_count");
+    listener.set_nonblocking(true).unwrap();
+    assert!(listener.accept().is_err(), "invalid batch connected to API");
+}
+
+#[test]
+fn batch_request_file_resolves_during_dry_run_without_a_key() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let request_file = directory.path().join("request.json");
+    fs::write(
+        &request_file,
+        serde_json::json!({
+            "schema_version": 1,
+            "prompt": "batch request file",
+            "n": 2,
+            "format": "png",
+            "quality": "low"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "batch",
+            "submit",
+            "--request-file",
+            request_file.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--prefix",
+            "request-file",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "dry_run");
+    assert_eq!(report["outputs"].as_array().unwrap().len(), 2);
 }

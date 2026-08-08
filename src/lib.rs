@@ -5,6 +5,7 @@
 //! then publish all files or report a truthful failure.
 
 pub mod api;
+pub mod batch;
 pub mod cli;
 pub mod endpoint;
 pub mod image;
@@ -76,7 +77,7 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
         let key = env::var("OPENAI_API_KEY").map_err(|_| {
             AppError::usage(
                 "missing_api_key",
-                "OPENAI_API_KEY must be set for --provider api. The default provider uses the authenticated Codex CLI subscription.",
+                "OPENAI_API_KEY must be set for the default --provider api path, or select --provider codex explicitly.",
             )
         })?;
         if key.trim().is_empty() {
@@ -218,7 +219,7 @@ fn generate_with_codex(prompt: &str, args: &GenerateArgs) -> Result<Vec<u8>, App
             let _ = fs::remove_file(&request_path);
             return Err(AppError::usage(
                 "codex_cli_unavailable",
-                "The default Codex provider requires the authenticated `codex` CLI. Use --provider api for direct Image API generation.",
+            "The explicit --provider codex path requires the authenticated `codex` CLI. Omit --provider or use --provider api for direct Image API generation.",
             ));
         }
     };

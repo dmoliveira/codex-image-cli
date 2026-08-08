@@ -1,11 +1,13 @@
 use std::{io::Read, time::Duration};
 
 use reqwest::{
+    blocking::multipart::{Form, Part},
     blocking::Client,
     header::{HeaderMap, HeaderValue, CONTENT_TYPE},
     redirect::Policy,
+    Method,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{cli::GenerateArgs, endpoint::Endpoint, report::AppError, MODEL};
 
@@ -30,10 +32,14 @@ pub struct ImageGenerationRequest<'a> {
 
 impl<'a> ImageGenerationRequest<'a> {
     pub fn from_args(prompt: &'a str, args: &'a GenerateArgs) -> Self {
+        Self::from_args_with_count(prompt, args, args.n)
+    }
+
+    pub fn from_args_with_count(prompt: &'a str, args: &'a GenerateArgs, count: u8) -> Self {
         Self {
             model: MODEL,
             prompt,
-            n: args.n,
+            n: count,
             size: &args.size,
             quality: args.quality.as_api_value(),
             background: args.background.as_api_value(),
@@ -42,6 +48,42 @@ impl<'a> ImageGenerationRequest<'a> {
             moderation: args.moderation.as_api_value(),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchCreateRequest<'a> {
+    pub input_file_id: &'a str,
+    pub endpoint: &'static str,
+    pub completion_window: &'static str,
+    pub output_expires_after: OutputExpiresAfter,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutputExpiresAfter {
+    pub anchor: &'static str,
+    pub seconds: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BatchInfo {
+    pub id: String,
+    pub status: String,
+    pub input_file_id: String,
+    pub output_file_id: Option<String>,
+    pub error_file_id: Option<String>,
+    pub request_counts: Option<BatchRequestCounts>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BatchRequestCounts {
+    pub completed: u32,
+    pub failed: u32,
+    pub total: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileInfo {
+    pub id: String,
 }
 
 pub struct ApiClient {
@@ -167,6 +209,309 @@ impl ApiClient {
             status: status.as_u16(),
         })
     }
+
+    pub fn upload_batch_input(
+        &self,
+        endpoint: &Endpoint,
+        api_key: &str,
+        input: Vec<u8>,
+    ) -> Result<ApiResponse, AppError> {
+        let url = endpoint.files_url()?;
+        let part = Part::bytes(input)
+            .file_name("batch-input.jsonl")
+            .mime_str("application/jsonl")
+            .map_err(|_| {
+                AppError::preflight(
+                    "multipart_unavailable",
+                    "The batch input could not be prepared.",
+                )
+            })?;
+        let form = Form::new().text("purpose", "batch").part("file", part);
+        self.send_request(
+            Method::POST,
+            url,
+            api_key,
+            RequestPayload::Multipart(form),
+            RequestKind::BillablePost,
+            MAX_BATCH_RESPONSE_BYTES,
+        )
+    }
+
+    pub fn create_batch(
+        &self,
+        endpoint: &Endpoint,
+        api_key: &str,
+        request: &BatchCreateRequest<'_>,
+    ) -> Result<ApiResponse, AppError> {
+        self.send_json(
+            Method::POST,
+            endpoint.batches_url()?,
+            api_key,
+            request,
+            RequestKind::BillablePost,
+            MAX_BATCH_RESPONSE_BYTES,
+        )
+    }
+
+    pub fn get_batch(
+        &self,
+        endpoint: &Endpoint,
+        api_key: &str,
+        batch_id: &str,
+    ) -> Result<ApiResponse, AppError> {
+        self.send_request(
+            Method::GET,
+            endpoint.batch_url(batch_id)?,
+            api_key,
+            RequestPayload::Empty,
+            RequestKind::Observation,
+            MAX_BATCH_RESPONSE_BYTES,
+        )
+    }
+
+    pub fn get_file_content(
+        &self,
+        endpoint: &Endpoint,
+        api_key: &str,
+        file_id: &str,
+    ) -> Result<ApiResponse, AppError> {
+        self.send_request(
+            Method::GET,
+            endpoint.file_content_url(file_id)?,
+            api_key,
+            RequestPayload::Empty,
+            RequestKind::Observation,
+            MAX_BATCH_CONTENT_BYTES,
+        )
+    }
+
+    pub fn cancel_batch(
+        &self,
+        endpoint: &Endpoint,
+        api_key: &str,
+        batch_id: &str,
+    ) -> Result<ApiResponse, AppError> {
+        self.send_request(
+            Method::POST,
+            endpoint.batch_cancel_url(batch_id)?,
+            api_key,
+            RequestPayload::Empty,
+            RequestKind::ControlPost,
+            MAX_BATCH_RESPONSE_BYTES,
+        )
+    }
+
+    fn send_json<T: Serialize>(
+        &self,
+        method: Method,
+        url: url::Url,
+        api_key: &str,
+        body: &T,
+        kind: RequestKind,
+        max_response: usize,
+    ) -> Result<ApiResponse, AppError> {
+        let body = serde_json::to_vec(body).map_err(|_| {
+            AppError::preflight(
+                "request_serialization_failed",
+                "The batch request could not be serialized safely.",
+            )
+        })?;
+        self.send_request(
+            method,
+            url,
+            api_key,
+            RequestPayload::Json(body),
+            kind,
+            max_response,
+        )
+    }
+
+    fn send_request(
+        &self,
+        method: Method,
+        url: url::Url,
+        api_key: &str,
+        payload: RequestPayload,
+        kind: RequestKind,
+        max_response: usize,
+    ) -> Result<ApiResponse, AppError> {
+        let mut request = self
+            .client
+            .request(method.clone(), url)
+            .bearer_auth(api_key);
+        match payload {
+            RequestPayload::Multipart(form) => {
+                request = request.multipart(form);
+            }
+            RequestPayload::Json(body) => {
+                request = request
+                    .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                    .body(body);
+            }
+            RequestPayload::Empty => {}
+        }
+        let response = request.send().map_err(|_| kind.transport_error())?;
+        let status = response.status();
+        let request_id = request_id(response.headers(), api_key);
+        if status.is_redirection() {
+            return Err(kind.redirect_error().with_http(status.as_u16(), request_id));
+        }
+        if status.is_client_error() {
+            let code = safe_error_code(response, api_key);
+            if matches!(kind, RequestKind::Observation) {
+                return Err(AppError::observation(
+                    "batch_observation_rejected",
+                    format!(
+                        "The Batch read was rejected (HTTP {}; {}). Retrying this read-only operation is safe.",
+                        status.as_u16(),
+                        code.unwrap_or_else(|| "no safe error code returned".to_owned())
+                    ),
+                )
+                .with_http(status.as_u16(), request_id));
+            }
+            return Err(AppError::api_rejected(
+                "api_rejected",
+                format!(
+                    "The API rejected the batch operation (HTTP {}; {}).",
+                    status.as_u16(),
+                    code.unwrap_or_else(|| "no safe error code returned".to_owned())
+                ),
+                status.as_u16(),
+                request_id,
+            ));
+        }
+        if status.is_server_error() || !status.is_success() {
+            return Err(kind.status_error(status.as_u16(), request_id));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_response as u64)
+        {
+            return Err(kind
+                .size_error(max_response)
+                .with_http(status.as_u16(), request_id));
+        }
+        let response_body = read_bounded(response, max_response).map_err(|_| {
+            kind.read_error()
+                .with_http(status.as_u16(), request_id.clone())
+        })?;
+        if response_body.len() > max_response {
+            return Err(kind
+                .size_error(max_response)
+                .with_http(status.as_u16(), request_id));
+        }
+        Ok(ApiResponse {
+            body: response_body,
+            request_id,
+            status: status.as_u16(),
+        })
+    }
+}
+
+enum RequestPayload {
+    Multipart(Form),
+    Json(Vec<u8>),
+    Empty,
+}
+
+pub const MAX_BATCH_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BATCH_CONTENT_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum RequestKind {
+    BillablePost,
+    ControlPost,
+    Observation,
+}
+
+impl RequestKind {
+    fn transport_error(self) -> AppError {
+        match self {
+            Self::BillablePost => AppError::indeterminate(
+                "batch_submission_outcome_unknown",
+                "The batch submission POST may have been processed. Do not retry automatically; inspect the persisted job state.",
+            ),
+            Self::ControlPost => AppError::indeterminate(
+                "batch_cancel_outcome_unknown",
+                "The batch cancel request outcome is unknown. Query the persisted batch status before trying again; do not resubmit automatically.",
+            ),
+            Self::Observation => AppError::observation(
+                "batch_observation_failed",
+                "The batch status or output could not be observed. Retrying this read-only operation is safe.",
+            ),
+        }
+    }
+
+    fn redirect_error(self) -> AppError {
+        match self {
+            Self::BillablePost => AppError::indeterminate(
+                "batch_submission_redirected",
+                "The batch submission returned a redirect. Credentials were not forwarded and the submission outcome may be unknown; do not retry automatically.",
+            ),
+            Self::ControlPost => AppError::indeterminate(
+                "batch_cancel_redirected",
+                "The batch cancel returned a redirect. Credentials were not forwarded, but cancellation outcome may be unknown; query status before trying again.",
+            ),
+            Self::Observation => AppError::observation(
+                "batch_observation_redirected",
+                "The batch observation returned a redirect. Credentials were not forwarded; retrying the read-only operation is safe.",
+            ),
+        }
+    }
+
+    fn status_error(self, status: u16, request_id: Option<String>) -> AppError {
+        match self {
+            Self::BillablePost => AppError::indeterminate(
+                "batch_submission_server_error",
+                "The batch submission returned a server error; the operation outcome may be unknown. Do not retry automatically.",
+            )
+            .with_http(status, request_id),
+            Self::ControlPost => AppError::indeterminate(
+                "batch_cancel_outcome_unknown",
+                format!("The batch cancel endpoint returned HTTP {status}; cancellation outcome may be unknown. Query status before trying again."),
+            )
+            .with_http(status, request_id),
+            Self::Observation => AppError::observation(
+                "batch_observation_server_error",
+                format!("The batch endpoint returned HTTP {status}; retrying this read-only operation is safe."),
+            )
+            .with_http(status, request_id),
+        }
+    }
+
+    fn size_error(self, max: usize) -> AppError {
+        match self {
+            Self::BillablePost => AppError::invalid_response(
+                "batch_response_too_large",
+                format!("The batch submission response exceeded the {max}-byte safety limit; do not retry automatically."),
+            ),
+            Self::ControlPost => AppError::indeterminate(
+                "batch_cancel_outcome_unknown",
+                format!("The batch cancel response exceeded the {max}-byte safety limit; cancellation outcome may be unknown. Query status before trying again."),
+            ),
+            Self::Observation => AppError::observation(
+                "batch_response_too_large",
+                format!("The batch response exceeded the {max}-byte safety limit; retrying the observation is safe."),
+            ),
+        }
+    }
+
+    fn read_error(self) -> AppError {
+        match self {
+            Self::BillablePost => AppError::invalid_response(
+                "batch_response_read_failed",
+                "The batch submission response could not be read completely; do not retry automatically.",
+            ),
+            Self::ControlPost => AppError::indeterminate(
+                "batch_cancel_outcome_unknown",
+                "The batch cancel response could not be read completely; cancellation outcome may be unknown. Query status before trying again.",
+            ),
+            Self::Observation => AppError::observation(
+                "batch_response_read_failed",
+                "The batch response could not be read completely; retrying the observation is safe.",
+            ),
+        }
+    }
 }
 
 fn request_id(headers: &HeaderMap, api_key: &str) -> Option<String> {
@@ -251,6 +596,7 @@ mod tests {
             format: crate::cli::OutputFormat::Png,
             size: "auto".to_owned(),
             quality: crate::cli::Quality::Auto,
+            confirm_high_quality: false,
             background: crate::cli::Background::Auto,
             compression: None,
             moderation: crate::cli::Moderation::Auto,
@@ -264,5 +610,16 @@ mod tests {
         let body = serde_json::to_value(ImageGenerationRequest::from_args("test", &args)).unwrap();
         assert_eq!(body["model"], "gpt-image-2");
         assert!(body.get("output_compression").is_none());
+    }
+
+    #[test]
+    fn read_only_batch_rejections_are_retryable_observations() {
+        let error = RequestKind::Observation.status_error(429, None);
+        assert_eq!(error.status, crate::report::Status::BatchObservationFailed);
+        assert!(error.automatic_retry_safe);
+
+        let error = RequestKind::ControlPost.status_error(500, None);
+        assert_eq!(error.status, crate::report::Status::OutcomeIndeterminate);
+        assert!(!error.automatic_retry_safe);
     }
 }

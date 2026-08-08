@@ -8,9 +8,10 @@ use std::{
 
 use clap::{error::ErrorKind, Parser};
 use codex_image_cli::{
-    cli::{Cli, Command},
+    batch,
+    cli::{BatchCommand, Cli, Command},
     provider,
-    report::{AppError, RunReport, SCHEMA_VERSION},
+    report::{AppError, BatchReport, RunReport, SCHEMA_VERSION},
     run_generate,
 };
 use serde::Serialize;
@@ -63,10 +64,62 @@ fn main() {
                 error.status.exit_code()
             }
         },
+        Command::Batch { command } => match command {
+            BatchCommand::Submit(args) => emit_batch(batch::submit(&args), cli.json),
+            BatchCommand::Status(args) => emit_batch(batch::status(&args), cli.json),
+            BatchCommand::Retrieve(args) => emit_batch(batch::retrieve(&args), cli.json),
+            BatchCommand::Cancel(args) => emit_batch(batch::cancel(&args), cli.json),
+        },
         Command::Doctor => run_doctor(cli.json),
         Command::AiHelp => run_ai_help(cli.json),
     };
     std::process::exit(exit_code);
+}
+
+fn emit_batch(
+    result: Result<BatchReport, codex_image_cli::batch::BatchFailure>,
+    json: bool,
+) -> i32 {
+    match result {
+        Ok(report) => {
+            let exit_code = report.exit_code;
+            if json {
+                print_json(&report);
+            } else if report.ok {
+                if let Some(job_file) = report.job_file {
+                    println!("job: {job_file}");
+                }
+                if let Some(batch_id) = report.batch_id {
+                    println!("batch: {batch_id}");
+                }
+                for output in report.outputs {
+                    println!("{output}");
+                }
+                if let Some(next_action) = report.next_action {
+                    println!("next: {next_action}");
+                }
+            } else {
+                eprintln!("{}", report.status);
+            }
+            exit_code
+        }
+        Err(failure) => {
+            let report = failure.context.report(Some(&failure.error));
+            let exit_code = report.exit_code;
+            if json {
+                print_json(&report);
+            } else {
+                eprintln!("{}: {}", failure.error.code, failure.error.message);
+                if let Some(job_file) = report.job_file {
+                    eprintln!("job: {job_file}");
+                }
+                if let Some(next_action) = report.next_action {
+                    eprintln!("next: {next_action}");
+                }
+            }
+            exit_code
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -153,7 +206,7 @@ fn run_doctor(json: bool) -> i32 {
                 detail: if codex_present {
                     "The Codex CLI is available locally."
                 } else {
-                    "Install the Codex CLI for the default subscription provider."
+                    "Install the Codex CLI only when using the explicit subscription provider."
                 },
             },
             DoctorCheck {
@@ -312,20 +365,23 @@ fn run_ai_help(json: bool) -> i32 {
         command: "codex-image generate",
         non_interactive: true,
         required: AiRequirements {
-        environment: "authenticated Codex CLI subscription by default; OPENAI_API_KEY only with --provider api",
+            environment: "OPENAI_API_KEY for the default --provider api; authenticated Codex CLI only with --provider codex",
             flags: vec!["--prompt TEXT or --prompt-file FILE"],
         },
-        safe_template: "codex-image generate --prompt \"<prompt>\" --output-dir ./artifacts/design --name <safe-stem> --n 1 --json",
-        planning_template: "codex-image generate --prompt \"<prompt>\" --output-dir ./artifacts/design --prefix <safe-stem> --dry-run --json",
-        request_file_template: "{\"schema_version\":1,\"prompt\":\"<prompt>\",\"provider\":\"codex\",\"size\":\"auto\",\"quality\":\"auto\"}",
+        safe_template: "codex-image generate --provider api --prompt \"<prompt>\" --output-dir ./artifacts/design --name <safe-stem> --n 1 --json",
+        planning_template: "codex-image generate --provider api --prompt \"<prompt>\" --output-dir ./artifacts/design --prefix <safe-stem> --dry-run --json",
+        batch_template: "codex-image batch submit --provider api --prompt \"<prompt>\" --output-dir ./artifacts/design --prefix <safe-stem> --n 2 --job-file ./batch-job.json --json",
+        request_file_template: "{\"schema_version\":1,\"prompt\":\"<prompt>\",\"provider\":\"api\",\"size\":\"auto\",\"quality\":\"low\"}",
         capabilities: provider::capabilities(),
         rules: vec![
-            "The default provider uses the authenticated Codex CLI subscription; --provider api uses OPENAI_API_KEY.",
+            "The default provider is the direct Image API and reads OPENAI_API_KEY only from the environment; --provider codex explicitly selects the local subscription path.",
             "Use --dry-run --json to validate names and parameters without reading a key or using a network.",
             "Create --output-dir explicitly; the CLI refuses missing or symlinked output directories.",
             "Use --name only for one image; use --prefix for deterministic multi-image names.",
             "Never retry exit code 5, 6, or 7 automatically because a generation may have been billed.",
-            "Use --provider api only when deliberately choosing API billing and OPENAI_API_KEY.",
+            "Use --confirm-high-quality with --quality high after reviewing the approximate cost warning.",
+            "Batch commands require --provider api; persist the returned job file and use batch status, retrieve, or cancel.",
+            "Repeat custom-origin or loopback approval flags on each Batch operation; editable job files never grant credential-destination approval.",
         ],
     };
     if json {
@@ -335,6 +391,7 @@ fn run_ai_help(json: bool) -> i32 {
         println!("Required environment: {}", help.required.environment);
         println!("Required input: {}", help.required.flags.join("; "));
         println!("Plan safely: {}", help.planning_template);
+        println!("Batch: {}", help.batch_template);
         println!("Structured request: {}", help.request_file_template);
         println!("Generate: {}", help.safe_template);
         println!("For machine-readable instructions: codex-image ai-help --json");
@@ -350,6 +407,7 @@ struct AiHelp {
     required: AiRequirements,
     safe_template: &'static str,
     planning_template: &'static str,
+    batch_template: &'static str,
     request_file_template: &'static str,
     capabilities: Vec<provider::Capability>,
     rules: Vec<&'static str>,
