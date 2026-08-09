@@ -89,6 +89,8 @@ job = json.loads(job_path.read_text(encoding="utf-8"))
 assert submit["ok"] is True and submit["status"] == "validating", submit
 assert status["ok"] is True and status["status"] == "completed", status
 assert retrieve["ok"] is True and retrieve["status"] == "retrieved", retrieve
+assert status["request_counts"] == {"completed": 1, "failed": 0, "total": 1}, status
+assert status["next_action"] == "run batch retrieve to publish available results", status
 assert image_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 assert "offline Batch lifecycle verification image" not in job
 
@@ -103,5 +105,6 @@ assert [event["operation"] for event in events] == [
 ], events
 assert all(event["authorization_present"] for event in events), events
 assert events[0]["quality"] == "low", events[0]
-print("Batch E2E PASS: submit, zero-count validation, status, retrieval, low quality, closed stdin")
+assert events[0]["size"] == "1024x1024", events[0]
+print("Batch E2E PASS: submit, zero-count validation, status counts, retrieval action, low quality, 1024 square, closed stdin")
 PY

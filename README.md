@@ -85,7 +85,7 @@ codex-image generate \
   --output-dir artifacts/design \
   --prefix fox-terminal \
   --n 1 \
-  --size 1536x1024 \
+  --size 1024x1024 \
   --quality low \
   --dry-run \
   --json
@@ -145,7 +145,7 @@ codex-image generate --prompt <TEXT> [OPTIONS]
 | `--name STEM` | — | Exact safe stem for one image only: `hero` → `hero.png`. |
 | `--prefix STEM` | `codex-image` | Safe stem for one/many images: `hero` + 3 → `hero-01.png` … |
 | `--format` | `png` | `png`, `jpeg`, or `webp`; response container is verified. |
-| `--size` | `auto` | `auto` or `WIDTHxHEIGHT` within documented GPT Image 2 constraints. |
+| `--size` | `1024x1024` | `auto` or `WIDTHxHEIGHT` within documented GPT Image 2 constraints. Use `--size auto` or a larger explicit size deliberately. |
 | `--quality` | `low` | `low`, `medium`, `high`, or `auto`; `high` requires `--confirm-high-quality`. |
 | `--background` | `auto` | `auto` or `opaque`; GPT Image 2 currently rejects transparent output. |
 | `--compression` | — | 0–100 for JPEG/WebP only. |
@@ -166,7 +166,7 @@ Use a request file when an agent already has typed parameters:
   "schema_version": 1,
   "prompt": "A warm editorial illustration of a rust-orange fox using a terminal",
   "provider": "codex",
-  "size": "1536x1024",
+  "size": "1024x1024",
   "quality": "medium"
 }
 ```

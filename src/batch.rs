@@ -29,7 +29,7 @@ use crate::{
         OutputIdentity, OutputTransaction, OutputVerificationArtifact, RecoveryArtifact,
         RecoveryVerificationArtifact, RetainedVerificationArtifact,
     },
-    report::{AppError, BatchContext, BatchReport},
+    report::{AppError, BatchContext, BatchReport, BatchRequestCountsReport},
     MODEL,
 };
 
@@ -508,6 +508,10 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     report_context.remote_status = job.remote_status.clone();
     report_context.output_file_id = job.output_file_id.clone();
     report_context.error_file_id = job.error_file_id.clone();
+    report_context.request_counts = batch_info
+        .request_counts
+        .as_ref()
+        .map(request_counts_report);
     report_context.http_status = Some(created.status);
     report_context.request_id = created.request_id;
     if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
@@ -668,8 +672,14 @@ pub fn recover(args: &BatchRecoverArgs) -> Result<BatchReport, BatchFailure> {
                 context,
             ));
         }
-        context.next_action =
-            Some("run batch status or batch retrieve with this job file".to_owned());
+        context.next_action = Some(
+            if job.output_file_id.is_some() {
+                "run batch retrieve to publish available results"
+            } else {
+                "run batch status or batch retrieve with this job file"
+            }
+            .to_owned(),
+        );
         return Ok(context.report(None));
     }
 
@@ -906,6 +916,11 @@ pub fn status(args: &BatchJobArgs) -> Result<BatchReport, BatchFailure> {
     if !is_terminal_remote_status(&info.status) {
         context.next_action =
             Some("run batch status again or use batch retrieve --wait".to_owned());
+    } else if updated.output_file_id.is_some() {
+        context.next_action = Some("run batch retrieve to publish available results".to_owned());
+    } else if info.status == "completed" {
+        context.next_action =
+            Some("inspect the Batch status, request counts, and error file".to_owned());
     }
     Ok(context.report(None))
 }
@@ -1945,12 +1960,7 @@ fn api_key() -> Result<String, AppError> {
             "OPENAI_API_KEY must be set for Batch API operations; it is never read during --dry-run.",
         )
     })?;
-    if value.trim().is_empty() {
-        return Err(AppError::usage(
-            "empty_api_key",
-            "OPENAI_API_KEY is empty; set a non-empty key in the environment.",
-        ));
-    }
+    crate::api::validate_api_key(&value)?;
     Ok(value)
 }
 
@@ -2231,6 +2241,25 @@ fn set_context_from_info(context: &mut BatchContext, info: &BatchInfo) {
     context.remote_status = Some(info.status.clone());
     context.output_file_id = info.output_file_id.clone();
     context.error_file_id = info.error_file_id.clone();
+    context.request_counts = info.request_counts.as_ref().map(request_counts_report);
+}
+
+fn request_counts_report(counts: &BatchRequestCounts) -> BatchRequestCountsReport {
+    BatchRequestCountsReport {
+        completed: counts.completed,
+        failed: counts.failed,
+        total: counts.total,
+    }
+}
+
+fn persisted_request_counts_report(
+    counts: &PersistedBatchRequestCounts,
+) -> BatchRequestCountsReport {
+    BatchRequestCountsReport {
+        completed: counts.completed,
+        failed: counts.failed,
+        total: counts.total,
+    }
 }
 
 fn is_terminal_remote_status(status: &str) -> bool {
@@ -2368,6 +2397,10 @@ fn context_from_job(operation: &'static str, path: &Path, job: &BatchJob) -> Bat
         output_file_id: job.output_file_id.clone(),
         error_file_id: job.error_file_id.clone(),
         remote_status: job.remote_status.clone(),
+        request_counts: job
+            .request_counts
+            .as_ref()
+            .map(persisted_request_counts_report),
         image_count: job.image_count,
         attempted: false,
         retained_artifacts: job.retained_artifacts.clone(),

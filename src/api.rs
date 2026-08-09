@@ -16,6 +16,22 @@ use crate::{cli::GenerateArgs, endpoint::Endpoint, report::AppError, MODEL};
 pub const MAX_RESPONSE_BYTES: usize = 180 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 
+pub fn validate_api_key(api_key: &str) -> Result<(), AppError> {
+    if api_key.trim().is_empty() {
+        return Err(AppError::usage(
+            "empty_api_key",
+            "OPENAI_API_KEY is empty. Set a non-empty API key in the environment; do not pass it on the command line.",
+        ));
+    }
+    if !api_key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(AppError::usage(
+            "invalid_api_key",
+            "OPENAI_API_KEY must contain only visible ASCII characters and must not include whitespace or control characters.",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 pub struct ImageGenerationRequest<'a> {
     model: &'static str,
@@ -720,7 +736,7 @@ mod tests {
             name: None,
             prefix: None,
             format: crate::cli::OutputFormat::Png,
-            size: "auto".to_owned(),
+            size: "1024x1024".to_owned(),
             quality: crate::cli::Quality::Auto,
             confirm_high_quality: false,
             background: crate::cli::Background::Auto,
@@ -735,7 +751,18 @@ mod tests {
         };
         let body = serde_json::to_value(ImageGenerationRequest::from_args("test", &args)).unwrap();
         assert_eq!(body["model"], "gpt-image-2");
+        assert_eq!(body["size"], "1024x1024");
         assert!(body.get("output_compression").is_none());
+    }
+
+    #[test]
+    fn rejects_empty_or_non_visible_api_keys() {
+        assert_eq!(validate_api_key("   ").unwrap_err().code, "empty_api_key");
+        assert_eq!(
+            validate_api_key("test-api-key\n").unwrap_err().code,
+            "invalid_api_key"
+        );
+        assert!(validate_api_key("test-api-key").is_ok());
     }
 
     #[test]

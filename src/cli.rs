@@ -188,8 +188,8 @@ pub struct GenerateArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Png)]
     pub format: OutputFormat,
 
-    /// `auto` or WIDTHxHEIGHT. GPT Image 2 dimensions must follow its documented limits.
-    #[arg(long, default_value = "auto", value_name = "SIZE")]
+    /// `1024x1024` by default, or `auto`/WIDTHxHEIGHT within GPT Image 2 limits.
+    #[arg(long, default_value = "1024x1024", value_name = "SIZE")]
     pub size: String,
 
     /// Render quality. `low` is the cost-conscious default; `high` requires explicit confirmation.
@@ -628,5 +628,16 @@ mod tests {
         let error = high_quality_confirmation_message(Provider::Api);
         assert!(error.contains("$0.277"));
         assert!(error.contains("--confirm-high-quality"));
+    }
+
+    #[test]
+    fn defaults_generation_to_low_quality_png_at_1024_square() {
+        let cli = Cli::try_parse_from(["codex-image", "generate", "--prompt", "test"]).unwrap();
+        let Command::Generate(args) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(args.format, OutputFormat::Png);
+        assert_eq!(args.size, "1024x1024");
+        assert_eq!(args.quality, Quality::Low);
     }
 }

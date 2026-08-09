@@ -80,12 +80,7 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
                 "OPENAI_API_KEY must be set for the default --provider api path, or select --provider codex explicitly.",
             )
         })?;
-        if key.trim().is_empty() {
-            return Err(AppError::usage(
-                "empty_api_key",
-                "OPENAI_API_KEY is empty. Set a non-empty API key in the environment; do not pass it on the command line.",
-            ));
-        }
+        api::validate_api_key(&key)?;
         let client = ApiClient::new(args.timeout_seconds)?;
         Some((key, client))
     } else {

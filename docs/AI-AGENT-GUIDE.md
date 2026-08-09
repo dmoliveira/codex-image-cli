@@ -20,6 +20,8 @@ codex-image doctor --json
 5. Parse `ok`, `status`, `exit_code`, `outputs`, `retained_artifacts`, and `possibly_modified_paths`.
 6. Never auto-retry codes 5–7. Surface the API request ID and path list to the caller instead.
 
+The API provider defaults to a cost-conscious `1024x1024` PNG at `low` quality. Choose `--size auto` or a larger size explicitly when the request needs it.
+
 For typed callers, prefer a version 1 `--request-file` JSON request. Keep output naming and security approvals as separate CLI flags.
 
 ```bash

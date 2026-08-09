@@ -251,11 +251,11 @@ fn spawn_batch_server_with_second_content_status(
             let body = match (index, request.method.as_str(), request.path.as_str()) {
                 (0, "POST", "/v1/files") => r#"{"id":"file-input"}"#.to_owned(),
                 (1, "POST", "/v1/batches") => {
-                    r#"{"id":"batch-test","status":"validating","input_file_id":"file-input"}"#.to_owned()
+                    r#"{"id":"batch-test","status":"validating","input_file_id":"file-input","request_counts":{"completed":0,"failed":0,"total":0}}"#.to_owned()
                 }
                 (2, "GET", "/v1/batches/batch-test")
                 | (3, "GET", "/v1/batches/batch-test") => {
-                    r#"{"id":"batch-test","status":"completed","input_file_id":"file-input","output_file_id":"file-output"}"#.to_owned()
+                    r#"{"id":"batch-test","status":"completed","input_file_id":"file-input","output_file_id":"file-output","request_counts":{"completed":2,"failed":0,"total":2}}"#.to_owned()
                 }
                 (4, "GET", "/v1/files/file-output/content") => custom_ids
                     .iter()
@@ -651,6 +651,7 @@ fn generate_writes_a_valid_png_from_a_loopback_mock() {
     assert!(request.authorization_was_present);
     assert_eq!(request.request_json["model"], "gpt-image-2");
     assert_eq!(request.request_json["n"], 1);
+    assert_eq!(request.request_json["size"], "1024x1024");
     assert_eq!(request.request_json["quality"], "low");
 }
 
@@ -1151,6 +1152,62 @@ fn completed_batch_without_output_is_a_terminal_batch_failure() {
         .all(|request| !request.path.contains("content")));
 }
 
+#[test]
+fn completed_batch_status_without_output_exposes_inspection_action() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let job_file = directory.path().join("completed-status-job.json");
+    let (url, server) = spawn_terminal_batch_server("completed", None);
+
+    let submitted = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "submit",
+            "--provider",
+            "api",
+            "--prompt",
+            "complete without output",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--name",
+            "completed",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(submitted.status.success(), "{submitted:?}");
+
+    let status = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "status",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let report: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(report["status"], "completed");
+    assert_eq!(
+        report["next_action"],
+        "inspect the Batch status, request counts, and error file"
+    );
+
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+}
+
 fn assert_terminal_batch_with_output(status: &str) {
     let directory = safe_tempdir();
     let output_dir = directory.path().join("images");
@@ -1499,6 +1556,14 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     let submitted_report: Value = serde_json::from_slice(&submitted.stdout).unwrap();
     assert_eq!(submitted_report["status"], "validating");
     assert_eq!(submitted_report["batch_id"], "batch-test");
+    assert_eq!(
+        submitted_report["request_counts"],
+        serde_json::json!({"completed": 0, "failed": 0, "total": 0})
+    );
+    assert_eq!(
+        submitted_report["next_action"],
+        "run batch status or batch retrieve with this job file"
+    );
     let job_body = fs::read_to_string(&job_file).unwrap();
     assert!(!job_body.contains("batch fox"));
 
@@ -1517,6 +1582,14 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     assert!(status.status.success(), "{status:?}");
     let status_report: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status_report["status"], "completed");
+    assert_eq!(
+        status_report["request_counts"],
+        serde_json::json!({"completed": 2, "failed": 0, "total": 2})
+    );
+    assert_eq!(
+        status_report["next_action"],
+        "run batch retrieve to publish available results"
+    );
 
     let retrieved = command()
         .env("OPENAI_API_KEY", "test-key")
@@ -1533,6 +1606,10 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     assert!(retrieved.status.success(), "{retrieved:?}");
     let retrieved_report: Value = serde_json::from_slice(&retrieved.stdout).unwrap();
     assert_eq!(retrieved_report["status"], "retrieved");
+    assert_eq!(
+        retrieved_report["request_counts"],
+        serde_json::json!({"completed": 2, "failed": 0, "total": 2})
+    );
     assert!(output_dir.join("fox-01.png").exists());
     assert!(output_dir.join("fox-02.png").exists());
     assert_eq!(
@@ -1626,6 +1703,7 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     let batch_input = String::from_utf8_lossy(&requests[0].body);
     assert!(batch_input.contains("purpose"));
     assert!(batch_input.contains("\"quality\":\"low\""));
+    assert!(batch_input.contains("\"size\":\"1024x1024\""));
     assert_eq!(requests[1].path, "/v1/batches");
     assert_eq!(requests[2].path, "/v1/batches/batch-test");
     assert_eq!(requests[3].path, "/v1/batches/batch-test");

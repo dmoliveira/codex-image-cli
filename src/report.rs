@@ -323,6 +323,7 @@ pub struct BatchContext {
     pub output_file_id: Option<String>,
     pub error_file_id: Option<String>,
     pub remote_status: Option<String>,
+    pub request_counts: Option<BatchRequestCountsReport>,
     pub http_status: Option<u16>,
     pub request_id: Option<String>,
     pub image_count: u8,
@@ -347,6 +348,8 @@ pub struct BatchReport {
     pub output_file_id: Option<String>,
     pub error_file_id: Option<String>,
     pub remote_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_counts: Option<BatchRequestCountsReport>,
     pub request: BatchRequestInfo,
     pub http: HttpInfo,
     pub outputs: Vec<String>,
@@ -356,6 +359,13 @@ pub struct BatchReport {
     pub next_action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchRequestCountsReport {
+    pub completed: u32,
+    pub failed: u32,
+    pub total: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -416,6 +426,7 @@ impl BatchContext {
             output_file_id: self.output_file_id.clone(),
             error_file_id: self.error_file_id.clone(),
             remote_status: self.remote_status.clone(),
+            request_counts: self.request_counts.clone(),
             request: BatchRequestInfo {
                 attempted: self.attempted,
                 image_count: self.image_count,

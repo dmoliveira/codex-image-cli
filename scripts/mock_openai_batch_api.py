@@ -27,6 +27,7 @@ class BatchHandler(BaseHTTPRequestHandler):
     log_path: Path
     custom_ids: list[str] = []
     quality = "unknown"
+    size = "unknown"
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -98,6 +99,8 @@ class BatchHandler(BaseHTTPRequestHandler):
         BatchHandler.custom_ids = re.findall(r'"custom_id"\s*:\s*"([^"]+)"', text)
         qualities = re.findall(r'"quality"\s*:\s*"([^"]+)"', text)
         BatchHandler.quality = qualities[0] if qualities else "missing"
+        sizes = re.findall(r'"size"\s*:\s*"([^"]+)"', text)
+        BatchHandler.size = sizes[0] if sizes else "missing"
         self._record_event("file_upload")
 
     def _record_event(self, operation: str) -> None:
@@ -108,6 +111,7 @@ class BatchHandler(BaseHTTPRequestHandler):
             "authorization_present": bool(self.headers.get("Authorization")),
             "request_count": BatchHandler.request_count,
             "quality": BatchHandler.quality,
+            "size": BatchHandler.size,
         }
         with BatchHandler.log_path.open("a", encoding="utf-8") as log:
             log.write(json.dumps(event) + "\n")
