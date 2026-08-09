@@ -55,6 +55,28 @@ fn spawn_server_with_request_id(
     (format!("http://{address}/v1"), handle)
 }
 
+fn spawn_mutating_direct_server(run_file: &Path) -> (String, JoinHandle<RecordedRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let run_file = run_file.to_owned();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        let mut coordinator = fs::read(&run_file).unwrap();
+        coordinator[0] = if coordinator[0] == b'{' { b'[' } else { b'{' };
+        fs::write(&run_file, coordinator).unwrap();
+        let body = format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: mutating-run-test\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        request
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
 fn spawn_parallel_image_server(
     expected_requests: usize,
 ) -> (String, JoinHandle<(Vec<RecordedRequest>, usize)>) {
@@ -2878,6 +2900,75 @@ fn run_direct_does_not_retry_an_unknown_post_on_resume() {
     let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(report["status"], "outcome_unknown");
     assert_eq!(report["assets"][0]["state"], "outcome_unknown");
+}
+
+#[test]
+fn run_direct_propagates_a_coordinator_change_during_dispatch() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
+    let run_file = directory.path().join("run.json");
+    let (url, server) = spawn_mutating_direct_server(&run_file);
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            plan_report["plan_digest"].as_str().unwrap(),
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "run_state_changed");
+    assert_eq!(report["error"]["automatic_retry_safe"], false);
+    assert_eq!(report["request"]["request_id"], "mutating-run-test");
+    assert_eq!(report["http"]["status"], 200);
+    assert!(report["possibly_modified_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path.as_str().unwrap().ends_with("one.png")));
+    assert!(server.join().unwrap().path_is_correct);
 }
 
 #[test]

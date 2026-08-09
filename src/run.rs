@@ -15,12 +15,15 @@ use std::os::unix::fs::MetadataExt;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use rustix::{
-    fs::{mkdirat, openat, renameat_with, statat, AtFlags, Mode, OFlags, RenameFlags, CWD},
+    fs::{
+        mkdirat, openat, renameat_with, statat, AtFlags, FileType, Mode, OFlags, RenameFlags, CWD,
+    },
     io::Errno,
 };
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     batch,
@@ -30,7 +33,7 @@ use crate::{
     },
     endpoint::Endpoint,
     manifest::{self, Manifest, ManifestAsset},
-    report::{AppError, Status},
+    report::{AppError, RunReport as GenerationReport, Status},
     run_generate_with_preflight, MODEL,
 };
 
@@ -201,6 +204,32 @@ struct PersistedAssetError {
     message: String,
 }
 
+#[derive(Debug, Clone)]
+struct AssetMapping {
+    id: String,
+    output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunFileMetadata {
+    length: u64,
+    modified: SystemTime,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    device: u64,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    inode: u64,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    change_time: i64,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    change_time_nanos: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunFileFingerprint {
+    metadata: RunFileMetadata,
+    digest: [u8; 32],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AssetClaim {
     identity: Option<crate::output::OutputIdentity>,
@@ -297,7 +326,7 @@ pub fn plan(args: &RunPlanArgs) -> Result<RunReport, AppError> {
             1
         },
     };
-    let plan = build_plan(&manifest, &args.common, execution)?;
+    let plan = build_plan(manifest, &args.common, execution)?;
     Ok(plan_report(&plan, "run.plan"))
 }
 
@@ -308,7 +337,7 @@ pub fn direct(args: &RunDirectArgs) -> Result<RunReport, AppError> {
         continue_on_error: args.continue_on_error,
     };
     let plan = build_plan(
-        &manifest,
+        manifest,
         &args.common,
         PlanExecution {
             mode: RunMode::Direct,
@@ -369,35 +398,39 @@ pub fn direct(args: &RunDirectArgs) -> Result<RunReport, AppError> {
         let continue_on_error = execution.continue_on_error;
         workers.push(thread::spawn(move || loop {
             if stop.load(Ordering::Acquire) {
-                break;
+                break Ok(());
             }
             let index = cursor.fetch_add(1, Ordering::AcqRel);
             if index >= plan.manifest.assets.len() {
-                break;
+                break Ok(());
             }
             let claim = match store.claim_asset(index) {
                 Ok(claim) => claim,
-                Err(_) => {
+                Err(error) => {
                     stop.store(true, Ordering::Release);
-                    break;
+                    return Err(error);
                 }
             };
             let Some(claim) = claim else { continue };
-            if store.verify_asset_claim(index, claim).is_err() {
+            if let Err(error) = store.verify_asset_claim(index, claim) {
                 stop.store(true, Ordering::Release);
-                break;
+                return Err(error);
             }
             let asset = &plan.manifest.assets[index];
             let generation = generation_args(&plan, asset);
             let result =
                 run_generate_with_preflight(&generation, || store.verify_asset_claim(index, claim));
             let hard_stop = match &result {
-                Ok(report) => store
-                    .update_asset(index, |asset| {
+                Ok(report) => {
+                    if let Err(error) = store.update_asset(index, |asset| {
                         record_success(asset, report);
                         Ok(())
-                    })
-                    .is_err(),
+                    }) {
+                        stop.store(true, Ordering::Release);
+                        return Err(persistence_error_after_dispatch(error, Some(report), None));
+                    }
+                    false
+                }
                 Err(error) => {
                     let unknown = matches!(
                         error.status,
@@ -405,13 +438,18 @@ pub fn direct(args: &RunDirectArgs) -> Result<RunReport, AppError> {
                             | Status::InvalidSuccessResponse
                             | Status::OutputCommitFailed
                     );
-                    let recorded = store
-                        .update_asset(index, |asset| {
-                            record_error(asset, error, unknown);
-                            Ok(())
-                        })
-                        .is_ok();
-                    unknown || !recorded || !continue_on_error
+                    if let Err(update_error) = store.update_asset(index, |asset| {
+                        record_error(asset, error, unknown);
+                        Ok(())
+                    }) {
+                        stop.store(true, Ordering::Release);
+                        return Err(persistence_error_after_dispatch(
+                            update_error,
+                            None,
+                            Some(error),
+                        ));
+                    }
+                    unknown || !continue_on_error
                 }
             };
             if hard_stop {
@@ -419,15 +457,30 @@ pub fn direct(args: &RunDirectArgs) -> Result<RunReport, AppError> {
             }
         }));
     }
+    let mut worker_error = None;
     for worker in workers {
-        if worker.join().is_err() {
-            return Err(AppError::preflight(
-                "run_worker_failed",
-                "A direct run worker terminated unexpectedly; inspect the durable run state before resuming.",
-            ));
+        match worker.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if worker_error.is_none() {
+                    worker_error = Some(error);
+                }
+            }
+            Err(_) => {
+                return Err(AppError::indeterminate(
+                    "run_worker_failed",
+                    "A direct run worker terminated unexpectedly after dispatch may have started; inspect durable run state and API activity before retrying.",
+                ));
+            }
         }
     }
-    let state = store.snapshot()?;
+    if let Some(error) = worker_error {
+        return Err(error);
+    }
+    let state = match store.snapshot() {
+        Ok(state) => state,
+        Err(error) => return Err(persistence_error_after_dispatch(error, None, None)),
+    };
     Ok(report_from_state(&shared_plan, &state, "run.direct"))
 }
 
@@ -454,7 +507,7 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
     }
     let manifest = manifest::load(&args.common.manifest)?;
     let plan = build_plan(
-        &manifest,
+        manifest,
         &args.common,
         PlanExecution {
             mode: RunMode::Batch,
@@ -669,7 +722,7 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
     Ok(batch_report_from_state(&shared_plan, &state))
 }
 fn build_plan(
-    manifest: &Manifest,
+    manifest: Manifest,
     common: &RunCommonArgs,
     execution: PlanExecution,
 ) -> Result<ExecutionPlan, AppError> {
@@ -763,7 +816,7 @@ fn build_plan(
     let operation = payload.operation;
     drop(payload);
     Ok(ExecutionPlan {
-        manifest: manifest.clone(),
+        manifest,
         common: common.clone(),
         output_dir,
         output_names,
@@ -1570,12 +1623,96 @@ fn record_error(asset: &mut PersistedAsset, error: &AppError, unknown: bool) {
     });
 }
 
+fn persistence_error_after_dispatch(
+    persistence_error: AppError,
+    report: Option<&GenerationReport>,
+    request_error: Option<&AppError>,
+) -> AppError {
+    let mut error = AppError::indeterminate(
+        persistence_error.code,
+        format!(
+            "The API request may have completed, but durable run state could not be recorded: {} Inspect the run state and API activity before retrying; do not rerun automatically.",
+            persistence_error.message
+        ),
+    );
+    error.request_id = report
+        .and_then(|report| report.request.request_id.clone())
+        .or_else(|| request_error.and_then(|error| error.request_id.clone()));
+    error.http_status = report
+        .and_then(|report| report.http.status)
+        .or_else(|| request_error.and_then(|error| error.http_status));
+    error
+        .possibly_modified_paths
+        .extend(persistence_error.possibly_modified_paths);
+    if let Some(request_error) = request_error {
+        error
+            .possibly_modified_paths
+            .extend(request_error.possibly_modified_paths.iter().cloned());
+    }
+    if let Some(report) = report {
+        error
+            .possibly_modified_paths
+            .extend(report.outputs.iter().map(PathBuf::from));
+        error
+            .possibly_modified_paths
+            .extend(report.retained_artifacts.iter().map(PathBuf::from));
+        error
+            .possibly_modified_paths
+            .extend(report.possibly_modified_paths.iter().map(PathBuf::from));
+    }
+    error.possibly_modified_paths.sort();
+    error.possibly_modified_paths.dedup();
+    error
+}
+
+fn inspect_run_file_metadata(file: &File) -> Result<RunFileMetadata, AppError> {
+    let metadata = file.metadata().map_err(|_| {
+        AppError::preflight(
+            "run_state_unavailable",
+            "The direct run coordinator could not be inspected safely.",
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(AppError::preflight(
+            "run_state_unavailable",
+            "The direct run coordinator must be a regular file.",
+        ));
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if metadata.nlink() != 1 {
+        return Err(AppError::preflight(
+            "run_state_hard_linked",
+            "The direct run coordinator must have exactly one filesystem link.",
+        ));
+    }
+    let modified = metadata.modified().map_err(|_| {
+        AppError::preflight(
+            "run_state_unavailable",
+            "The direct run coordinator modification time could not be inspected safely.",
+        )
+    })?;
+    Ok(RunFileMetadata {
+        length: metadata.len(),
+        modified,
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        device: metadata.dev(),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        inode: metadata.ino(),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        change_time: metadata.ctime(),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        change_time_nanos: metadata.ctime_nsec(),
+    })
+}
+
 #[derive(Debug, Clone)]
 struct RunStore {
     path: PathBuf,
     thread_lock: Arc<Mutex<()>>,
     parent_directory: Arc<Mutex<Option<File>>>,
     asset_directory: Arc<Mutex<Option<File>>>,
+    asset_mappings: Arc<Mutex<Option<Arc<Vec<AssetMapping>>>>>,
+    run_file_fingerprint: Arc<Mutex<Option<RunFileFingerprint>>>,
 }
 
 impl RunStore {
@@ -1641,6 +1778,8 @@ impl RunStore {
             thread_lock: Arc::new(Mutex::new(())),
             parent_directory: Arc::new(Mutex::new(Some(parent_directory))),
             asset_directory: Arc::new(Mutex::new(None)),
+            asset_mappings: Arc::new(Mutex::new(None)),
+            run_file_fingerprint: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1649,12 +1788,14 @@ impl RunStore {
             if store.state_file_exists()? {
                 let state = store.read_base_unlocked()?;
                 store.validate_state(&state, plan)?;
+                store.cache_asset_mappings(&state.assets)?;
                 if state.schema_version == LEGACY_DIRECT_RUN_STATE_SCHEMA_VERSION {
                     store.migrate_legacy_state(&state)?;
                 } else {
                     store.pin_existing_asset_state_dir()?;
                     store.validate_asset_state_files(&state)?;
                 }
+                store.cache_run_file_fingerprint()?;
                 return Ok(());
             }
             match fs::symlink_metadata(store.asset_state_dir()) {
@@ -1701,8 +1842,150 @@ impl RunStore {
                 updated_at: now,
             };
             store.ensure_asset_state_dir()?;
+            store.cache_asset_mappings(&state.assets)?;
             store.write_all_asset_state(&state)?;
-            store.write_unlocked(&state)
+            store.write_unlocked(&state)?;
+            store.cache_run_file_fingerprint()
+        })
+    }
+
+    fn cache_asset_mappings(&self, assets: &[PersistedAsset]) -> Result<(), AppError> {
+        let mappings = assets
+            .iter()
+            .map(|asset| AssetMapping {
+                id: asset.id.clone(),
+                output: asset.output.clone(),
+            })
+            .collect();
+        let mut cached = self.asset_mappings.lock().map_err(|_| {
+            AppError::preflight(
+                "run_lock_unavailable",
+                "The direct run asset mapping cache could not be acquired safely.",
+            )
+        })?;
+        *cached = Some(Arc::new(mappings));
+        Ok(())
+    }
+
+    fn asset_mappings(&self) -> Result<Arc<Vec<AssetMapping>>, AppError> {
+        let cached = self.asset_mappings.lock().map_err(|_| {
+            AppError::preflight(
+                "run_lock_unavailable",
+                "The direct run asset mapping cache could not be acquired safely.",
+            )
+        })?;
+        let mappings = cached.as_ref().ok_or_else(|| {
+            AppError::preflight(
+                "run_state_unavailable",
+                "The direct run asset mapping cache has not been initialized safely.",
+            )
+        })?;
+        Ok(Arc::clone(mappings))
+    }
+
+    fn cache_run_file_fingerprint(&self) -> Result<(), AppError> {
+        let fingerprint = self.current_run_file_fingerprint()?;
+        let mut cached = self.run_file_fingerprint.lock().map_err(|_| {
+            AppError::preflight(
+                "run_lock_unavailable",
+                "The direct run coordinator fingerprint cache could not be acquired safely.",
+            )
+        })?;
+        *cached = Some(fingerprint);
+        Ok(())
+    }
+
+    fn validate_run_file_fingerprint(&self) -> Result<(), AppError> {
+        let expected = self
+            .run_file_fingerprint
+            .lock()
+            .map_err(|_| {
+                AppError::preflight(
+                    "run_lock_unavailable",
+                    "The direct run coordinator fingerprint cache could not be acquired safely.",
+                )
+            })?
+            .clone()
+            .ok_or_else(|| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The direct run coordinator fingerprint has not been initialized safely.",
+                )
+            })?;
+        // Keep stable transitions O(1); hash only when file identity or change metadata moves.
+        if self.current_run_file_metadata()? != expected.metadata {
+            let current = self.current_run_file_fingerprint()?;
+            if current.digest == expected.digest {
+                let mut cached = self.run_file_fingerprint.lock().map_err(|_| {
+                    AppError::preflight(
+                        "run_lock_unavailable",
+                        "The direct run coordinator fingerprint cache could not be acquired safely.",
+                    )
+                })?;
+                *cached = Some(current);
+                return Ok(());
+            }
+            return Err(AppError::preflight(
+                "run_state_changed",
+                "The direct run coordinator changed during execution; inspect durable state before resuming.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn current_run_file_metadata(&self) -> Result<RunFileMetadata, AppError> {
+        self.with_parent_directory(|parent| {
+            let file = open_pinned_asset_file(parent, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The direct run coordinator could not be opened safely.",
+                )
+            })?;
+            inspect_run_file_metadata(&file)
+        })
+    }
+
+    fn current_run_file_fingerprint(&self) -> Result<RunFileFingerprint, AppError> {
+        self.with_parent_directory(|parent| {
+            let mut file = open_pinned_asset_file(parent, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The direct run coordinator could not be opened safely.",
+                )
+            })?;
+            let metadata = inspect_run_file_metadata(&file)?;
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take((MAX_RUN_FILE_BYTES as u64).saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|_| {
+                    AppError::preflight(
+                        "run_state_unavailable",
+                        "The direct run coordinator could not be read safely.",
+                    )
+                })?;
+            if bytes.len() > MAX_RUN_FILE_BYTES {
+                return Err(AppError::preflight(
+                    "run_state_too_large",
+                    "The direct run coordinator exceeded its local safety limit.",
+                ));
+            }
+            let final_file = open_pinned_asset_file(parent, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_changed",
+                    "The direct run coordinator changed while it was being fingerprinted; inspect durable state before resuming.",
+                )
+            })?;
+            if inspect_run_file_metadata(&final_file)? != metadata {
+                return Err(AppError::preflight(
+                    "run_state_changed",
+                    "The direct run coordinator changed while it was being fingerprinted; inspect durable state before resuming.",
+                ));
+            }
+            Ok(RunFileFingerprint {
+                metadata,
+                digest: Sha256::digest(bytes).into(),
+            })
         })
     }
 
@@ -1746,7 +2029,10 @@ impl RunStore {
     }
 
     fn snapshot(&self) -> Result<RunState, AppError> {
-        self.with_lock(|store| store.read_unlocked())
+        self.with_lock(|store| {
+            store.validate_run_file_fingerprint()?;
+            store.read_unlocked()
+        })
     }
 
     fn update_asset<F, T>(&self, index: usize, update: F) -> Result<T, AppError>
@@ -1754,23 +2040,18 @@ impl RunStore {
         F: FnOnce(&mut PersistedAsset) -> Result<T, AppError>,
     {
         self.with_lock(|store| {
-            let state = store.read_base_unlocked()?;
-            if state.schema_version != DIRECT_RUN_STATE_SCHEMA_VERSION {
-                return Err(AppError::preflight(
-                    "run_state_invalid",
-                    "The direct run coordinator has not completed its durable state migration.",
-                ));
-            }
-            store.pin_existing_asset_state_dir()?;
-            let base_asset = state.assets.get(index).ok_or_else(|| {
+            store.validate_run_file_fingerprint()?;
+            let mappings = store.asset_mappings()?;
+            let mapping = mappings.get(index).ok_or_else(|| {
                 AppError::preflight(
                     "run_state_invalid",
-                    "The run state asset list changed unexpectedly.",
+                    "The requested asset index is outside the approved run plan.",
                 )
             })?;
-            let mut asset = store.read_asset_unlocked(index, base_asset)?;
+            store.pin_existing_asset_state_dir()?;
+            let mut asset = store.read_asset_unlocked(index, mapping)?;
             let value = update(&mut asset)?;
-            store.write_asset_unlocked(index, &state, &asset)?;
+            store.write_asset_unlocked(index, mapping, &asset)?;
             Ok(value)
         })
     }
@@ -1795,21 +2076,16 @@ impl RunStore {
 
     fn verify_asset_claim(&self, index: usize, claim: AssetClaim) -> Result<(), AppError> {
         self.with_lock(|store| {
-            let state = store.read_base_unlocked()?;
-            if state.schema_version != DIRECT_RUN_STATE_SCHEMA_VERSION {
-                return Err(AppError::preflight(
-                    "run_state_invalid",
-                    "The direct run coordinator has not completed its durable state migration.",
-                ));
-            }
-            store.pin_existing_asset_state_dir()?;
-            let base_asset = state.assets.get(index).ok_or_else(|| {
+            store.validate_run_file_fingerprint()?;
+            let mappings = store.asset_mappings()?;
+            let mapping = mappings.get(index).ok_or_else(|| {
                 AppError::preflight(
                     "run_state_invalid",
-                    "The run state asset list changed unexpectedly.",
+                    "The requested asset index is outside the approved run plan.",
                 )
             })?;
-            let asset = store.read_asset_unlocked(index, base_asset)?;
+            store.pin_existing_asset_state_dir()?;
+            let asset = store.read_asset_unlocked(index, mapping)?;
             if !matches!(asset.state, PersistedAssetState::DispatchInFlight) {
                 return Err(AppError::preflight(
                     "run_state_changed",
@@ -1958,14 +2234,21 @@ impl RunStore {
         }
         self.pin_existing_asset_state_dir()?;
         self.validate_asset_state_files(&state)?;
+        let mappings = self.asset_mappings()?;
+        if mappings.len() != state.assets.len() {
+            return Err(AppError::preflight(
+                "run_state_invalid",
+                "The run state asset mapping changed unexpectedly.",
+            ));
+        }
         for index in 0..state.assets.len() {
-            let base_asset = state.assets.get(index).ok_or_else(|| {
+            let mapping = mappings.get(index).ok_or_else(|| {
                 AppError::preflight(
                     "run_state_invalid",
-                    "The run state asset list changed unexpectedly.",
+                    "The run state asset mapping changed unexpectedly.",
                 )
             })?;
-            state.assets[index] = self.read_asset_unlocked(index, base_asset)?;
+            state.assets[index] = self.read_asset_unlocked(index, mapping)?;
         }
         Ok(state)
     }
@@ -2068,6 +2351,7 @@ impl RunStore {
     }
 
     fn write_all_asset_state(&self, state: &RunState) -> Result<(), AppError> {
+        let mappings = self.asset_mappings()?;
         for index in 0..state.assets.len() {
             let asset = state.assets.get(index).ok_or_else(|| {
                 AppError::preflight(
@@ -2075,7 +2359,13 @@ impl RunStore {
                     "The run state asset list changed unexpectedly.",
                 )
             })?;
-            self.write_asset_unlocked(index, state, asset)?;
+            let mapping = mappings.get(index).ok_or_else(|| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The run state asset mapping changed unexpectedly.",
+                )
+            })?;
+            self.write_asset_unlocked(index, mapping, asset)?;
         }
         Ok(())
     }
@@ -2101,6 +2391,7 @@ impl RunStore {
                 ));
             }
         }
+        let mappings = self.asset_mappings()?;
         for index in 0..state.assets.len() {
             let base_asset = state.assets.get(index).ok_or_else(|| {
                 AppError::preflight(
@@ -2108,8 +2399,14 @@ impl RunStore {
                     "The legacy run state asset list changed unexpectedly.",
                 )
             })?;
+            let mapping = mappings.get(index).ok_or_else(|| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The legacy run state asset mapping changed unexpectedly.",
+                )
+            })?;
             if self.asset_state_file_exists(index)? {
-                let sidecar = self.read_asset_unlocked(index, base_asset)?;
+                let sidecar = self.read_asset_unlocked(index, mapping)?;
                 if sidecar != *base_asset {
                     return Err(AppError::preflight(
                         "run_state_invalid",
@@ -2117,7 +2414,7 @@ impl RunStore {
                     ));
                 }
             } else {
-                self.write_asset_unlocked(index, state, base_asset)?;
+                self.write_asset_unlocked(index, mapping, base_asset)?;
             }
         }
         let mut migrated = state.clone();
@@ -2292,7 +2589,7 @@ impl RunStore {
     fn read_asset_unlocked(
         &self,
         index: usize,
-        base_asset: &PersistedAsset,
+        mapping: &AssetMapping,
     ) -> Result<PersistedAsset, AppError> {
         let path = self.asset_state_path(index);
         let mut file = self.with_asset_directory(|directory| {
@@ -2344,7 +2641,7 @@ impl RunStore {
                 "The per-asset run state file is not valid JSON.",
             )
         })?;
-        if asset.id != base_asset.id || asset.output != base_asset.output {
+        if asset.id != mapping.id || asset.output != mapping.output {
             return Err(AppError::preflight(
                 "run_state_invalid",
                 "The per-asset run state mapping is inconsistent with the approved plan.",
@@ -2356,16 +2653,10 @@ impl RunStore {
     fn write_asset_unlocked(
         &self,
         index: usize,
-        state: &RunState,
+        mapping: &AssetMapping,
         asset: &PersistedAsset,
     ) -> Result<(), AppError> {
-        let base_asset = state.assets.get(index).ok_or_else(|| {
-            AppError::preflight(
-                "run_state_invalid",
-                "The run state asset list changed unexpectedly.",
-            )
-        })?;
-        if asset.id != base_asset.id || asset.output != base_asset.output {
+        if asset.id != mapping.id || asset.output != mapping.output {
             return Err(AppError::preflight(
                 "run_state_invalid",
                 "The per-asset run state mapping cannot be changed.",
@@ -3073,6 +3364,7 @@ pub(crate) fn open_directory_for_lock(parent: &File) -> Result<File, ()> {
 }
 
 pub(crate) fn open_pinned_lock_file(directory: &File, path: &Path) -> Result<File, ()> {
+    validate_lock_path_before_open(directory, path)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let name = path.file_name().ok_or(())?;
@@ -3083,18 +3375,76 @@ pub(crate) fn open_pinned_lock_file(directory: &File, path: &Path) -> Result<Fil
             Mode::RUSR | Mode::WUSR,
         )
         .map_err(|_| ())?;
-        Ok(fd.into())
+        let file: File = fd.into();
+        validate_pinned_lock_file(directory, path, &file)?;
+        Ok(file)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = directory;
-        fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(path)
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        validate_pinned_lock_file(directory, path, &file)?;
+        Ok(file)
     }
+}
+
+fn validate_lock_path_before_open(directory: &File, path: &Path) -> Result<(), ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let name = path.file_name().ok_or(())?;
+        match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => Ok(()),
+            Ok(_) => Err(()),
+            Err(Errno::NOENT) => Ok(()),
+            Err(_) => Err(()),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = directory;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => Ok(()),
+            Ok(_) => Err(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(()),
+        }
+    }
+}
+
+pub(crate) fn validate_pinned_lock_file(
+    directory: &File,
+    path: &Path,
+    file: &File,
+) -> Result<(), ()> {
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_file() {
+        return Err(());
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if metadata.nlink() != 1 {
+            return Err(());
+        }
+        let name = path.file_name().ok_or(())?;
+        let entry = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ())?;
+        let device = u64::try_from(i128::from(entry.st_dev)).map_err(|_| ())?;
+        if device != metadata.dev() || entry.st_ino != metadata.ino() {
+            return Err(());
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = directory;
+        if !fs::symlink_metadata(path).map_err(|_| ())?.is_file() {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn pinned_path_exists(directory: &File, path: &Path) -> Result<bool, ()> {
@@ -3338,6 +3688,32 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_lock_rejects_unsafe_or_replaced_entries() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().canonicalize().unwrap();
+        let parent = open_pinned_directory(&path).unwrap();
+        let target = path.join("target");
+        let lock_path = path.join("lock");
+        fs::write(&target, b"lock").unwrap();
+        symlink(&target, &lock_path).unwrap();
+        assert!(open_pinned_lock_file(&parent, &lock_path).is_err());
+
+        fs::remove_file(&lock_path).unwrap();
+        fs::hard_link(&target, &lock_path).unwrap();
+        assert!(open_pinned_lock_file(&parent, &lock_path).is_err());
+
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, b"lock").unwrap();
+        let held = open_pinned_lock_file(&parent, &lock_path).unwrap();
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, b"replacement").unwrap();
+        assert!(validate_pinned_lock_file(&parent, &lock_path, &held).is_err());
     }
 
     #[test]

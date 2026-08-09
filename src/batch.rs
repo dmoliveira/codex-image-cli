@@ -3404,6 +3404,14 @@ impl JobStore {
                 "Another Batch operation is updating this job; retry after it exits.",
             )
         })?;
+        crate::run::validate_pinned_lock_file(&self.parent, &self.lock_path, &lock).map_err(
+            |_| {
+                AppError::preflight(
+                    "job_lock_unavailable",
+                    "The Batch job lock file changed while it was being acquired.",
+                )
+            },
+        )?;
         Ok(lock)
     }
 
