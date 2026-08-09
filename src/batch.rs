@@ -35,8 +35,8 @@ use crate::{
     },
     report::{AppError, BatchContext, BatchReport, BatchRequestCountsReport},
     run::{
-        create_pinned_asset_temp, open_pinned_asset_file, open_pinned_directory,
-        open_pinned_lock_file, pinned_directory_matches, pinned_path_exists,
+        create_pinned_asset_temp, open_or_create_pinned_directory, open_pinned_asset_file,
+        open_pinned_directory, open_pinned_lock_file, pinned_directory_matches, pinned_path_exists,
         rename_pinned_asset_file_with_policy,
     },
     MODEL,
@@ -267,9 +267,143 @@ pub fn submit_manifest(
     submit_prepared(generation, inputs, Some(job_file.to_owned()))
 }
 
+pub fn prepare_manifest(
+    generation: &GenerateArgs,
+    assets: &[ManifestAsset],
+    job_file: &Path,
+) -> Result<(), AppError> {
+    if assets.is_empty() || assets.len() > usize::from(crate::cli::MAX_BATCH_IMAGES) {
+        return Err(AppError::usage(
+            "invalid_batch_shard_size",
+            "A Batch shard must contain between 1 and 8 assets.",
+        ));
+    }
+    let mut generation = generation.clone();
+    generation.n = assets.len() as u8;
+    generation.prompt = Some(assets[0].prompt.clone());
+    generation.prompt_file = None;
+    generation.name = None;
+    generation.prefix = None;
+    generation.validate_batch(&assets[0].prompt)?;
+    for asset in assets {
+        let mut single_generation = generation.clone();
+        single_generation.n = 1;
+        single_generation.validate(&asset.prompt)?;
+    }
+    require_api_provider(&generation)?;
+    let output_names = assets
+        .iter()
+        .map(|asset| asset.output_name(generation.format))
+        .collect::<Vec<_>>();
+    let output_dir = absolute_path(&generation.output_dir)?;
+    let job_id = new_job_id();
+    let job_file = JobStore::resolve(Some(job_file), &job_id)?;
+    let custom_ids = (0..generation.n)
+        .map(|index| format!("{job_id}-{index:02}"))
+        .collect::<Vec<_>>();
+    let input = build_batch_input(
+        &assets
+            .iter()
+            .map(|asset| BatchAssetInput {
+                prompt: asset.prompt.clone(),
+                output_name: asset.output_name(generation.format),
+            })
+            .collect::<Vec<_>>(),
+        &generation,
+        &custom_ids,
+    )?;
+    let expected = BatchJob {
+        schema_version: JOB_SCHEMA_VERSION,
+        revision: 0,
+        job_id,
+        state_path: job_file.to_string_lossy().into_owned(),
+        state: JobState::Prepared,
+        provider: generation.provider,
+        model: MODEL.to_owned(),
+        api_base_url: generation.api_base_url.clone(),
+        output_dir: output_dir.to_string_lossy().into_owned(),
+        output_names,
+        overwrite: generation.overwrite,
+        format: generation.format,
+        image_count: generation.n,
+        quality: generation.quality,
+        size: generation.size.clone(),
+        background: generation.background,
+        compression: generation.compression,
+        moderation: generation.moderation,
+        custom_ids,
+        input_sha256: sha256(&input),
+        input_bytes: input.len() as u64,
+        input_file_id: None,
+        batch_id: None,
+        output_file_id: None,
+        error_file_id: None,
+        remote_status: None,
+        request_counts: None,
+        publishing: None,
+        retained_artifacts: Vec::new(),
+        created_at: now_seconds(),
+        updated_at: now_seconds(),
+    };
+    let store = JobStore::open(&job_file)?;
+    let _lock = store.lock()?;
+    match fs::symlink_metadata(&job_file) {
+        Ok(_) => {
+            let existing = store.load_unlocked()?;
+            let existing_input = build_batch_input(
+                &assets
+                    .iter()
+                    .map(|asset| BatchAssetInput {
+                        prompt: asset.prompt.clone(),
+                        output_name: asset.output_name(generation.format),
+                    })
+                    .collect::<Vec<_>>(),
+                &generation,
+                &existing.custom_ids,
+            )?;
+            let safe_state = match existing.state {
+                JobState::Prepared => prepared_job_matches(&existing, &expected, &job_file),
+                JobState::InputUploaded => {
+                    job_matches_plan(&existing, &expected, &job_file)
+                        && existing.input_file_id.is_some()
+                }
+                _ => false,
+            };
+            if !safe_state
+                || existing.input_bytes != existing_input.len() as u64
+                || existing.input_sha256 != sha256(&existing_input)
+            {
+                return Err(AppError::preflight(
+                    "job_state_not_resumable",
+                    "The existing child Batch job is not a matching safe pre-POST state; inspect it before resuming.",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            store.create_unlocked(&expected)?;
+        }
+        Err(_) => {
+            return Err(AppError::preflight(
+                "job_file_unreadable",
+                "The child Batch job path could not be inspected safely before preparation.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn inspect_job(path: &Path) -> Result<BatchJob, AppError> {
     let path = JobStore::resolve(Some(path), "inspect")?;
     JobStore::load(&path)
+}
+
+pub fn inspect_job_for_reconciliation(path: &Path) -> Result<Option<BatchJob>, AppError> {
+    let path = JobStore::resolve(Some(path), "inspect")?;
+    let store = JobStore::open(&path)?;
+    let Some(_lock) = store.try_lock()? else {
+        return Ok(None);
+    };
+    store.load_unlocked().map(Some)
 }
 
 pub fn input_fingerprint(
@@ -292,6 +426,38 @@ pub fn input_fingerprint(
         .collect::<Vec<_>>();
     let bytes = build_batch_input(&inputs, generation, custom_ids)?;
     Ok((sha256(&bytes), bytes.len() as u64))
+}
+
+fn job_matches_plan(persisted: &BatchJob, expected: &BatchJob, path: &Path) -> bool {
+    persisted.schema_version == expected.schema_version
+        && persisted.state_path == path.to_string_lossy()
+        && persisted.provider == expected.provider
+        && persisted.model == expected.model
+        && persisted.api_base_url == expected.api_base_url
+        && persisted.output_dir == expected.output_dir
+        && persisted.output_names == expected.output_names
+        && persisted.overwrite == expected.overwrite
+        && persisted.format == expected.format
+        && persisted.image_count == expected.image_count
+        && persisted.quality == expected.quality
+        && persisted.size == expected.size
+        && persisted.background == expected.background
+        && persisted.compression == expected.compression
+        && persisted.moderation == expected.moderation
+        && persisted.custom_ids.len() == expected.custom_ids.len()
+}
+
+fn prepared_job_matches(persisted: &BatchJob, expected: &BatchJob, path: &Path) -> bool {
+    job_matches_plan(persisted, expected, path)
+        && persisted.state == JobState::Prepared
+        && persisted.input_file_id.is_none()
+        && persisted.batch_id.is_none()
+        && persisted.output_file_id.is_none()
+        && persisted.error_file_id.is_none()
+        && persisted.remote_status.is_none()
+        && persisted.request_counts.is_none()
+        && persisted.publishing.is_none()
+        && persisted.retained_artifacts.is_empty()
 }
 
 fn submit_prepared(
@@ -317,7 +483,7 @@ fn submit_prepared(
         ..BatchContext::default()
     };
 
-    let job_id = new_job_id();
+    let mut job_id = new_job_id();
     let job_file = JobStore::resolve(job_file_arg.as_deref(), &job_id).map_err(|error| {
         failure(
             error,
@@ -328,7 +494,7 @@ fn submit_prepared(
     let custom_ids = (0..generation.n)
         .map(|index| format!("{job_id}-{index:02}"))
         .collect::<Vec<_>>();
-    let input = build_batch_input(&assets, &generation, &custom_ids).map_err(|error| {
+    let mut input = build_batch_input(&assets, &generation, &custom_ids).map_err(|error| {
         failure(
             error,
             "batch.submit",
@@ -430,18 +596,112 @@ fn submit_prepared(
             )),
         )
     })?;
-    job_store.create_unlocked(&job).map_err(|error| {
-        failure(
-            error,
-            "batch.submit",
-            Some(context_for_job(
-                &base_context,
-                &job.job_id,
-                None,
-                Some(&job_file),
-            )),
-        )
-    })?;
+    match fs::symlink_metadata(&job_file) {
+        Ok(_) => {
+            let existing = job_store.load_unlocked().map_err(|error| {
+                failure(
+                    error,
+                    "batch.submit",
+                    Some(context_for_job(
+                        &base_context,
+                        &job.job_id,
+                        None,
+                        Some(&job_file),
+                    )),
+                )
+            })?;
+            let existing_input = build_batch_input(&assets, &generation, &existing.custom_ids)
+                .map_err(|error| {
+                    failure(
+                        error,
+                        "batch.submit",
+                        Some(context_for_job(
+                            &base_context,
+                            &existing.job_id,
+                            existing.batch_id.as_deref(),
+                            Some(&job_file),
+                        )),
+                    )
+                })?;
+            let input_matches = existing_input.len() as u64 == existing.input_bytes
+                && sha256(&existing_input) == existing.input_sha256;
+            if existing.state == JobState::InputUploaded {
+                if !job_matches_plan(&existing, &job, &job_file)
+                    || existing.input_file_id.is_none()
+                    || !input_matches
+                {
+                    return Err(failure(
+                        AppError::preflight(
+                            "job_state_not_resumable",
+                            "The existing uploaded Batch job does not match the approved shard; inspect it before resuming.",
+                        ),
+                        "batch.submit",
+                        Some(context_for_job(
+                            &base_context,
+                            &existing.job_id,
+                            existing.batch_id.as_deref(),
+                            Some(&job_file),
+                        )),
+                    ));
+                }
+                drop(_job_lock);
+                let resume_args = BatchJobArgs {
+                    job_file: job_file.clone(),
+                    timeout_seconds: generation.timeout_seconds,
+                    dangerously_allow_api_key_to: generation.dangerously_allow_api_key_to.clone(),
+                    allow_insecure_localhost: generation.allow_insecure_localhost,
+                };
+                return create_batch_from_job(&resume_args, &job_file, existing);
+            }
+            if !prepared_job_matches(&existing, &job, &job_file) || !input_matches {
+                return Err(failure(
+                    AppError::preflight(
+                        "job_state_not_resumable",
+                        "The existing Batch job is not a matching pre-POST prepared or confirmed-uploaded state; inspect it before resuming.",
+                    ),
+                    "batch.submit",
+                    Some(context_for_job(
+                        &base_context,
+                        &existing.job_id,
+                        existing.batch_id.as_deref(),
+                        Some(&job_file),
+                    )),
+                ));
+            }
+            input = existing_input;
+            job_id = existing.job_id.clone();
+            job = existing;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            job_store.create_unlocked(&job).map_err(|error| {
+                failure(
+                    error,
+                    "batch.submit",
+                    Some(context_for_job(
+                        &base_context,
+                        &job.job_id,
+                        None,
+                        Some(&job_file),
+                    )),
+                )
+            })?;
+        }
+        Err(_) => {
+            return Err(failure(
+                AppError::preflight(
+                    "job_file_unreadable",
+                    "The existing Batch job path could not be inspected safely before submission.",
+                ),
+                "batch.submit",
+                Some(context_for_job(
+                    &base_context,
+                    &job.job_id,
+                    None,
+                    Some(&job_file),
+                )),
+            ));
+        }
+    }
     let client = ApiClient::new(generation.timeout_seconds).map_err(|error| {
         failure(
             error,
@@ -1741,6 +2001,7 @@ fn recover_publishing(
             stage_name: check.stage_name.clone(),
             expected_stage_id: check.expected_stage_id,
             expected_id: artifact.expected_target,
+            expected_sha256: artifact.sha256.clone(),
         });
     }
     if !recovery_artifacts.is_empty() {
@@ -3415,6 +3676,35 @@ impl JobStore {
         Ok(lock)
     }
 
+    fn try_lock(&self) -> Result<Option<File>, AppError> {
+        self.verify_parent()?;
+        let lock = open_pinned_lock_file(&self.parent, &self.lock_path).map_err(|_| {
+            AppError::preflight(
+                "job_lock_unavailable",
+                "The Batch job lock file could not be opened safely.",
+            )
+        })?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(_) => {
+                return Err(AppError::preflight(
+                    "job_lock_unavailable",
+                    "The Batch job lock file could not be acquired safely.",
+                ));
+            }
+        }
+        crate::run::validate_pinned_lock_file(&self.parent, &self.lock_path, &lock).map_err(
+            |_| {
+                AppError::preflight(
+                    "job_lock_unavailable",
+                    "The Batch job lock file changed while it was being acquired.",
+                )
+            },
+        )?;
+        Ok(Some(lock))
+    }
+
     fn write_atomic(&self, value: &BatchJob, no_clobber: bool) -> Result<(), AppError> {
         self.verify_parent()?;
         validate_job_path(&self.path, value)?;
@@ -3487,23 +3777,14 @@ fn ensure_parent(path: &Path) -> Result<(), AppError> {
             "The Batch job path has no parent directory.",
         )
     })?;
-    fs::create_dir_all(parent).map_err(|_| {
+    let parent = absolute_path(parent)?;
+    validate_no_symlink_components(&parent)?;
+    open_or_create_pinned_directory(&parent).map_err(|_| {
         AppError::preflight(
             "job_directory_unavailable",
-            "The Batch job directory could not be created.",
+            "The Batch job directory could not be created or pinned safely.",
         )
     })?;
-    validate_no_symlink_components(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|_| {
-            AppError::preflight(
-                "job_directory_unavailable",
-                "The Batch job directory permissions could not be restricted.",
-            )
-        })?;
-    }
     Ok(())
 }
 
@@ -3699,6 +3980,26 @@ mod tests {
         };
         job.output_names[0] = "../escape.png".to_owned();
         assert!(validate_job(&job).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_parent_preserves_existing_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::Builder::new()
+            .prefix(".codex-image-batch-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let existing = root.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o750)).unwrap();
+        ensure_parent(&existing.join("job.json")).unwrap();
+        assert_eq!(fs::metadata(&existing).unwrap().mode() & 0o777, 0o750);
+
+        let created = root.path().join("created");
+        ensure_parent(&created.join("job.json")).unwrap();
+        assert_eq!(fs::metadata(&created).unwrap().mode() & 0o777, 0o700);
     }
 
     #[test]

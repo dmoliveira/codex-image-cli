@@ -586,6 +586,50 @@ fn spawn_competing_run_batch_server(
     (format!("http://{address}/v1"), handle)
 }
 
+fn spawn_batch_status_failure_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while requests.len() < 3 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let index = requests.len();
+            let request = read_raw_request(&mut stream);
+            let (status, body) = match (index, request.method.as_str(), request.path.as_str()) {
+                (0, "POST", "/v1/files") => ("200 OK", r#"{"id":"file-input"}"#),
+                (1, "POST", "/v1/batches") => (
+                    "200 OK",
+                    r#"{"id":"batch-observe","status":"validating","input_file_id":"file-input","request_counts":{"completed":0,"failed":0,"total":1}}"#,
+                ),
+                (2, "GET", "/v1/batches/batch-observe") => (
+                    "503 Service Unavailable",
+                    r#"{"error":{"message":"status unavailable"}}"#,
+                ),
+                _ => panic!(
+                    "unexpected status failure request {index}: {} {}",
+                    request.method, request.path
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: status-failure-test\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            requests.push(request);
+        }
+        assert_eq!(requests.len(), 3);
+        requests
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
 fn spawn_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
     spawn_batch_server_with_second_content_status("200 OK")
 }
@@ -3473,6 +3517,90 @@ fn run_batch_limits_remote_submissions_without_waiting() {
     assert_eq!(report["shards"][0]["state"], "pending");
     assert_eq!(report["shards"][1]["state"], "not_started");
     assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn run_batch_blocks_new_submissions_after_status_observation_failure() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(
+        &manifest,
+        "{\"id\":\"one\",\"prompt\":\"first asset\"}\n{\"id\":\"two\",\"prompt\":\"second asset\"}\n",
+    )
+    .unwrap();
+    let (url, server) = spawn_batch_status_failure_server();
+    let common = [
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--output-dir",
+        output_dir.to_str().unwrap(),
+        "--max-assets",
+        "2",
+        "--shard-size",
+        "1",
+        "--max-active-batches",
+        "1",
+        "--api-base-url",
+        &url,
+        "--allow-insecure-localhost",
+    ];
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args(["run", "batch"])
+        .args(common)
+        .args(["--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let digest = serde_json::from_slice::<Value>(&plan.stdout).unwrap()["plan_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let run_file = directory.path().join("batch-observation-run.json");
+    let first = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(["run", "batch"])
+        .args(common)
+        .args([
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(8), "{first:?}");
+    let resumed = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(["run", "batch"])
+        .args(common)
+        .args([
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(9), "{resumed:?}");
+    let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "batch_observation_server_error");
+    let state: Value = serde_json::from_slice(&fs::read(&run_file).unwrap()).unwrap();
+    assert_eq!(state["shards"][0]["state"], "submitted");
+    assert_eq!(state["shards"][1]["state"], "planned");
+    assert!(state["shards"][0]["error"].is_object());
+    let requests = server.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        2
+    );
 }
 
 #[test]

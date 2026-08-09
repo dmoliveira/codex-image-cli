@@ -528,6 +528,7 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
         )
     })?;
     let store = BatchStore::open(run_file)?;
+    let _execution_lock = store.acquire_execution_lock()?;
     let shards = build_batch_shards(&plan, run_file, args.shard_size)?;
     store.initialize(&plan, &shards)?;
     let mut state = store.snapshot()?;
@@ -594,11 +595,13 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
         })
         .count();
     let available_slots = args.max_active_batches.saturating_sub(active_remote);
-    let pending = state
+    let pending_indices = state
         .shards
         .iter()
         .filter(|shard| matches!(shard.state, PersistedShardState::Planned))
-        .count();
+        .map(|shard| shard.index)
+        .collect::<Vec<_>>();
+    let pending = pending_indices.len();
     if pending == 0 || available_slots == 0 {
         return Ok(batch_report_from_state(&plan, &state));
     }
@@ -606,6 +609,7 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
     let stop = Arc::new(AtomicBool::new(false));
     let shared_plan = Arc::new(plan);
     let shared_shards = Arc::new(shards);
+    let shared_pending_indices = Arc::new(pending_indices);
     let shared_store = Arc::new(store.clone());
     let max_active_batches = args.max_active_batches;
     let worker_count = if args.wait {
@@ -619,51 +623,66 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
         let stop = Arc::clone(&stop);
         let plan = Arc::clone(&shared_plan);
         let shards = Arc::clone(&shared_shards);
+        let pending_indices = Arc::clone(&shared_pending_indices);
         let store = Arc::clone(&shared_store);
         let wait = args.wait;
         let max_wait_seconds = args.max_wait_seconds;
         let poll_interval_seconds = args.poll_interval_seconds;
         workers.push(thread::spawn(move || loop {
             if stop.load(Ordering::Acquire) {
-                break;
+                break Ok(());
             }
-            let index = cursor.fetch_add(1, Ordering::AcqRel);
-            if index >= shards.len() {
-                break;
+            let queue_index = cursor.fetch_add(1, Ordering::AcqRel);
+            if queue_index >= pending_indices.len() {
+                break Ok(());
             }
+            let index = pending_indices[queue_index];
             let shard = &shards[index];
+            let assets = &plan.manifest.assets[shard.start..shard.end];
+            let generation = generation_args(&plan, &assets[0]);
+            if let Err(error) = batch::prepare_manifest(&generation, assets, &shard.job_file) {
+                stop.store(true, Ordering::Release);
+                return Err(error);
+            }
             let claim = claim_batch_shard(&store, index, max_active_batches);
             let claim = match claim {
                 Ok(claim) => claim,
-                Err(_) => {
+                Err(error) => {
                     stop.store(true, Ordering::Release);
-                    break;
+                    return Err(error);
                 }
             };
             match claim {
                 BatchClaim::Claimed => {}
                 BatchClaim::Skipped => continue,
-                BatchClaim::CapacityFull => break,
+                BatchClaim::CapacityFull => break Ok(()),
             }
-            let assets = &plan.manifest.assets[shard.start..shard.end];
             let mut hard_stop = false;
-            let generation = generation_args(&plan, &assets[0]);
             match batch::submit_manifest(&generation, assets, &shard.job_file) {
                 Ok(report) => {
-                    if store
-                        .update(|state| {
-                            let persisted = &mut state.shards[index];
-                            persisted.state = PersistedShardState::Submitted;
-                            persisted.batch_id = report.batch_id.clone();
-                            persisted.remote_status = report.remote_status.clone();
-                            persisted.error = None;
-                            Ok(())
-                        })
-                        .is_err()
-                    {
-                        hard_stop = true;
+                    if let Err(error) = store.update(|state| {
+                        let persisted = &mut state.shards[index];
+                        persisted.state = PersistedShardState::Submitted;
+                        persisted.batch_id = report.batch_id.clone();
+                        persisted.remote_status = report.remote_status.clone();
+                        persisted.error = None;
+                        Ok(())
+                    }) {
+                        stop.store(true, Ordering::Release);
+                        return Err(batch_persistence_error_after_dispatch(
+                            error,
+                            report.request.request_id.clone(),
+                            report.http.status,
+                            report
+                                .outputs
+                                .iter()
+                                .chain(report.retained_artifacts.iter())
+                                .chain(report.possibly_modified_paths.iter())
+                                .map(PathBuf::from)
+                                .collect(),
+                        ));
                     } else if wait {
-                        hard_stop = match claim_batch_observation(&store, index) {
+                        let observation = match claim_batch_observation(&store, index) {
                             Ok(true) => observe_batch_shard(
                                 &plan,
                                 shard,
@@ -671,9 +690,16 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
                                 max_wait_seconds,
                                 poll_interval_seconds,
                             )
-                            .map(|outcome| outcome == BatchObservationOutcome::Failed)
-                            .unwrap_or(true),
-                            Ok(false) | Err(_) => true,
+                            .map(|outcome| outcome == BatchObservationOutcome::Failed),
+                            Ok(false) => Ok(true),
+                            Err(error) => Err(error),
+                        };
+                        hard_stop = match observation {
+                            Ok(hard_stop) => hard_stop,
+                            Err(error) => {
+                                stop.store(true, Ordering::Release);
+                                return Err(error);
+                            }
                         };
                     }
                 }
@@ -684,7 +710,7 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
                             | Status::InvalidSuccessResponse
                             | Status::OutputCommitFailed
                     );
-                    let _ = store.update(|state| {
+                    if let Err(update_error) = store.update(|state| {
                         let persisted = &mut state.shards[index];
                         persisted.state = if unknown {
                             PersistedShardState::OutcomeUnknown
@@ -698,7 +724,31 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
                             message: failure.error.message.clone(),
                         });
                         Ok(())
-                    });
+                    }) {
+                        stop.store(true, Ordering::Release);
+                        return Err(batch_persistence_error_after_dispatch(
+                            update_error,
+                            failure
+                                .error
+                                .request_id
+                                .clone()
+                                .or(failure.context.request_id.clone()),
+                            failure.error.http_status.or(failure.context.http_status),
+                            failure
+                                .error
+                                .possibly_modified_paths
+                                .iter()
+                                .cloned()
+                                .chain(
+                                    failure
+                                        .context
+                                        .possibly_modified_paths
+                                        .iter()
+                                        .map(PathBuf::from),
+                                )
+                                .collect(),
+                        ));
+                    }
                     hard_stop = true;
                 }
             }
@@ -706,17 +756,29 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
                 stop.store(true, Ordering::Release);
             }
             if !wait {
-                break;
+                break Ok(());
             }
         }));
     }
+    let mut worker_error = None;
     for worker in workers {
-        if worker.join().is_err() {
-            return Err(AppError::preflight(
-                "run_worker_failed",
-                "A Batch run worker terminated unexpectedly; inspect the durable coordinator state before resuming.",
-            ));
+        match worker.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if worker_error.is_none() {
+                    worker_error = Some(error);
+                }
+            }
+            Err(_) => {
+                return Err(AppError::indeterminate(
+                    "run_worker_failed",
+                    "A Batch run worker terminated unexpectedly after dispatch may have started; inspect durable state and remote Batch activity before retrying.",
+                ));
+            }
         }
+    }
+    if let Some(error) = worker_error {
+        return Err(error);
     }
     let state = store.snapshot()?;
     Ok(batch_report_from_state(&shared_plan, &state))
@@ -1231,10 +1293,34 @@ fn reconcile_submitting_batch_shards(
                 "The Batch run shard index is outside the approved shard plan.",
             )
         })?;
-        let Ok(job) = batch::inspect_job(&shard.job_file) else {
-            continue;
+        let job = match fs::symlink_metadata(&shard.job_file) {
+            Ok(_) => {
+                let Some(job) = batch::inspect_job_for_reconciliation(&shard.job_file)? else {
+                    continue;
+                };
+                job
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AppError::preflight(
+                    "run_state_incomplete",
+                    "A submitting Batch shard has no durable child job; inspect it before resuming rather than risking a duplicate submission.",
+                ));
+            }
+            Err(_) => {
+                return Err(AppError::preflight(
+                    "run_state_unavailable",
+                    "The Batch child job path could not be inspected safely during reconciliation.",
+                ));
+            }
         };
         validate_reconciled_child_job(plan, shard, &job)?;
+        if matches!(
+            job.state,
+            batch::JobState::Prepared | batch::JobState::InputUploaded
+        ) {
+            reset_submitting_batch_shard(store, shard_index)?;
+            continue;
+        }
         let Some((reconciled_state, error)) = reconciled_child_state(&job) else {
             continue;
         };
@@ -1261,6 +1347,24 @@ fn reconcile_submitting_batch_shards(
         })?;
     }
     Ok(())
+}
+
+fn reset_submitting_batch_shard(store: &BatchStore, index: usize) -> Result<(), AppError> {
+    store.update(|state| {
+        let persisted = state.shards.get_mut(index).ok_or_else(|| {
+            AppError::preflight(
+                "run_state_invalid",
+                "The Batch run shard index changed unexpectedly while resetting safe work.",
+            )
+        })?;
+        if matches!(persisted.state, PersistedShardState::Submitting) {
+            persisted.state = PersistedShardState::Planned;
+            persisted.batch_id = None;
+            persisted.remote_status = None;
+            persisted.error = None;
+        }
+        Ok(())
+    })
 }
 
 fn validate_reconciled_child_job(
@@ -1446,6 +1550,7 @@ fn refresh_submitted_batch_status(
 ) -> Result<(), AppError> {
     let state = store.snapshot()?;
     let mut observations = Vec::new();
+    let mut unresolved_error = None;
     for persisted in state
         .shards
         .iter()
@@ -1486,26 +1591,27 @@ fn refresh_submitted_batch_status(
                 });
             }
             Err(failure) => {
-                if failure.context.remote_status.is_some() {
-                    let failed = matches!(
-                        failure.context.remote_status.as_deref(),
-                        Some("failed" | "expired" | "cancelled")
-                    );
-                    observations.push(BatchStatusObservation {
-                        index: shard.index,
-                        batch_id: failure.context.batch_id.clone(),
-                        remote_status: failure.context.remote_status.clone(),
-                        state: if failed {
-                            PersistedShardState::Failed
-                        } else {
-                            PersistedShardState::Submitted
-                        },
-                        error: failed.then(|| RunAssetError {
-                            code: failure.error.code.to_owned(),
-                            message: failure.error.message.clone(),
-                        }),
-                    });
+                let failed = matches!(
+                    failure.context.remote_status.as_deref(),
+                    Some("failed" | "expired" | "cancelled")
+                );
+                if !failed && unresolved_error.is_none() {
+                    unresolved_error = Some((*failure.error).clone());
                 }
+                observations.push(BatchStatusObservation {
+                    index: shard.index,
+                    batch_id: failure.context.batch_id.clone(),
+                    remote_status: failure.context.remote_status.clone(),
+                    state: if failed {
+                        PersistedShardState::Failed
+                    } else {
+                        PersistedShardState::Submitted
+                    },
+                    error: Some(RunAssetError {
+                        code: failure.error.code.to_owned(),
+                        message: failure.error.message.clone(),
+                    }),
+                });
             }
         }
     }
@@ -1530,6 +1636,9 @@ fn refresh_submitted_batch_status(
         }
         Ok(())
     })?;
+    if let Some(error) = unresolved_error {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1662,6 +1771,25 @@ fn persistence_error_after_dispatch(
     }
     error.possibly_modified_paths.sort();
     error.possibly_modified_paths.dedup();
+    error
+}
+
+fn batch_persistence_error_after_dispatch(
+    persistence_error: AppError,
+    request_id: Option<String>,
+    http_status: Option<u16>,
+    possibly_modified_paths: Vec<PathBuf>,
+) -> AppError {
+    let mut error = AppError::indeterminate(
+        persistence_error.code,
+        format!(
+            "A Batch request may have completed, but durable run state could not be recorded: {} Inspect the run state and remote Batch before retrying; do not resubmit automatically.",
+            persistence_error.message
+        ),
+    );
+    error.request_id = request_id;
+    error.http_status = http_status;
+    error.possibly_modified_paths = possibly_modified_paths;
     error
 }
 
@@ -2870,6 +2998,7 @@ struct BatchStore {
     path: PathBuf,
     thread_lock: Arc<Mutex<()>>,
     parent_directory: Arc<Mutex<Option<File>>>,
+    execution_lock_held: Arc<Mutex<bool>>,
 }
 
 impl BatchStore {
@@ -2934,6 +3063,7 @@ impl BatchStore {
             path,
             thread_lock: Arc::new(Mutex::new(())),
             parent_directory: Arc::new(Mutex::new(Some(parent_directory))),
+            execution_lock_held: Arc::new(Mutex::new(false)),
         })
     }
 
@@ -2972,6 +3102,31 @@ impl BatchStore {
             };
             store.write_unlocked(&state)
         })
+    }
+
+    fn acquire_execution_lock(&self) -> Result<File, AppError> {
+        let directory = self.with_parent_directory(|directory| {
+            open_directory_for_lock(directory).map_err(|_| {
+                AppError::preflight(
+                    "run_execution_lock_unavailable",
+                    "The Batch run directory could not be opened safely.",
+                )
+            })
+        })?;
+        directory.lock_exclusive().map_err(|_| {
+            AppError::preflight(
+                "run_execution_lock_unavailable",
+                "The Batch run directory lock could not be acquired safely.",
+            )
+        })?;
+        let mut held = self.execution_lock_held.lock().map_err(|_| {
+            AppError::preflight(
+                "run_execution_lock_unavailable",
+                "The Batch run execution lock could not be retained safely.",
+            )
+        })?;
+        *held = true;
+        Ok(directory)
     }
 
     fn state_file_exists(&self) -> Result<bool, AppError> {
@@ -3060,21 +3215,31 @@ impl BatchStore {
                 "The Batch run state lock could not be acquired safely after a worker failure.",
             )
         })?;
-        let _directory_lock = self.with_parent_directory(|directory| {
-            let directory = open_directory_for_lock(directory).map_err(|_| {
-                AppError::preflight(
-                    "run_lock_unavailable",
-                    "The Batch run directory could not be opened safely.",
-                )
-            })?;
-            directory.lock_exclusive().map_err(|_| {
-                AppError::preflight(
-                    "run_lock_unavailable",
-                    "The Batch run directory lock could not be acquired safely.",
-                )
-            })?;
-            Ok(directory)
+        let execution_lock_held = *self.execution_lock_held.lock().map_err(|_| {
+            AppError::preflight(
+                "run_lock_unavailable",
+                "The Batch run execution lock state could not be acquired safely.",
+            )
         })?;
+        let _directory_lock = if execution_lock_held {
+            None
+        } else {
+            Some(self.with_parent_directory(|directory| {
+                let directory = open_directory_for_lock(directory).map_err(|_| {
+                    AppError::preflight(
+                        "run_lock_unavailable",
+                        "The Batch run directory could not be opened safely.",
+                    )
+                })?;
+                directory.lock_exclusive().map_err(|_| {
+                    AppError::preflight(
+                        "run_lock_unavailable",
+                        "The Batch run directory lock could not be acquired safely.",
+                    )
+                })?;
+                Ok(directory)
+            })?)
+        };
         operation(self)
     }
 
@@ -3321,6 +3486,54 @@ pub(crate) fn open_pinned_directory(path: &Path) -> Result<File, ()> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        File::open(path).map_err(|_| ())
+    }
+}
+
+pub(crate) fn open_or_create_pinned_directory(path: &Path) -> Result<File, ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let root = openat(
+            CWD,
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ())?;
+        let mut current: File = root.into();
+        for component in path.components() {
+            let Component::Normal(name) = component else {
+                if matches!(component, Component::ParentDir) {
+                    return Err(());
+                }
+                continue;
+            };
+            let next = match openat(
+                &current,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(Errno::NOENT) => {
+                    let _ = mkdirat(&current, name, Mode::RUSR | Mode::WUSR | Mode::XUSR);
+                    openat(
+                        &current,
+                        name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(|_| ())?
+                }
+                Err(_) => return Err(()),
+            };
+            current = next.into();
+        }
+        Ok(current)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        fs::create_dir_all(path).map_err(|_| ())?;
         File::open(path).map_err(|_| ())
     }
 }
