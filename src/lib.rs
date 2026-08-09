@@ -80,12 +80,27 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
         args.prefix.as_deref(),
         args.format,
     )?;
-    args.validate(&prompt)?;
+    if args.dry_run {
+        args.validate_dry_run(&prompt)?;
+    } else {
+        args.validate(&prompt)?;
+    }
 
     let planned_outputs = derive_output_paths(&args.output_dir, &file_names);
     provider::validate(args)?;
     let cost_preview = request_cost_preview(args);
+
+    let endpoint = if args.provider == Provider::Api {
+        Some(endpoint::Endpoint::authorize(
+            &args.api_base_url,
+            args.dangerously_allow_api_key_to.as_deref(),
+            args.allow_insecure_localhost,
+        )?)
+    } else {
+        None
+    };
     if args.dry_run {
+        OutputTransaction::validate_plan(&args.output_dir, &file_names, args.overwrite)?;
         return Ok(RunReport::dry_run(
             args.n,
             planned_outputs,
@@ -109,15 +124,6 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
         }
         let client = ApiClient::new(args.timeout_seconds)?;
         Some((key, client))
-    } else {
-        None
-    };
-    let endpoint = if args.provider == Provider::Api {
-        Some(endpoint::Endpoint::authorize(
-            &args.api_base_url,
-            args.dangerously_allow_api_key_to.as_deref(),
-            args.allow_insecure_localhost,
-        )?)
     } else {
         None
     };

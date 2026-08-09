@@ -90,11 +90,14 @@ fn emit_cost(result: Result<CostReport, AppError>, json: bool) -> i32 {
                     report.period.name, report.period.from, report.period.to
                 );
                 println!(
-                    "estimated: {} | requests: {} | images: {}",
-                    report.totals.estimated_usd, report.totals.requests, report.totals.images
+                    "usage-derived estimate ({}): {} | requests: {} | images: {}",
+                    report.totals.estimate_coverage,
+                    report.totals.estimated_usd,
+                    report.totals.requests,
+                    report.totals.images
                 );
                 println!(
-                    "priced: {} | unpriced: {} | pending: {} | unknown: {}",
+                    "priced: {} | unpriced: {} | pending_known: {} | unknown: {}",
                     report.totals.priced_requests,
                     report.totals.unpriced_requests,
                     report.totals.pending_requests,
@@ -157,6 +160,14 @@ fn emit_batch(
             } else if report.ok {
                 if let Some(preview) = &report.cost_preview {
                     emit_cost_preview(preview);
+                }
+                if let Some(counts) = &report.request_counts {
+                    println!(
+                        "batch status: {} | progress: {}/{} completed, {} failed",
+                        report.status, counts.completed, counts.total, counts.failed
+                    );
+                } else {
+                    println!("batch status: {}", report.status);
                 }
                 if let Some(job_file) = report.job_file {
                     println!("job: {job_file}");
@@ -246,7 +257,7 @@ fn emit_error(error: &AppError, image_count: u8, json: bool) {
 fn emit_cost_preview(preview: &CostPreview) {
     match preview.status {
         CostPreviewStatus::Estimated => println!(
-            "estimated output cost: {} {} image(s); input charges excluded",
+            "known output-only estimate: {} {} image(s); total cost unknown, input charges excluded",
             preview
                 .estimated_output_usd
                 .as_deref()
@@ -254,7 +265,7 @@ fn emit_cost_preview(preview: &CostPreview) {
             preview.image_count
         ),
         CostPreviewStatus::Unavailable => println!(
-            "estimated output cost: unavailable ({})",
+            "output-only estimate unavailable ({}); total cost unknown, not $0",
             preview.reason.unwrap_or("pricing_unavailable")
         ),
     }
@@ -263,7 +274,7 @@ fn emit_cost_preview(preview: &CostPreview) {
 fn emit_cost_preview_stderr(preview: &CostPreview) {
     match preview.status {
         CostPreviewStatus::Estimated => eprintln!(
-            "estimated output cost: {} {} image(s); input charges excluded",
+            "known output-only estimate: {} {} image(s); total cost unknown, input charges excluded",
             preview
                 .estimated_output_usd
                 .as_deref()
@@ -271,7 +282,7 @@ fn emit_cost_preview_stderr(preview: &CostPreview) {
             preview.image_count
         ),
         CostPreviewStatus::Unavailable => eprintln!(
-            "estimated output cost: unavailable ({})",
+            "output-only estimate unavailable ({}); total cost unknown, not $0",
             preview.reason.unwrap_or("pricing_unavailable")
         ),
     }
@@ -491,15 +502,15 @@ fn run_ai_help(json: bool) -> i32 {
         capabilities: provider::capabilities(),
         rules: vec![
             "The default provider is the direct Image API and reads OPENAI_API_KEY only from the environment; --provider codex explicitly selects the local subscription path.",
-            "Use --dry-run --json to validate names and parameters without reading a key or using a network.",
-            "Parse cost_preview from dry-run and generation/Batch reports; it is a non-binding output-only estimate and unavailable never means zero.",
+            "Use --dry-run --json to validate parameters, endpoint policy, and output targets without reading a key, writing the ledger, creating files, or using a network.",
+            "Parse cost_preview from dry-run and generation/Batch reports; scope is output_only, total_cost_status is unknown, and unavailable never means zero.",
             "Create --output-dir explicitly; the CLI refuses missing or symlinked output directories.",
             "Use --name only for one image; use --prefix for deterministic multi-image names.",
             "Never retry exit code 5, 6, or 7 automatically because a generation may have been billed.",
             "Use --confirm-high-quality with --quality high after reviewing the approximate cost warning.",
             "Batch commands require --provider api; persist the returned job file and use batch status, retrieve, cancel, or recover.",
             "Use cost --period today|week|month|year|all for local UTC estimates; add --day-by-day and --per-request for detailed views.",
-            "Cost reports never contact the API or read a key; missing usage and custom origins remain unpriced.",
+            "Cost reports never contact the API or read a key; inspect estimate_coverage and disjoint pending/unknown counts before treating a total as complete.",
             "Repeat custom-origin or loopback approval flags on each Batch operation; editable job files never grant credential-destination approval.",
         ],
     };

@@ -28,7 +28,7 @@ use crate::{
     report::AppError,
 };
 
-pub const COST_REPORT_SCHEMA_VERSION: u8 = 1;
+pub const COST_REPORT_SCHEMA_VERSION: u8 = 2;
 pub const COST_PREVIEW_SOURCE: &str =
     "https://developers.openai.com/api/docs/guides/image-generation#calculating-costs";
 const LEDGER_SCHEMA_VERSION: u8 = 1;
@@ -63,6 +63,8 @@ pub enum CostPreviewStatus {
 pub struct CostPreview {
     pub status: CostPreviewStatus,
     pub currency: &'static str,
+    pub scope: &'static str,
+    pub total_cost_status: &'static str,
     pub model: String,
     pub transport: CostTransport,
     pub image_count: u8,
@@ -93,6 +95,8 @@ pub fn preflight_preview(
     let common = || CostPreview {
         status: CostPreviewStatus::Unavailable,
         currency: "USD",
+        scope: "output_only",
+        total_cost_status: "unknown",
         model: model.to_owned(),
         transport,
         image_count,
@@ -1563,6 +1567,7 @@ pub struct CostTotals {
     pub pending_requests: u64,
     pub unknown_requests: u64,
     pub rejected_requests: u64,
+    pub estimate_coverage: &'static str,
     pub estimated_nano_usd: u64,
     pub estimated_usd: String,
 }
@@ -1700,7 +1705,9 @@ fn totals_for(operations: &[CostOperation]) -> CostTotals {
         if operation.outcome == CostOutcome::Unknown {
             totals.unknown_requests += 1;
         }
-        if !operation.finalized || operation.outcome == CostOutcome::Pending {
+        if operation.outcome != CostOutcome::Unknown
+            && (!operation.finalized || operation.outcome == CostOutcome::Pending)
+        {
             totals.pending_requests += 1;
         }
         if operation.finalized {
@@ -1712,6 +1719,14 @@ fn totals_for(operations: &[CostOperation]) -> CostTotals {
             }
         }
     }
+    totals.estimate_coverage = if totals.unpriced_requests > 0
+        || totals.pending_requests > 0
+        || totals.unknown_requests > 0
+    {
+        "partial"
+    } else {
+        "complete"
+    };
     totals.estimated_usd = format_usd(totals.estimated_nano_usd);
     totals
 }
@@ -1924,6 +1939,44 @@ mod tests {
         let (start, end) = period_bounds(CostPeriod::Week, 1_772_841_600);
         assert_eq!(start.format(), "2026-03-02");
         assert_eq!(end.format(), "2026-03-09");
+    }
+
+    #[test]
+    fn cost_totals_report_disjoint_outcomes_and_coverage() {
+        let operation = |outcome, finalized, estimated_nano_usd| CostOperation {
+            operation_id: "test".to_owned(),
+            started_at: 1_700_000_000,
+            transport: CostTransport::Live,
+            model: "gpt-image-2".to_owned(),
+            image_count: 1,
+            quality: "low".to_owned(),
+            size: "1024x1024".to_owned(),
+            output_format: "png".to_owned(),
+            pricing_version: PRICING_VERSION.to_owned(),
+            batch_id: None,
+            custom_id: None,
+            request_id: None,
+            outcome,
+            usage: None,
+            estimated_nano_usd,
+            finalized,
+            started: true,
+        };
+        let totals = totals_for(&[
+            operation(CostOutcome::Succeeded, true, Some(1)),
+            operation(CostOutcome::Failed, true, None),
+            operation(CostOutcome::Unknown, false, None),
+            operation(CostOutcome::Pending, false, None),
+        ]);
+        assert_eq!(totals.requests, 4);
+        assert_eq!(totals.priced_requests, 1);
+        assert_eq!(totals.unpriced_requests, 1);
+        assert_eq!(totals.pending_requests, 1);
+        assert_eq!(totals.unknown_requests, 1);
+        assert_eq!(totals.estimate_coverage, "partial");
+
+        let complete = totals_for(&[operation(CostOutcome::Succeeded, true, Some(1))]);
+        assert_eq!(complete.estimate_coverage, "complete");
     }
 
     #[test]

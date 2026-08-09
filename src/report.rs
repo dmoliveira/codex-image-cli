@@ -5,7 +5,7 @@ use crate::cli::Provider;
 use crate::cost::CostPreview;
 use crate::provider;
 
-pub const SCHEMA_VERSION: u8 = 3;
+pub const SCHEMA_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -344,6 +344,7 @@ pub struct BatchContext {
     pub possibly_modified_paths: Vec<String>,
     pub next_action: Option<String>,
     pub cost_preview: Option<CostPreview>,
+    pub request_counts: Option<BatchRequestCountsInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -368,6 +369,8 @@ pub struct BatchReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_preview: Option<CostPreview>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_counts: Option<BatchRequestCountsInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
@@ -381,6 +384,13 @@ pub struct BatchRequestInfo {
     pub provider: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchRequestCountsInfo {
+    pub completed: u32,
+    pub failed: u32,
+    pub total: u32,
 }
 
 impl BatchContext {
@@ -445,6 +455,7 @@ impl BatchContext {
             retained_artifacts: self.retained_artifacts.clone(),
             possibly_modified_paths,
             cost_preview: self.cost_preview.clone(),
+            request_counts: self.request_counts.clone(),
             next_action: self.next_action.clone(),
             error: error_info,
         }

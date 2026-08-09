@@ -259,11 +259,11 @@ fn spawn_batch_server_with_second_content_status(
             let body = match (index, request.method.as_str(), request.path.as_str()) {
                 (0, "POST", "/v1/files") => r#"{"id":"file-input"}"#.to_owned(),
                 (1, "POST", "/v1/batches") => {
-                    r#"{"id":"batch-test","status":"validating","input_file_id":"file-input"}"#.to_owned()
+                    r#"{"id":"batch-test","status":"validating","input_file_id":"file-input","request_counts":{"completed":0,"failed":0,"total":2}}"#.to_owned()
                 }
                 (2, "GET", "/v1/batches/batch-test")
                 | (3, "GET", "/v1/batches/batch-test") => {
-                    r#"{"id":"batch-test","status":"completed","input_file_id":"file-input","output_file_id":"file-output"}"#.to_owned()
+                    r#"{"id":"batch-test","status":"completed","input_file_id":"file-input","output_file_id":"file-output","request_counts":{"completed":2,"failed":0,"total":2}}"#.to_owned()
                 }
                 (4, "GET", "/v1/files/file-output/content") => custom_ids
                     .iter()
@@ -729,6 +729,7 @@ fn live_api_usage_is_recorded_without_pricing_custom_origins() {
     assert_eq!(report["totals"]["images"], 1);
     assert_eq!(report["totals"]["priced_requests"], 0);
     assert_eq!(report["totals"]["unpriced_requests"], 1);
+    assert_eq!(report["totals"]["estimate_coverage"], "partial");
     assert_eq!(report["requests"][0]["transport"], "live");
     assert_eq!(report["requests"][0]["usage"]["input_tokens"], 10);
     assert!(report["requests"][0]["estimated_usd"].is_null());
@@ -767,6 +768,8 @@ fn dry_run_does_not_connect_or_require_a_key() {
     assert_eq!(report["request"]["attempted"], false);
     assert_eq!(report["cost_preview"]["status"], "unavailable");
     assert_eq!(report["cost_preview"]["reason"], "custom_endpoint_unpriced");
+    assert_eq!(report["cost_preview"]["scope"], "output_only");
+    assert_eq!(report["cost_preview"]["total_cost_status"], "unknown");
     assert!(!directory.path().join("draft.png").exists());
     listener.set_nonblocking(true).unwrap();
     assert!(
@@ -801,6 +804,8 @@ fn canonical_dry_run_includes_non_binding_output_cost_preview() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "dry_run");
     assert_eq!(report["cost_preview"]["status"], "estimated");
+    assert_eq!(report["cost_preview"]["scope"], "output_only");
+    assert_eq!(report["cost_preview"]["total_cost_status"], "unknown");
     assert_eq!(report["cost_preview"]["transport"], "live");
     assert_eq!(report["cost_preview"]["image_count"], 2);
     assert_eq!(
@@ -833,7 +838,118 @@ fn canonical_dry_run_includes_non_binding_output_cost_preview() {
         .output()
         .unwrap();
     assert!(text.status.success(), "{text:?}");
-    assert!(String::from_utf8_lossy(&text.stdout).contains("estimated output cost: $0.006000"));
+    assert!(String::from_utf8_lossy(&text.stdout).contains("known output-only estimate: $0.006000"));
+}
+
+#[test]
+fn dry_run_rejects_invalid_endpoint_and_output_plan_without_a_key() {
+    let directory = safe_tempdir();
+    let invalid_endpoint = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "generate",
+            "--prompt",
+            "invalid endpoint",
+            "--output-dir",
+            directory.path().to_str().unwrap(),
+            "--name",
+            "endpoint",
+            "--api-base-url",
+            "https://api.openai.com/v1?unsafe=1",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(invalid_endpoint.status.code(), Some(2));
+    let endpoint_report: Value = serde_json::from_slice(&invalid_endpoint.stdout).unwrap();
+    assert_eq!(endpoint_report["error"]["code"], "unsafe_api_base_url");
+    assert_eq!(endpoint_report["request"]["attempted"], false);
+
+    fs::write(directory.path().join("taken.png"), b"keep").unwrap();
+    let collision = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "generate",
+            "--prompt",
+            "planned collision",
+            "--output-dir",
+            directory.path().to_str().unwrap(),
+            "--name",
+            "taken",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(collision.status.code(), Some(3));
+    let collision_report: Value = serde_json::from_slice(&collision.stdout).unwrap();
+    assert_eq!(collision_report["error"]["code"], "output_path_exists");
+    assert_eq!(
+        fs::read(directory.path().join("taken.png")).unwrap(),
+        b"keep"
+    );
+}
+
+#[test]
+fn batch_dry_run_rejects_output_collision_without_creating_a_job() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    fs::write(output_dir.join("taken.png"), b"keep").unwrap();
+    let job_file = directory.path().join("batch-job.json");
+    let output = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "batch",
+            "submit",
+            "--prompt",
+            "planned batch collision",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--name",
+            "taken",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "output_path_exists");
+    assert!(!job_file.exists());
+    assert_eq!(fs::read(output_dir.join("taken.png")).unwrap(), b"keep");
+}
+
+#[test]
+fn high_quality_dry_run_shows_preview_without_billable_confirmation() {
+    let directory = safe_tempdir();
+    let output = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "generate",
+            "--prompt",
+            "high quality plan",
+            "--output-dir",
+            directory.path().to_str().unwrap(),
+            "--name",
+            "high",
+            "--size",
+            "1024x1024",
+            "--quality",
+            "high",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "dry_run");
+    assert_eq!(report["cost_preview"]["estimated_output_usd"], "$0.211000");
+    assert!(!directory.path().join("high.png").exists());
 }
 
 #[test]
@@ -1065,7 +1181,7 @@ fn clap_parse_failure_respects_the_json_contract() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
     assert_eq!(report["status"], "usage_error");
     assert_eq!(report["error"]["code"], "cli_parse_error");
     assert_eq!(report["request"]["attempted"], false);
@@ -1576,6 +1692,10 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     let submitted_report: Value = serde_json::from_slice(&submitted.stdout).unwrap();
     assert_eq!(submitted_report["status"], "validating");
     assert_eq!(submitted_report["batch_id"], "batch-test");
+    assert_eq!(submitted_report["http"]["status"], 200);
+    assert_eq!(submitted_report["request"]["request_id"], "batch-test");
+    assert_eq!(submitted_report["request_counts"]["completed"], 0);
+    assert_eq!(submitted_report["request_counts"]["total"], 2);
     let job_body = fs::read_to_string(&job_file).unwrap();
     assert!(!job_body.contains("batch fox"));
 
@@ -1594,6 +1714,8 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     assert!(status.status.success(), "{status:?}");
     let status_report: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status_report["status"], "completed");
+    assert_eq!(status_report["request_counts"]["completed"], 2);
+    assert_eq!(status_report["request_counts"]["failed"], 0);
 
     let retrieved = command()
         .env("OPENAI_API_KEY", "test-key")
@@ -1610,6 +1732,7 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     assert!(retrieved.status.success(), "{retrieved:?}");
     let retrieved_report: Value = serde_json::from_slice(&retrieved.stdout).unwrap();
     assert_eq!(retrieved_report["status"], "retrieved");
+    assert_eq!(retrieved_report["request_counts"]["completed"], 2);
     assert!(output_dir.join("fox-01.png").exists());
     assert!(output_dir.join("fox-02.png").exists());
     assert_eq!(

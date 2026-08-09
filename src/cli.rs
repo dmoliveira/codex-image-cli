@@ -454,14 +454,27 @@ impl GenerateArgs {
     }
 
     pub fn validate(&self, prompt: &str) -> Result<(), AppError> {
-        self.validate_with_limit(prompt, 4)
+        self.validate_with_limit(prompt, 4, true)
+    }
+
+    pub fn validate_dry_run(&self, prompt: &str) -> Result<(), AppError> {
+        self.validate_with_limit(prompt, 4, false)
     }
 
     pub fn validate_batch(&self, prompt: &str) -> Result<(), AppError> {
-        self.validate_with_limit(prompt, MAX_BATCH_IMAGES)
+        self.validate_with_limit(prompt, MAX_BATCH_IMAGES, true)
     }
 
-    fn validate_with_limit(&self, prompt: &str, image_limit: u8) -> Result<(), AppError> {
+    pub fn validate_batch_dry_run(&self, prompt: &str) -> Result<(), AppError> {
+        self.validate_with_limit(prompt, MAX_BATCH_IMAGES, false)
+    }
+
+    fn validate_with_limit(
+        &self,
+        prompt: &str,
+        image_limit: u8,
+        require_high_quality_confirmation: bool,
+    ) -> Result<(), AppError> {
         if prompt.trim().is_empty() {
             return Err(AppError::usage(
                 "empty_prompt",
@@ -514,7 +527,10 @@ impl GenerateArgs {
                 "gpt-image-2 does not currently support transparent backgrounds. Use --background auto or opaque.",
             ));
         }
-        if self.quality == Quality::High && !self.confirm_high_quality {
+        if require_high_quality_confirmation
+            && self.quality == Quality::High
+            && !self.confirm_high_quality
+        {
             return Err(AppError::usage(
                 "high_quality_confirmation_required",
                 high_quality_confirmation_message(self.provider),
@@ -527,10 +543,31 @@ impl GenerateArgs {
 fn high_quality_confirmation_message(provider: Provider) -> String {
     let provider_note = match provider {
         Provider::Api => {
-            "For a typical 1024x1024 image, the current approximate API estimate is about $0.277 on Standard or $0.138 through Batch."
+            let live = crate::cost::preflight_preview(
+                crate::cost::CostTransport::Live,
+                "gpt-image-2",
+                1,
+                "high",
+                "1024x1024",
+                true,
+            );
+            let batch = crate::cost::preflight_preview(
+                crate::cost::CostTransport::Batch,
+                "gpt-image-2",
+                1,
+                "high",
+                "1024x1024",
+                true,
+            );
+            format!(
+                "For a typical 1024x1024 image, the known output-only estimate is about {} on Standard or {} through Batch; total cost is unknown because input charges are excluded.",
+                live.estimated_output_usd.as_deref().unwrap_or("unavailable"),
+                batch.estimated_output_usd.as_deref().unwrap_or("unavailable")
+            )
         }
         Provider::Codex => {
             "Codex subscription usage and limits are account-dependent; the CLI cannot verify a dollar estimate locally."
+                .to_owned()
         }
     };
     format!(
@@ -668,7 +705,7 @@ mod tests {
     #[test]
     fn high_quality_requires_explicit_confirmation() {
         let error = high_quality_confirmation_message(Provider::Api);
-        assert!(error.contains("$0.277"));
+        assert!(error.contains("$0.211000"));
         assert!(error.contains("--confirm-high-quality"));
     }
 }

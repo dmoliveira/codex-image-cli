@@ -33,7 +33,7 @@ use crate::{
         OutputIdentity, OutputTransaction, OutputVerificationArtifact, RecoveryArtifact,
         RecoveryVerificationArtifact, RetainedVerificationArtifact,
     },
-    report::{AppError, BatchContext, BatchReport},
+    report::{AppError, BatchContext, BatchReport, BatchRequestCountsInfo},
     MODEL,
 };
 
@@ -379,9 +379,15 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     let prompt = generation
         .read_prompt()
         .map_err(|error| failure(error, "batch.submit", None))?;
-    generation
-        .validate_batch(&prompt)
-        .map_err(|error| failure(error, "batch.submit", None))?;
+    if generation.dry_run {
+        generation
+            .validate_batch_dry_run(&prompt)
+            .map_err(|error| failure(error, "batch.submit", None))?;
+    } else {
+        generation
+            .validate_batch(&prompt)
+            .map_err(|error| failure(error, "batch.submit", None))?;
+    }
     require_api_provider(&generation).map_err(|error| failure(error, "batch.submit", None))?;
 
     let output_names = derive_file_names(
@@ -412,6 +418,10 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         &generation.size,
         endpoint.is_canonical_openai(),
     ));
+    if generation.dry_run {
+        OutputTransaction::validate_plan(&output_dir, &output_names, generation.overwrite)
+            .map_err(|error| failure(error, "batch.submit", Some(base_context.clone())))?;
+    }
 
     let job_id = new_job_id();
     let job_file = JobStore::resolve(args.job_file.as_deref(), &job_id).map_err(|error| {
@@ -719,6 +729,14 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     report_context.remote_status = job.remote_status.clone();
     report_context.output_file_id = job.output_file_id.clone();
     report_context.error_file_id = job.error_file_id.clone();
+    report_context.request_counts =
+        job.request_counts
+            .as_ref()
+            .map(|counts| BatchRequestCountsInfo {
+                completed: counts.completed,
+                failed: counts.failed,
+                total: counts.total,
+            });
     report_context.http_status = Some(created.status);
     report_context.request_id = created.request_id.clone();
     if let Err(error) = record_batch_created(
@@ -2533,6 +2551,15 @@ fn set_context_from_info(context: &mut BatchContext, info: &BatchInfo) {
     context.remote_status = Some(info.status.clone());
     context.output_file_id = info.output_file_id.clone();
     context.error_file_id = info.error_file_id.clone();
+    context.request_counts = info.request_counts.as_ref().map(request_counts_info);
+}
+
+fn request_counts_info(counts: &BatchRequestCounts) -> BatchRequestCountsInfo {
+    BatchRequestCountsInfo {
+        completed: counts.completed,
+        failed: counts.failed,
+        total: counts.total,
+    }
 }
 
 fn is_terminal_remote_status(status: &str) -> bool {
@@ -2661,6 +2688,14 @@ fn context_from_job(operation: &'static str, path: &Path, job: &BatchJob) -> Bat
         image_count: job.image_count,
         attempted: false,
         retained_artifacts: job.retained_artifacts.clone(),
+        request_counts: job
+            .request_counts
+            .as_ref()
+            .map(|counts| BatchRequestCountsInfo {
+                completed: counts.completed,
+                failed: counts.failed,
+                total: counts.total,
+            }),
         cost_preview: Some(cost::preflight_preview(
             CostTransport::Batch,
             &job.model,

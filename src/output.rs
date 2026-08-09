@@ -3,6 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+use std::fs;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{cli::OutputFormat, report::AppError};
@@ -271,6 +274,33 @@ mod secure {
     }
 
     impl OutputTransaction {
+        pub fn validate_plan(
+            output_dir: &Path,
+            file_names: &[String],
+            overwrite: bool,
+        ) -> Result<(), AppError> {
+            let unique: HashSet<_> = file_names.iter().collect();
+            if unique.len() != file_names.len() {
+                return Err(AppError::preflight(
+                    "duplicate_output_path",
+                    "The requested output names are not unique; no image request was sent.",
+                ));
+            }
+            let directory = PinnedDirectory::open(output_dir)?;
+            let transaction = Self {
+                directory,
+                entries: Vec::new(),
+                overwrite,
+                recovering: false,
+                transaction_id: String::new(),
+                finalized: false,
+            };
+            for final_name in file_names {
+                transaction.inspect_reservation(final_name)?;
+            }
+            Ok(())
+        }
+
         pub fn reserve(
             output_dir: &Path,
             file_names: Vec<String>,
@@ -1964,6 +1994,83 @@ pub struct CommitResult {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl OutputTransaction {
+    pub fn validate_plan(
+        output_dir: &Path,
+        file_names: &[String],
+        overwrite: bool,
+    ) -> Result<(), AppError> {
+        let metadata = fs::symlink_metadata(output_dir).map_err(|_| {
+            AppError::preflight(
+                "unsafe_output_directory",
+                "--output-dir must be an existing directory with no symlinked path components.",
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AppError::preflight(
+                "unsafe_output_directory",
+                "--output-dir must be an existing directory with no symlinked path components.",
+            ));
+        }
+        let mut current = PathBuf::new();
+        for component in output_dir.components() {
+            current.push(component.as_os_str());
+            let component_metadata = fs::symlink_metadata(&current).map_err(|_| {
+                AppError::preflight(
+                    "unsafe_output_directory",
+                    "--output-dir must be an existing directory with no symlinked path components.",
+                )
+            })?;
+            if component_metadata.file_type().is_symlink() {
+                return Err(AppError::preflight(
+                    "unsafe_output_directory",
+                    "--output-dir must be an existing directory with no symlinked path components.",
+                ));
+            }
+        }
+        let unique: HashSet<_> = file_names.iter().collect();
+        if unique.len() != file_names.len() {
+            return Err(AppError::preflight(
+                "duplicate_output_path",
+                "The requested output names are not unique; no image request was sent.",
+            ));
+        }
+        for name in file_names {
+            if name.components().count() != 1
+                || !matches!(
+                    name.components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                return Err(AppError::preflight(
+                    "unsafe_output_name",
+                    "Output names must be single regular filenames.",
+                ));
+            }
+            let target = output_dir.join(name);
+            let target_metadata = match fs::symlink_metadata(&target) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(AppError::preflight(
+                    "output_target_unavailable",
+                    "An output target could not be inspected safely; no image request was sent.",
+                )),
+            };
+            if target_metadata.file_type().is_symlink() || !target_metadata.is_file() {
+                return Err(AppError::preflight(
+                    "non_regular_output_target",
+                    "Output targets must be regular files when they already exist.",
+                ));
+            }
+            if !overwrite {
+                return Err(AppError::preflight(
+                    "output_path_exists",
+                    "An output path already exists. Choose another --name/--prefix or pass --overwrite deliberately.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn reserve(
         _output_dir: &Path,
         _file_names: Vec<String>,
