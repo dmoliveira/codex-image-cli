@@ -9,9 +9,11 @@ pub mod batch;
 pub mod cli;
 pub mod endpoint;
 pub mod image;
+pub mod manifest;
 pub mod output;
 pub mod provider;
 pub mod report;
+pub mod run;
 
 use std::{
     env, fs,

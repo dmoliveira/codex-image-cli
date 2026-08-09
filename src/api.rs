@@ -14,6 +14,7 @@ use crate::{cli::GenerateArgs, endpoint::Endpoint, report::AppError, MODEL};
 /// Bound the full JSON response before parsing it. This protects callers from
 /// a compatible endpoint returning an unexpectedly large body.
 pub const MAX_RESPONSE_BYTES: usize = 180 * 1024 * 1024;
+const MAX_SINGLE_IMAGE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 
 pub fn validate_api_key(api_key: &str) -> Result<(), AppError> {
@@ -198,9 +199,14 @@ impl ApiClient {
             .with_http(status.as_u16(), request_id));
         }
 
+        let max_response = if request.n == 1 {
+            MAX_SINGLE_IMAGE_RESPONSE_BYTES
+        } else {
+            MAX_RESPONSE_BYTES
+        };
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+            .is_some_and(|length| length > max_response as u64)
         {
             return Err(AppError::invalid_response(
                 "response_too_large",
@@ -209,14 +215,14 @@ impl ApiClient {
             .with_http(status.as_u16(), request_id));
         }
 
-        let body = read_bounded(response, MAX_RESPONSE_BYTES).map_err(|_| {
+        let body = read_bounded(response, max_response).map_err(|_| {
             AppError::indeterminate(
                 "response_read_outcome_unknown",
                 "The image POST may have been processed, but the successful response could not be read completely. Billing and generation outcome are unknown; do not retry automatically.",
             )
             .with_http(status.as_u16(), request_id.clone())
         })?;
-        if body.len() > MAX_RESPONSE_BYTES {
+        if body.len() > max_response {
             return Err(AppError::invalid_response(
                 "response_too_large",
                 "The successful response exceeded the local safety limit. The image request may have been billed; do not retry automatically.",

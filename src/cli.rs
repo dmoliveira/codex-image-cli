@@ -38,6 +38,11 @@ pub enum Command {
         #[command(subcommand)]
         command: BatchCommand,
     },
+    /// Execute a bounded, plan-approved manifest of image assets.
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
     /// Check local configuration without sending a request or spending credits.
     Doctor,
     /// Print the non-interactive contract that AI agents can consume.
@@ -56,6 +61,184 @@ pub enum BatchCommand {
     Cancel(BatchCancelArgs),
     /// Resume a safe local state or attach a manually reconciled remote ID.
     Recover(Box<BatchRecoverArgs>),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RunCommand {
+    /// Validate a manifest and print its plan digest without reading a key or using a network.
+    Plan(RunPlanArgs),
+    /// Execute manifest assets as bounded direct Image API requests.
+    Direct(RunDirectArgs),
+    /// Execute manifest assets as bounded durable Batch shards.
+    Batch(RunBatchArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunCommonArgs {
+    /// Existing UTF-8 JSONL manifest containing one `{id,prompt,name}` asset per line.
+    #[arg(long, value_name = "FILE")]
+    pub manifest: PathBuf,
+
+    /// Existing, non-symlink directory where assets will be written.
+    #[arg(long, value_name = "DIR")]
+    pub output_dir: PathBuf,
+
+    /// Maximum number of manifest assets accepted for this run.
+    #[arg(long, default_value_t = 1_000, value_name = "COUNT")]
+    pub max_assets: usize,
+
+    /// Output container format for every manifest asset.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Png)]
+    pub format: OutputFormat,
+
+    /// `1024x1024` by default, or `auto`/WIDTHxHEIGHT within GPT Image 2 limits.
+    #[arg(long, default_value = "1024x1024", value_name = "SIZE")]
+    pub size: String,
+
+    /// Render quality for every manifest asset.
+    #[arg(long, value_enum, default_value_t = Quality::Low)]
+    pub quality: Quality,
+
+    /// Confirm the approximate cost and increased usage of high-quality generation.
+    #[arg(long)]
+    pub confirm_high_quality: bool,
+
+    /// Background behavior for every manifest asset.
+    #[arg(long, value_enum, default_value_t = Background::Auto)]
+    pub background: Background,
+
+    /// Compression percentage for JPEG/WebP only.
+    #[arg(long, value_name = "PERCENT")]
+    pub compression: Option<u8>,
+
+    /// GPT Image moderation strictness.
+    #[arg(long, value_enum, default_value_t = Moderation::Auto)]
+    pub moderation: Moderation,
+
+    /// Permit replacing regular output files.
+    #[arg(long)]
+    pub overwrite: bool,
+
+    /// Total timeout for one API operation, in seconds (1-300).
+    #[arg(long, default_value_t = 180, value_name = "SECONDS")]
+    pub timeout_seconds: u64,
+
+    /// API base URL. Custom origins require explicit key-destination approval.
+    #[arg(long, default_value = "https://api.openai.com/v1", value_name = "URL")]
+    pub api_base_url: String,
+
+    /// Explicitly approve sending OPENAI_API_KEY to this exact custom HTTPS origin.
+    #[arg(long, value_name = "ORIGIN")]
+    pub dangerously_allow_api_key_to: Option<String>,
+
+    /// Permit loopback-only HTTP for local tests.
+    #[arg(long)]
+    pub allow_insecure_localhost: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunPlanArgs {
+    #[command(flatten)]
+    pub common: RunCommonArgs,
+
+    /// Execution mode to bind into the plan digest.
+    #[arg(long, value_enum, default_value_t = RunMode::Direct)]
+    pub mode: RunMode,
+
+    /// Direct worker count or Batch shard size to bind into the plan digest.
+    #[arg(long, default_value_t = 1, value_name = "COUNT")]
+    pub parallelism: usize,
+
+    /// Maximum active Batch child jobs to bind into a Batch plan.
+    #[arg(long, default_value_t = 1, value_name = "COUNT")]
+    pub max_active_batches: usize,
+
+    /// Read-only polling/retrieval behavior for `run batch`; not included in the plan digest.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Maximum Batch polling duration for `run batch`, in seconds; not included in the plan digest.
+    #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+    pub max_wait_seconds: u64,
+
+    /// Batch polling interval for `run batch`, in seconds; not included in the plan digest.
+    #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+    pub poll_interval_seconds: u64,
+
+    /// Continue scheduling after definitive direct failures.
+    #[arg(long)]
+    pub continue_on_error: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunDirectArgs {
+    #[command(flatten)]
+    pub common: RunCommonArgs,
+
+    /// Exact plan digest printed by `run plan` or a prior dry run.
+    #[arg(long, value_name = "SHA256")]
+    pub approve_plan: Option<String>,
+
+    /// Durable run state. Required for a billable non-dry run.
+    #[arg(long, value_name = "FILE")]
+    pub run_file: Option<PathBuf>,
+
+    /// Maximum number of direct generation POSTs in flight (1-4).
+    #[arg(long, default_value_t = 1, value_name = "COUNT")]
+    pub max_concurrency: usize,
+
+    /// Continue scheduling after definitive failures; ambiguous outcomes always stop the run.
+    #[arg(long)]
+    pub continue_on_error: bool,
+
+    /// Validate the plan without reading a key, reserving files, or using a network.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunBatchArgs {
+    #[command(flatten)]
+    pub common: RunCommonArgs,
+
+    /// Exact plan digest printed by `run plan` or a prior dry run.
+    #[arg(long, value_name = "SHA256")]
+    pub approve_plan: Option<String>,
+
+    /// Durable coordinator state. Required for a billable non-dry run.
+    #[arg(long, value_name = "FILE")]
+    pub run_file: Option<PathBuf>,
+
+    /// Maximum assets per child Batch job (1-8 with the current bounded lifecycle).
+    #[arg(long, default_value_t = 8, value_name = "COUNT")]
+    pub shard_size: usize,
+
+    /// Maximum child Batch submissions/retrievals in flight (1-4).
+    #[arg(long, default_value_t = 1, value_name = "COUNT")]
+    pub max_active_batches: usize,
+
+    /// Poll and retrieve each child Batch to completion.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Maximum polling duration per child Batch, in seconds (1-86400).
+    #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+    pub max_wait_seconds: u64,
+
+    /// Delay between child Batch status reads while waiting (1-3600 seconds).
+    #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+    pub poll_interval_seconds: u64,
+
+    /// Validate the plan without reading a key, creating a job, or using a network.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunMode {
+    Direct,
+    Batch,
 }
 
 #[derive(Debug, Args)]

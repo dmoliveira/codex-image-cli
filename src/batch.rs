@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
     path::{Component, Path, PathBuf},
     thread,
@@ -11,6 +11,9 @@ use std::{
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use crate::{
     api::{
@@ -23,6 +26,7 @@ use crate::{
     },
     endpoint::{validate_remote_id, Endpoint},
     image::decode_base64_image,
+    manifest::ManifestAsset,
     output::{
         derive_file_names, derive_output_paths, inspect_recovery_plan, read_regular_file,
         read_regular_file_with_identity, verify_and_sync_plan, verify_regular_file_identity,
@@ -63,6 +67,7 @@ pub struct BatchJob {
     pub schema_version: u8,
     pub revision: u64,
     pub job_id: String,
+    pub state_path: String,
     pub state: JobState,
     pub provider: Provider,
     pub model: String,
@@ -75,6 +80,8 @@ pub struct BatchJob {
     pub quality: crate::cli::Quality,
     pub size: String,
     pub background: crate::cli::Background,
+    #[serde(default)]
+    pub compression: Option<u8>,
     pub moderation: crate::cli::Moderation,
     pub custom_ids: Vec<String>,
     pub input_sha256: String,
@@ -144,6 +151,12 @@ pub struct BatchFailure {
     pub context: Box<BatchContext>,
 }
 
+#[derive(Debug, Clone)]
+struct BatchAssetInput {
+    prompt: String,
+    output_name: String,
+}
+
 impl BatchFailure {
     fn new(error: AppError, context: BatchContext) -> Self {
         Self {
@@ -197,6 +210,94 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         generation.format,
     )
     .map_err(|error| failure(error, "batch.submit", None))?;
+    let assets = output_names
+        .into_iter()
+        .map(|output_name| BatchAssetInput {
+            prompt: prompt.clone(),
+            output_name,
+        })
+        .collect();
+    submit_prepared(generation, assets, args.job_file.clone())
+}
+
+pub fn submit_manifest(
+    generation: &GenerateArgs,
+    assets: &[ManifestAsset],
+    job_file: &Path,
+) -> Result<BatchReport, BatchFailure> {
+    if assets.is_empty() || assets.len() > usize::from(crate::cli::MAX_BATCH_IMAGES) {
+        return Err(failure(
+            AppError::usage(
+                "invalid_batch_shard_size",
+                "A Batch shard must contain between 1 and 8 assets.",
+            ),
+            "batch.submit",
+            None,
+        ));
+    }
+    let mut generation = generation.clone();
+    generation.n = assets.len() as u8;
+    generation.prompt = Some(assets[0].prompt.clone());
+    generation.prompt_file = None;
+    generation.name = None;
+    generation.prefix = None;
+    generation
+        .validate_batch(&assets[0].prompt)
+        .map_err(|error| failure(error, "batch.submit", None))?;
+    for asset in assets {
+        let mut single_generation = generation.clone();
+        single_generation.n = 1;
+        single_generation
+            .validate(&asset.prompt)
+            .map_err(|error| failure(error, "batch.submit", None))?;
+    }
+    require_api_provider(&generation).map_err(|error| failure(error, "batch.submit", None))?;
+    let inputs = assets
+        .iter()
+        .map(|asset| BatchAssetInput {
+            prompt: asset.prompt.clone(),
+            output_name: asset.output_name(generation.format),
+        })
+        .collect();
+    submit_prepared(generation, inputs, Some(job_file.to_owned()))
+}
+
+pub fn inspect_job(path: &Path) -> Result<BatchJob, AppError> {
+    let path = JobStore::resolve(Some(path), "inspect")?;
+    JobStore::load(&path)
+}
+
+pub fn input_fingerprint(
+    generation: &GenerateArgs,
+    assets: &[ManifestAsset],
+    custom_ids: &[String],
+) -> Result<(String, u64), AppError> {
+    if assets.len() != custom_ids.len() {
+        return Err(AppError::preflight(
+            "run_state_invalid",
+            "The child Batch custom-ID count does not match the approved shard.",
+        ));
+    }
+    let inputs = assets
+        .iter()
+        .map(|asset| BatchAssetInput {
+            prompt: asset.prompt.clone(),
+            output_name: asset.output_name(generation.format),
+        })
+        .collect::<Vec<_>>();
+    let bytes = build_batch_input(&inputs, generation, custom_ids)?;
+    Ok((sha256(&bytes), bytes.len() as u64))
+}
+
+fn submit_prepared(
+    generation: GenerateArgs,
+    assets: Vec<BatchAssetInput>,
+    job_file_arg: Option<PathBuf>,
+) -> Result<BatchReport, BatchFailure> {
+    let output_names = assets
+        .iter()
+        .map(|asset| asset.output_name.clone())
+        .collect::<Vec<_>>();
     let output_dir = absolute_path(&generation.output_dir)
         .map_err(|error| failure(error, "batch.submit", None))?;
     let endpoint = Endpoint::authorize(
@@ -212,7 +313,7 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     };
 
     let job_id = new_job_id();
-    let job_file = JobStore::resolve(args.job_file.as_deref(), &job_id).map_err(|error| {
+    let job_file = JobStore::resolve(job_file_arg.as_deref(), &job_id).map_err(|error| {
         failure(
             error,
             "batch.submit",
@@ -222,7 +323,7 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     let custom_ids = (0..generation.n)
         .map(|index| format!("{job_id}-{index:02}"))
         .collect::<Vec<_>>();
-    let input = build_batch_input(&prompt, &generation, &custom_ids).map_err(|error| {
+    let input = build_batch_input(&assets, &generation, &custom_ids).map_err(|error| {
         failure(
             error,
             "batch.submit",
@@ -238,6 +339,7 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         schema_version: JOB_SCHEMA_VERSION,
         revision: 0,
         job_id: job_id.clone(),
+        state_path: job_file.to_string_lossy().into_owned(),
         state: JobState::Prepared,
         provider: generation.provider,
         model: MODEL.to_owned(),
@@ -250,6 +352,7 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         quality: generation.quality,
         size: generation.size.clone(),
         background: generation.background,
+        compression: generation.compression,
         moderation: generation.moderation,
         custom_ids,
         input_sha256: sha256(&input),
@@ -272,6 +375,19 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         report_context.next_action = Some("remove --dry-run to submit the batch".to_owned());
         return Ok(dry_run_report(report_context));
     }
+
+    ensure_billable_platform().map_err(|error| {
+        failure(
+            error,
+            "batch.submit",
+            Some(context_for_job(
+                &base_context,
+                &job.job_id,
+                None,
+                Some(&job_file),
+            )),
+        )
+    })?;
 
     let api_key = api_key().map_err(|error| {
         failure(
@@ -728,6 +844,7 @@ fn create_batch_from_job(
     mut job: BatchJob,
 ) -> Result<BatchReport, BatchFailure> {
     let mut context = context_from_job("batch.recover", job_file, &job);
+    ensure_billable_platform().map_err(|error| BatchFailure::new(error, context.clone()))?;
     let input_file_id = job.input_file_id.clone().ok_or_else(|| {
         BatchFailure::new(
             AppError::preflight(
@@ -1888,17 +2005,17 @@ fn batch_result_failure(code: &'static str, message: &'static str, job: &BatchJo
 }
 
 fn build_batch_input(
-    prompt: &str,
+    assets: &[BatchAssetInput],
     args: &GenerateArgs,
     custom_ids: &[String],
 ) -> Result<Vec<u8>, AppError> {
     let mut input = Vec::new();
-    for custom_id in custom_ids {
+    for (asset, custom_id) in assets.iter().zip(custom_ids) {
         let request = serde_json::json!({
             "custom_id": custom_id,
             "method": "POST",
             "url": "/v1/images/generations",
-            "body": ImageGenerationRequest::from_args_with_count(prompt, args, 1),
+            "body": ImageGenerationRequest::from_args_with_count(&asset.prompt, args, 1),
         });
         serde_json::to_writer(&mut input, &request).map_err(|_| {
             AppError::preflight(
@@ -1962,6 +2079,20 @@ fn api_key() -> Result<String, AppError> {
     })?;
     crate::api::validate_api_key(&value)?;
     Ok(value)
+}
+
+pub fn ensure_billable_platform() -> Result<(), AppError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err(AppError::preflight(
+            "secure_output_transactions_unsupported",
+            "Billable Batch submission is supported only on macOS and Linux. Use --dry-run or a read-only reconciliation command on this platform; no request was sent.",
+        ))
+    }
 }
 
 fn parse_batch_info(
@@ -2465,6 +2596,25 @@ fn absolute_path(path: &Path) -> Result<PathBuf, AppError> {
     }
 }
 
+fn normalize_job_path(path: &Path) -> Result<PathBuf, AppError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir => {
+                return Err(AppError::preflight(
+                    "job_path_invalid",
+                    "The Batch job path must not contain '..'.",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 fn new_job_id() -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -2492,6 +2642,36 @@ fn sha256(bytes: &[u8]) -> String {
 
 struct JobStore;
 
+fn validate_job_link(path: &Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    if fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.is_file() && metadata.nlink() != 1)
+    {
+        return Err(AppError::preflight(
+            "job_file_hard_linked",
+            "The Batch job file must have exactly one filesystem link; use the original path rather than an alias.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_job_path(path: &Path, job: &BatchJob) -> Result<(), AppError> {
+    let expected = path.to_str().ok_or_else(|| {
+        AppError::preflight(
+            "job_path_invalid",
+            "The Batch job path must be valid UTF-8.",
+        )
+    })?;
+    if job.state_path != expected {
+        return Err(AppError::preflight(
+            "job_file_alias",
+            "The Batch job belongs to a different job-file path; use the original path.",
+        ));
+    }
+    validate_job_link(path)
+}
+
 fn validate_job(job: &BatchJob) -> Result<(), AppError> {
     if job.revision == u64::MAX {
         return Err(invalid_job("The Batch job revision is exhausted."));
@@ -2502,6 +2682,14 @@ fn validate_job(job: &BatchJob) -> Result<(), AppError> {
     {
         return Err(invalid_job(
             "The Batch job provider, model, or image count is invalid.",
+        ));
+    }
+    if job
+        .compression
+        .is_some_and(|compression| compression > 100 || job.format == OutputFormat::Png)
+    {
+        return Err(invalid_job(
+            "The Batch job compression is invalid for its output format.",
         ));
     }
     if !Path::new(&job.output_dir).is_absolute()
@@ -2819,6 +3007,14 @@ impl JobStore {
             Some(path) => absolute_path(path)?,
             None => default_job_directory()?.join(format!("{job_id}.json")),
         };
+        let path = absolute_path(&path)?;
+        let path = normalize_job_path(&path)?;
+        if path.to_str().is_none() {
+            return Err(AppError::preflight(
+                "job_path_invalid",
+                "The Batch job path must be valid UTF-8.",
+            ));
+        }
         validate_no_symlink_components(&path)?;
         Ok(path)
     }
@@ -2833,10 +3029,17 @@ impl JobStore {
                 "The requested job file already exists; refusing to replace an existing Batch record.",
             ));
         }
+        validate_job_path(path, job)?;
         write_atomic(path, job, true)
     }
 
     fn load(path: &Path) -> Result<BatchJob, AppError> {
+        let _lock = Self::lock(path)?;
+        Self::load_unlocked(path)
+    }
+
+    fn load_unlocked(path: &Path) -> Result<BatchJob, AppError> {
+        validate_job_link(path)?;
         let bytes = read_regular_file(path, MAX_JOB_FILE_BYTES).map_err(|error| {
             AppError::preflight(
                 if error.code == "publishing_output_too_large" {
@@ -2859,6 +3062,7 @@ impl JobStore {
                 "The Batch job record uses an unsupported schema version.",
             ));
         }
+        validate_job_path(path, &job)?;
         validate_job(&job)?;
         Ok(job)
     }
@@ -2879,7 +3083,7 @@ impl JobStore {
         F: FnOnce(&mut BatchJob) -> Result<(), AppError>,
     {
         let _lock = Self::lock(path)?;
-        let mut job = Self::load(path)?;
+        let mut job = Self::load_unlocked(path)?;
         if expected_revision.is_some_and(|expected| expected != job.revision) {
             return Err(AppError::preflight(
                 "job_changed_concurrently",
@@ -2901,28 +3105,19 @@ impl JobStore {
 
     fn lock(path: &Path) -> Result<File, AppError> {
         ensure_parent(path)?;
-        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-        if fs::symlink_metadata(&lock_path)
-            .ok()
-            .is_some_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(AppError::preflight(
-                "job_lock_unsafe",
-                "The Batch job lock path is a symlink; refusing to use it.",
-            ));
-        }
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)
-            .map_err(|_| {
-                AppError::preflight(
-                    "job_lock_unavailable",
-                    "The Batch job could not be locked safely.",
-                )
-            })?;
+        let parent = path.parent().ok_or_else(|| {
+            AppError::preflight(
+                "job_lock_unavailable",
+                "The Batch job directory could not be resolved for locking.",
+            )
+        })?;
+        validate_no_symlink_components(parent)?;
+        let lock = File::open(parent).map_err(|_| {
+            AppError::preflight(
+                "job_lock_unavailable",
+                "Another Batch operation is updating this job; retry after it exits.",
+            )
+        })?;
         lock.lock_exclusive().map_err(|_| {
             AppError::preflight(
                 "job_lock_unavailable",
@@ -2997,6 +3192,7 @@ fn validate_no_symlink_components(path: &Path) -> Result<(), AppError> {
 }
 
 fn write_atomic(path: &Path, value: &BatchJob, no_clobber: bool) -> Result<(), AppError> {
+    validate_job_path(path, value)?;
     let parent = path.parent().ok_or_else(|| {
         AppError::preflight(
             "job_path_invalid",
@@ -3112,6 +3308,7 @@ mod tests {
             schema_version: JOB_SCHEMA_VERSION,
             revision: 0,
             job_id: "job-test".to_owned(),
+            state_path: "/tmp/job-test.json".to_owned(),
             state: JobState::Prepared,
             provider: Provider::Api,
             model: MODEL.to_owned(),
@@ -3124,6 +3321,7 @@ mod tests {
             quality: crate::cli::Quality::Low,
             size: "auto".to_owned(),
             background: crate::cli::Background::Auto,
+            compression: None,
             moderation: crate::cli::Moderation::Auto,
             custom_ids: vec!["job-test-00".to_owned()],
             input_sha256: "0".repeat(64),
@@ -3200,6 +3398,7 @@ mod tests {
             schema_version: JOB_SCHEMA_VERSION,
             revision: 0,
             job_id: "job-test".to_owned(),
+            state_path: "/tmp/job-test.json".to_owned(),
             state: JobState::Prepared,
             provider: Provider::Api,
             model: MODEL.to_owned(),
@@ -3212,6 +3411,7 @@ mod tests {
             quality: crate::cli::Quality::Low,
             size: "auto".to_owned(),
             background: crate::cli::Background::Auto,
+            compression: None,
             moderation: crate::cli::Moderation::Auto,
             custom_ids: vec!["job-test-00".to_owned()],
             input_sha256: "0".repeat(64),

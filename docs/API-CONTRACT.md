@@ -42,6 +42,8 @@ Failure reports add:
 
 Batch reports add `operation`, job/remote IDs, `remote_status`, `request_counts`, `next_action`, and the same `outputs`, `retained_artifacts`, and `possibly_modified_paths` fields. `batch submit` uploads bounded JSONL input and creates a 24-hour Batch job with output retention configured for 30 days. A newly created Batch may validly report `status: "validating"` with zero request counts while the service parses the input; the client preserves that state and validates counts again once processing begins. `batch status` performs one read and exposes the latest completed/failed/total counts, `batch retrieve` can poll with `--wait` and a bounded `--max-wait-seconds`, `batch cancel` sends one cancellation request, and `batch recover` resumes only a confirmed-safe local state or attaches a manually reconciled remote ID after a read-only verification. Batch is API-only, locally limited to 8 image requests, and its job record never stores the prompt, API key, or image bytes. Remote POST outcomes are never automatically retried. Custom HTTPS and loopback endpoint approvals must be repeated explicitly on each operation; editable job records never grant credential-destination approval.
 
+Manifest run reports use `schema_version: 1` and `operation` values `run.plan`, `run.direct`, or `run.batch`. They expose `plan_digest`, aggregate asset counts, secret-free per-asset direct outcomes or per-shard Batch outcomes, and `next_action`. `run direct` requires `--run-file` and exact `--approve-plan` for billable execution; it marks each asset `dispatch_in_flight` before its one generation POST. `run batch` persists all shard/job paths before any upload/create POST. `outcome_unknown` and `dispatch_in_flight` entries are never automatically retried. `run direct` exits 5 for unknown outcomes, 10 for definitive failures/stopped work, and 0 only when every asset succeeds; `run batch` exits 8 while child Batches remain pending.
+
 ```json
 {
   "schema_version": 2,
@@ -104,6 +106,12 @@ The CLI sends one documented Image API `POST /v1/images/generations` request wit
 | `moderation` | `auto`, `low` |
 
 Responses must contain exactly `n` `data[].b64_json` values. The CLI limits a decoded image to 32 MiB and verifies the requested container signature (PNG, JPEG, or WebP) before writing.
+
+## Manifest input
+
+`run plan`, `run direct`, and `run batch` accept bounded UTF-8 JSONL manifests. A record is `{ "id": "safe-id", "prompt": "...", "name": "optional-safe-stem" }`; `name` defaults to `id`. The current local limits are 50,000 assets, 64 MiB per manifest, and 32,000 Unicode scalar values per prompt. IDs and names are unique and ASCII-safe. Blank lines are ignored; unknown fields and malformed records are rejected before key reads or network requests.
+
+Run output directories must already exist as regular non-symlink directories, contain no symlinked path components, and have valid UTF-8 paths.
 
 ## Provider/credential policy
 

@@ -69,6 +69,32 @@ codex-image batch retrieve \
   --json
 ```
 
+For large asset sets, use a bounded manifest run. Plan first, then pass the exact returned digest to the billable command:
+
+```bash
+codex-image run plan \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --mode batch \
+  --parallelism 8 \
+  --max-active-batches 1 \
+  --wait \
+  --max-wait-seconds 300 \
+  --poll-interval-seconds 10 \
+  --json
+
+codex-image run batch \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --run-file artifacts/design/run.json \
+  --approve-plan <plan-sha256> \
+  --shard-size 8 \
+  --wait \
+  --json
+```
+
+The manifest is bounded and contains only `id`, `prompt`, and optional safe `name` fields. Run state stores IDs, paths, shard/job state, and the plan digest, never prompts or credentials. Use `run direct` for bounded parallel synchronous work; its default concurrency is one and it never retries a generation POST.
+
 ## Contract for tool authors
 
 - **No interaction:** do not use `stdin`; `--prompt-file -` is deliberately rejected to prevent blocking.
@@ -84,5 +110,6 @@ codex-image batch retrieve \
 - **No silent partial success:** every returned image must decode and match the requested PNG/JPEG/WebP container before publishing. Multi-file publishing cannot be atomically visible as a set, so an error reports possibly modified/retained paths instead of claiming success or deleting a concurrent replacement.
 - **Provider choice:** the default selects API billing through `OPENAI_API_KEY`; `--provider codex` explicitly selects the authenticated Codex CLI subscription.
 - **Quality gate:** `low` is the default; `--quality high` requires `--confirm-high-quality` after reviewing the cost warning.
+- **Large runs:** plan and approve a manifest digest; never edit a manifest or run file after approval, and never resubmit assets marked in-flight or outcome-unknown.
 
 See [API contract](API-CONTRACT.md) for schemas and exit-code semantics.

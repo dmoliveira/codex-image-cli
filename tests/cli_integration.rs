@@ -1,18 +1,27 @@
 use std::{
+    ffi::OsString,
     fs,
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     path::Path,
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier, Mutex,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 
 use serde_json::Value;
 
 const PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLxOQAAAABJRU5ErkJggg==";
 
+#[derive(Debug)]
 struct RecordedRequest {
     path_is_correct: bool,
     authorization_was_present: bool,
@@ -46,6 +55,214 @@ fn spawn_server_with_request_id(
     (format!("http://{address}/v1"), handle)
 }
 
+fn spawn_parallel_image_server(
+    expected_requests: usize,
+) -> (String, JoinHandle<(Vec<RecordedRequest>, usize)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(expected_requests));
+    let handle = thread::spawn({
+        let requests = Arc::clone(&requests);
+        let active = Arc::clone(&active);
+        let max_active = Arc::clone(&max_active);
+        let barrier = Arc::clone(&barrier);
+        move || {
+            let mut workers = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while workers.len() < expected_requests && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let requests = Arc::clone(&requests);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                let barrier = Arc::clone(&barrier);
+                workers.push(thread::spawn(move || {
+                    let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    max_active.fetch_max(now, Ordering::AcqRel);
+                    let request = read_request(&mut stream);
+                    barrier.wait();
+                    let body = format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: run-direct-test\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                    requests.lock().unwrap().push(request);
+                    active.fetch_sub(1, Ordering::AcqRel);
+                }));
+            }
+            assert_eq!(workers.len(), expected_requests);
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+            (requests, max_active.load(Ordering::Acquire))
+        }
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+fn spawn_direct_overlap_server() -> (String, JoinHandle<(Vec<RecordedRequest>, usize)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let handle = thread::spawn({
+        let requests = Arc::clone(&requests);
+        let active = Arc::clone(&active);
+        let max_active = Arc::clone(&max_active);
+        move || {
+            let mut workers = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while workers.len() < 2 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let requests = Arc::clone(&requests);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                workers.push(thread::spawn(move || {
+                    let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    max_active.fetch_max(now, Ordering::AcqRel);
+                    let request = read_request(&mut stream);
+                    thread::sleep(Duration::from_millis(250));
+                    let body = format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: direct-overlap-test\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                    requests.lock().unwrap().push(request);
+                    active.fetch_sub(1, Ordering::AcqRel);
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+            (requests, max_active.load(Ordering::Acquire))
+        }
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+fn spawn_batch_run_server(expected_assets: usize) -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let mut custom_ids = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while requests.len() < 4 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let index = requests.len();
+            let request = read_raw_request(&mut stream);
+            if index == 0 {
+                custom_ids = custom_ids_from_multipart(&request.body);
+            }
+            let body = match (index, request.method.as_str(), request.path.as_str()) {
+                (0, "POST", "/v1/files") => r#"{"id":"file-input"}"#.to_owned(),
+                (1, "POST", "/v1/batches") => r#"{"id":"batch-run","status":"validating","input_file_id":"file-input","request_counts":{"completed":0,"failed":0,"total":0}}"#.to_owned(),
+                (2, "GET", "/v1/batches/batch-run") => serde_json::json!({
+                    "id": "batch-run",
+                    "status": "completed",
+                    "input_file_id": "file-input",
+                    "output_file_id": "file-output",
+                    "request_counts": {"completed": expected_assets, "failed": 0, "total": expected_assets}
+                })
+                .to_string(),
+                (3, "GET", "/v1/files/file-output/content") => custom_ids
+                    .iter()
+                    .map(|custom_id| {
+                        serde_json::json!({
+                            "custom_id": custom_id,
+                            "response": {
+                                "status_code": 200,
+                                "body": {"data": [{"b64_json": PNG_BASE64}]}
+                            }
+                        })
+                        .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => panic!("unexpected run Batch request {index}: {} {}", request.method, request.path),
+            };
+            let content_type = if index == 3 {
+                "application/jsonl"
+            } else {
+                "application/json"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: run-batch-test\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            requests.push(request);
+        }
+        assert_eq!(requests.len(), 4);
+        requests
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+fn spawn_batch_submission_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while requests.len() < 3 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let index = requests.len();
+            let request = read_raw_request(&mut stream);
+            let body = match (index, request.method.as_str(), request.path.as_str()) {
+                (0, "POST", "/v1/files") => r#"{"id":"file-input"}"#,
+                (1, "POST", "/v1/batches") => {
+                    r#"{"id":"batch-cap","status":"validating","input_file_id":"file-input","request_counts":{"completed":0,"failed":0,"total":0}}"#
+                }
+                _ => panic!(
+                    "unexpected submission request {index}: {} {}",
+                    request.method, request.path
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: batch-cap-test\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            requests.push(request);
+        }
+        assert_eq!(requests.len(), 2);
+        requests
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
 fn spawn_disconnect_server() -> (String, JoinHandle<RecordedRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -54,6 +271,52 @@ fn spawn_disconnect_server() -> (String, JoinHandle<RecordedRequest>) {
         let request = read_request(&mut stream);
         let _ = stream.shutdown(Shutdown::Both);
         request
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+fn spawn_direct_resume_failure_server() -> (String, JoinHandle<Vec<RecordedRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while requests.len() < 3 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let request = read_request(&mut stream);
+            let is_first = request.request_json["prompt"] == "first asset";
+            let is_failed = request.request_json["prompt"] == "failed asset";
+            let (status, body) = if is_first {
+                (
+                    "200 OK",
+                    format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#),
+                )
+            } else if is_failed {
+                (
+                    "400 Bad Request",
+                    r#"{"error":{"message":"definitive test failure"}}"#.to_owned(),
+                )
+            } else {
+                (
+                    "200 OK",
+                    format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#),
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: direct-resume-test\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            requests.push(request);
+        }
+        assert_eq!(requests.len(), 3);
+        requests
     });
     (format!("http://{address}/v1"), handle)
 }
@@ -218,6 +481,79 @@ fn spawn_fixed_response_server(
         stream.write_all(response.as_bytes()).unwrap();
         stream.flush().unwrap();
         request
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+fn spawn_batch_create_overlap_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while requests.len() < 2 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let request = read_raw_request(&mut stream);
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/v1/batches");
+            let body = r#"{"id":"batch-race","status":"validating","input_file_id":"file-input","request_counts":{"completed":0,"failed":0,"total":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: batch-race-test\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            requests.push(request);
+        }
+        requests
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+fn spawn_competing_run_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while requests.len() < 3 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let index = requests.len();
+            let request = read_raw_request(&mut stream);
+            let (body, content_type) = match (index, request.method.as_str(), request.path.as_str()) {
+                (0, "POST", "/v1/files") => (r#"{"id":"file-input"}"#.to_owned(), "application/json"),
+                (1, "POST", "/v1/batches") => (
+                    r#"{"id":"batch-competing","status":"validating","input_file_id":"file-input","request_counts":{"completed":0,"failed":0,"total":1}}"#.to_owned(),
+                    "application/json",
+                ),
+                (2, "GET", "/v1/batches/batch-competing") => (
+                    r#"{"id":"batch-competing","status":"in_progress","input_file_id":"file-input","request_counts":{"completed":0,"failed":0,"total":1}}"#.to_owned(),
+                    "application/json",
+                ),
+                _ => panic!(
+                    "unexpected competing run Batch request {index}: {} {}",
+                    request.method, request.path
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Request-ID: competing-run-batch-test\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            requests.push(request);
+        }
+        requests
     });
     (format!("http://{address}/v1"), handle)
 }
@@ -1796,6 +2132,7 @@ fn batch_recover_resumes_only_the_confirmed_input_uploaded_state() {
         "schema_version": 7,
         "revision": 0,
         "job_id": "job-recover",
+        "state_path": job_file.to_str().unwrap(),
         "state": "input_uploaded",
         "provider": "api",
         "model": "gpt-image-2",
@@ -1903,6 +2240,7 @@ fn batch_recover_malformed_observations_keep_response_metadata() {
             "schema_version": 7,
             "revision": 0,
             "job_id": "job-recover-malformed",
+            "state_path": job_file.to_str().unwrap(),
             "state": state,
             "provider": "api",
             "model": "gpt-image-2",
@@ -1955,4 +2293,1313 @@ fn batch_recover_malformed_observations_keep_response_metadata() {
         let saved: Value = serde_json::from_slice(&fs::read(&job_file).unwrap()).unwrap();
         assert_eq!(saved["state"], expected_state);
     }
+}
+
+#[test]
+fn batch_recover_rejects_hard_linked_job_alias_before_create() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let job_file = directory.path().join("recover-race-job.json");
+    let alias = directory.path().join("recover-race-alias.json");
+    let (url, server) = spawn_batch_create_overlap_server();
+    let job = serde_json::json!({
+        "schema_version": 7,
+        "revision": 0,
+        "job_id": "job-recover-race",
+        "state_path": job_file.to_str().unwrap(),
+        "state": "input_uploaded",
+        "provider": "api",
+        "model": "gpt-image-2",
+        "api_base_url": url,
+        "output_dir": output_dir,
+        "output_names": ["fox.png"],
+        "overwrite": false,
+        "format": "png",
+        "image_count": 1,
+        "quality": "low",
+        "size": "auto",
+        "background": "auto",
+        "moderation": "auto",
+        "custom_ids": ["job-recover-race-00"],
+        "input_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "input_bytes": 1,
+        "input_file_id": "file-input",
+        "batch_id": null,
+        "output_file_id": null,
+        "error_file_id": null,
+        "remote_status": null,
+        "request_counts": null,
+        "publishing": null,
+        "retained_artifacts": [],
+        "created_at": 0,
+        "updated_at": 0
+    });
+    fs::write(&job_file, serde_json::to_vec_pretty(&job).unwrap()).unwrap();
+    fs::hard_link(&job_file, &alias).unwrap();
+
+    let args_for = |path: &Path| {
+        vec![
+            "batch".to_owned(),
+            "recover".to_owned(),
+            "--job-file".to_owned(),
+            path.to_str().unwrap().to_owned(),
+            "--allow-insecure-localhost".to_owned(),
+            "--json".to_owned(),
+        ]
+    };
+    let alias_args = args_for(&alias);
+    let alias_output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(&alias_args)
+        .output()
+        .unwrap();
+    assert_eq!(alias_output.status.code(), Some(3), "{alias_output:?}");
+    let alias_report: Value = serde_json::from_slice(&alias_output.stdout).unwrap();
+    assert_eq!(alias_report["error"]["code"], "job_file_hard_linked");
+    fs::remove_file(&alias).unwrap();
+
+    let original_output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(args_for(&job_file))
+        .output()
+        .unwrap();
+    assert!(original_output.status.success(), "{original_output:?}");
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn run_direct_requires_plan_approval_and_bounds_parallel_requests() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(
+        &manifest,
+        "{\"id\":\"one\",\"prompt\":\"first asset\"}\n{\"id\":\"two\",\"prompt\":\"second asset\"}\n",
+    )
+    .unwrap();
+    let (url, server) = spawn_parallel_image_server(2);
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "2",
+            "--max-assets",
+            "2",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert_eq!(plan_report["status"], "dry_run");
+    assert_eq!(plan_report["total_assets"], 2);
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    assert_eq!(digest.len(), 64);
+    assert!(!String::from_utf8_lossy(&plan.stdout).contains("first asset"));
+
+    let run_file = directory.path().join("run.json");
+    let output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-concurrency",
+            "2",
+            "--max-assets",
+            "2",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "success");
+    assert_eq!(report["succeeded_assets"], 2);
+    assert_eq!(report["assets"][0]["state"], "succeeded");
+    assert_eq!(report["assets"][1]["state"], "succeeded");
+    assert!(output_dir.join("one.png").exists());
+    assert!(output_dir.join("two.png").exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("first asset"));
+    assert!(!String::from_utf8_lossy(&fs::read(&run_file).unwrap()).contains("first asset"));
+    let (requests, max_active) = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        max_active >= 2,
+        "the requested parallelism was not exercised: max_active={max_active}"
+    );
+    assert!(requests
+        .iter()
+        .all(|request| request.request_json["quality"] == "low"));
+}
+
+#[test]
+fn run_direct_serializes_competing_coordinators_for_one_run_file() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(
+        &manifest,
+        "{\"id\":\"one\",\"prompt\":\"first asset\"}\n{\"id\":\"two\",\"prompt\":\"second asset\"}\n",
+    )
+    .unwrap();
+    let (url, server) = spawn_direct_overlap_server();
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "1",
+            "--max-assets",
+            "2",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    let run_file = directory.path().join("run.json");
+    let args = vec![
+        "run".to_owned(),
+        "direct".to_owned(),
+        "--manifest".to_owned(),
+        manifest.to_str().unwrap().to_owned(),
+        "--output-dir".to_owned(),
+        output_dir.to_str().unwrap().to_owned(),
+        "--run-file".to_owned(),
+        run_file.to_str().unwrap().to_owned(),
+        "--approve-plan".to_owned(),
+        digest,
+        "--max-concurrency".to_owned(),
+        "1".to_owned(),
+        "--max-assets".to_owned(),
+        "2".to_owned(),
+        "--api-base-url".to_owned(),
+        url.clone(),
+        "--allow-insecure-localhost".to_owned(),
+        "--json".to_owned(),
+    ];
+    let first = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(&args)
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    let second = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(&args)
+        .spawn()
+        .unwrap();
+    let first_output = first.wait_with_output().unwrap();
+    let second_output = second.wait_with_output().unwrap();
+    assert!(first_output.status.success(), "{first_output:?}");
+    assert!(second_output.status.success(), "{second_output:?}");
+    let first_report: Value = serde_json::from_slice(&first_output.stdout).unwrap();
+    let second_report: Value = serde_json::from_slice(&second_output.stdout).unwrap();
+    assert_eq!(first_report["status"], "success");
+    assert_eq!(second_report["status"], "success");
+    assert!(output_dir.join("one.png").exists());
+    assert!(output_dir.join("two.png").exists());
+    let (requests, max_active) = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        max_active, 1,
+        "competing coordinators exceeded the run limit"
+    );
+}
+
+#[test]
+fn run_direct_rejects_hard_linked_run_file_alias_before_network() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
+    let (url, server) = spawn_server(
+        "200 OK",
+        format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#),
+    );
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    let run_file = directory.path().join("run.json");
+    let output = output_dir.join("one.png");
+    fs::write(&output, b"collision").unwrap();
+    let initial = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(initial.status.code(), Some(3), "{initial:?}");
+    let initial_report: Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(initial_report["error"]["code"], "output_collision");
+    fs::remove_file(output).unwrap();
+
+    let alias = directory.path().join("run-alias.json");
+    fs::hard_link(&run_file, &alias).unwrap();
+    let alias_output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            alias.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(alias_output.status.code(), Some(3), "{alias_output:?}");
+    let alias_report: Value = serde_json::from_slice(&alias_output.stdout).unwrap();
+    assert_eq!(alias_report["error"]["code"], "run_file_hard_linked");
+    fs::remove_file(alias).unwrap();
+
+    let original_output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(original_output.status.success(), "{original_output:?}");
+    let request = server.join().unwrap();
+    assert!(request.path_is_correct);
+}
+
+#[test]
+fn run_direct_rejects_a_stale_single_link_alias_before_network() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
+    let (url, server) = spawn_server(
+        "200 OK",
+        format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#),
+    );
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    let run_file = directory.path().join("run.json");
+    let output = output_dir.join("one.png");
+    fs::write(&output, b"collision").unwrap();
+    let initial = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(initial.status.code(), Some(3), "{initial:?}");
+    fs::remove_file(output).unwrap();
+
+    let alias = directory.path().join("stale-run-alias.json");
+    fs::hard_link(&run_file, &alias).unwrap();
+    fs::remove_file(&run_file).unwrap();
+    let alias_output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            alias.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(alias_output.status.code(), Some(3), "{alias_output:?}");
+    let alias_report: Value = serde_json::from_slice(&alias_output.stdout).unwrap();
+    assert_eq!(alias_report["error"]["code"], "run_file_alias");
+
+    fs::rename(&alias, &run_file).unwrap();
+    let original = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(original.status.success(), "{original:?}");
+    assert!(server.join().unwrap().path_is_correct);
+}
+
+#[test]
+fn run_direct_does_not_retry_an_unknown_post_on_resume() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(
+        &manifest,
+        "{\"id\":\"one\",\"prompt\":\"uncertain asset\"}\n",
+    )
+    .unwrap();
+    let (url, server) = spawn_disconnect_server();
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--max-assets",
+            "1",
+            "--max-concurrency",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap();
+    let run_file = directory.path().join("run.json");
+    let first = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            digest,
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(5), "{first:?}");
+    assert!(server.join().unwrap().path_is_correct);
+
+    let resumed = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            digest,
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(5), "{resumed:?}");
+    let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["status"], "outcome_unknown");
+    assert_eq!(report["assets"][0]["state"], "outcome_unknown");
+}
+
+#[test]
+fn run_direct_resume_skips_completed_prefix_and_dispatches_planned_suffix() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(
+        &manifest,
+        "{\"id\":\"one\",\"prompt\":\"first asset\"}\n{\"id\":\"two\",\"prompt\":\"failed asset\"}\n{\"id\":\"three\",\"prompt\":\"third asset\"}\n",
+    )
+    .unwrap();
+    let (url, first_server) = spawn_direct_resume_failure_server();
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "1",
+            "--max-assets",
+            "3",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    let run_file = directory.path().join("run.json");
+    let first = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-concurrency",
+            "1",
+            "--max-assets",
+            "3",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(10), "{first:?}");
+    let first_report: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_report["status"], "partial_success");
+    assert_eq!(first_report["assets"][0]["state"], "succeeded");
+    assert_eq!(first_report["assets"][1]["state"], "failed");
+    assert_eq!(first_report["assets"][2]["state"], "not_started");
+    let resumed = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-concurrency",
+            "1",
+            "--max-assets",
+            "3",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(10), "{resumed:?}");
+    let resumed_report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(resumed_report["assets"][0]["state"], "succeeded");
+    assert_eq!(resumed_report["assets"][1]["state"], "failed");
+    assert_eq!(resumed_report["assets"][2]["state"], "succeeded");
+    assert!(output_dir.join("three.png").exists());
+    let requests = first_server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].request_json["prompt"], "third asset");
+}
+
+#[test]
+fn run_direct_rejects_a_mutated_manifest_before_network() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"original\"}\n").unwrap();
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--max-assets",
+            "1",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap();
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"mutated\"}\n").unwrap();
+    let output = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            directory.path().join("run.json").to_str().unwrap(),
+            "--approve-plan",
+            digest,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "plan_digest_mismatch");
+}
+
+#[test]
+fn run_batch_shards_manifest_and_resume_without_duplicate_post() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(
+        &manifest,
+        "{\"id\":\"one\",\"prompt\":\"batch asset one\"}\n{\"id\":\"two\",\"prompt\":\"batch asset two\"}\n{\"id\":\"three\",\"prompt\":\"batch asset three\"}\n{\"id\":\"four\",\"prompt\":\"batch asset four\"}\n{\"id\":\"five\",\"prompt\":\"batch asset five\"}\n{\"id\":\"six\",\"prompt\":\"batch asset six\"}\n{\"id\":\"seven\",\"prompt\":\"batch asset seven\"}\n{\"id\":\"eight\",\"prompt\":\"batch asset eight\"}\n",
+    )
+    .unwrap();
+    let (url, server) = spawn_batch_run_server(8);
+    let common = [
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--output-dir",
+        output_dir.to_str().unwrap(),
+        "--max-assets",
+        "8",
+        "--shard-size",
+        "8",
+        "--max-active-batches",
+        "1",
+        "--wait",
+        "--max-wait-seconds",
+        "30",
+        "--poll-interval-seconds",
+        "1",
+        "--api-base-url",
+        &url,
+        "--allow-insecure-localhost",
+    ];
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args(["run", "batch"])
+        .args(common)
+        .args(["--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    let run_file = directory.path().join("batch-run.json");
+    let output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(["run", "batch"])
+        .args(common)
+        .args([
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "success");
+    assert_eq!(report["succeeded_assets"], 8);
+    assert_eq!(report["shards"][0]["state"], "succeeded");
+    for name in [
+        "one", "two", "three", "four", "five", "six", "seven", "eight",
+    ] {
+        assert!(output_dir.join(format!("{name}.png")).exists());
+    }
+    assert!(!String::from_utf8_lossy(&fs::read(&run_file).unwrap()).contains("batch asset"));
+
+    let resumed = command()
+        .env_remove("OPENAI_API_KEY")
+        .args(["run", "batch"])
+        .args(common)
+        .args([
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(resumed.status.success(), "{resumed:?}");
+    let resumed_report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(resumed_report["status"], "success");
+    assert_eq!(server.join().unwrap().len(), 4);
+}
+
+#[test]
+fn run_batch_limits_remote_submissions_without_waiting() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    let records = (1..=10)
+        .map(|index| format!("{{\"id\":\"asset-{index:02}\",\"prompt\":\"asset {index}\"}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&manifest, format!("{records}\n")).unwrap();
+    let (url, server) = spawn_batch_submission_server();
+    let common = [
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--output-dir",
+        output_dir.to_str().unwrap(),
+        "--max-assets",
+        "10",
+        "--shard-size",
+        "5",
+        "--max-active-batches",
+        "1",
+        "--api-base-url",
+        &url,
+        "--allow-insecure-localhost",
+    ];
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args(["run", "batch"])
+        .args(common)
+        .args(["--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    let run_file = directory.path().join("batch-cap-run.json");
+    let output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(["run", "batch"])
+        .args(common)
+        .args([
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(8), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "pending");
+    assert_eq!(report["pending_assets"], 5);
+    assert_eq!(report["not_started_assets"], 5);
+    assert_eq!(report["shards"][0]["state"], "pending");
+    assert_eq!(report["shards"][1]["state"], "not_started");
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn run_batch_serializes_competing_coordinators_without_duplicate_submission() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(
+        &manifest,
+        "{\"id\":\"one\",\"prompt\":\"first asset\"}\n{\"id\":\"two\",\"prompt\":\"second asset\"}\n",
+    )
+    .unwrap();
+    let (url, server) = spawn_competing_run_batch_server();
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "batch",
+            "--parallelism",
+            "1",
+            "--max-active-batches",
+            "1",
+            "--max-assets",
+            "2",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    let run_file = directory.path().join("batch-run.json");
+    let args = vec![
+        "run".to_owned(),
+        "batch".to_owned(),
+        "--manifest".to_owned(),
+        manifest.to_str().unwrap().to_owned(),
+        "--output-dir".to_owned(),
+        output_dir.to_str().unwrap().to_owned(),
+        "--run-file".to_owned(),
+        run_file.to_str().unwrap().to_owned(),
+        "--approve-plan".to_owned(),
+        digest,
+        "--shard-size".to_owned(),
+        "1".to_owned(),
+        "--max-active-batches".to_owned(),
+        "1".to_owned(),
+        "--max-assets".to_owned(),
+        "2".to_owned(),
+        "--api-base-url".to_owned(),
+        url,
+        "--allow-insecure-localhost".to_owned(),
+        "--json".to_owned(),
+    ];
+    let first = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(&args)
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    let second = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(&args)
+        .spawn()
+        .unwrap();
+    let first_output = first.wait_with_output().unwrap();
+    let second_output = second.wait_with_output().unwrap();
+    assert_eq!(first_output.status.code(), Some(8), "{first_output:?}");
+    assert!(
+        matches!(second_output.status.code(), Some(5 | 8)),
+        "{second_output:?}"
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == "/v1/files")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == "/v1/batches")
+            .count(),
+        1
+    );
+    assert!(requests.len() <= 3);
+}
+
+#[test]
+fn run_batch_reconciles_a_submitted_child_after_coordinator_state_gap() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
+    let (url, server) = spawn_competing_run_batch_server();
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "batch",
+            "--parallelism",
+            "1",
+            "--max-active-batches",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let digest = serde_json::from_slice::<Value>(&plan.stdout).unwrap()["plan_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let run_file = directory.path().join("batch-run.json");
+    let args = vec![
+        "run".to_owned(),
+        "batch".to_owned(),
+        "--manifest".to_owned(),
+        manifest.to_str().unwrap().to_owned(),
+        "--output-dir".to_owned(),
+        output_dir.to_str().unwrap().to_owned(),
+        "--run-file".to_owned(),
+        run_file.to_str().unwrap().to_owned(),
+        "--approve-plan".to_owned(),
+        digest,
+        "--shard-size".to_owned(),
+        "1".to_owned(),
+        "--max-active-batches".to_owned(),
+        "1".to_owned(),
+        "--max-assets".to_owned(),
+        "1".to_owned(),
+        "--api-base-url".to_owned(),
+        url,
+        "--allow-insecure-localhost".to_owned(),
+        "--json".to_owned(),
+    ];
+    let first = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(&args)
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(8), "{first:?}");
+    let mut state: Value = serde_json::from_slice(&fs::read(&run_file).unwrap()).unwrap();
+    state["shards"][0]["state"] = Value::String("submitting".to_owned());
+    fs::write(&run_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let resumed = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(&args)
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(8), "{resumed:?}");
+    let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["status"], "pending");
+    assert_eq!(server.join().unwrap().len(), 3);
+}
+
+#[test]
+fn run_batch_rejects_hard_linked_coordinator_before_upload() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
+    let api_url = "http://127.0.0.1:9/v1";
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "batch",
+            "--parallelism",
+            "1",
+            "--max-active-batches",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            api_url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    let run_file = directory.path().join("batch-run.json");
+    let output = output_dir.join("one.png");
+    fs::write(&output, b"collision").unwrap();
+    let initial = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "batch",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--shard-size",
+            "1",
+            "--max-active-batches",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            api_url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(initial.status.code(), Some(3), "{initial:?}");
+    fs::remove_file(output).unwrap();
+
+    let alias = directory.path().join("batch-run-alias.json");
+    fs::hard_link(&run_file, &alias).unwrap();
+    let alias_output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "batch",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            alias.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--shard-size",
+            "1",
+            "--max-active-batches",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            api_url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(alias_output.status.code(), Some(3), "{alias_output:?}");
+    let alias_report: Value = serde_json::from_slice(&alias_output.stdout).unwrap();
+    assert_eq!(alias_report["error"]["code"], "run_file_hard_linked");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_rejects_distinct_non_utf8_state_paths_before_network() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
+    let invalid_one = directory
+        .path()
+        .join(OsString::from_vec(b"run-\x80.json".to_vec()));
+    let invalid_two = directory
+        .path()
+        .join(OsString::from_vec(b"run-\x81.json".to_vec()));
+    assert_eq!(invalid_one.to_string_lossy(), invalid_two.to_string_lossy());
+
+    let direct_plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "1",
+            "--max-assets",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let direct_digest = serde_json::from_slice::<Value>(&direct_plan.stdout).unwrap()
+        ["plan_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let direct = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--approve-plan",
+            &direct_digest,
+            "--max-assets",
+            "1",
+            "--json",
+        ])
+        .arg("--run-file")
+        .arg(&invalid_one)
+        .output()
+        .unwrap();
+    assert_eq!(direct.status.code(), Some(3), "{direct:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&direct.stdout).unwrap()["error"]["code"],
+        "run_file_unavailable"
+    );
+
+    let batch_plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "batch",
+            "--parallelism",
+            "1",
+            "--max-active-batches",
+            "1",
+            "--max-assets",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let batch_digest = serde_json::from_slice::<Value>(&batch_plan.stdout).unwrap()["plan_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let batch = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "batch",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--approve-plan",
+            &batch_digest,
+            "--shard-size",
+            "1",
+            "--max-active-batches",
+            "1",
+            "--max-assets",
+            "1",
+            "--json",
+        ])
+        .arg("--run-file")
+        .arg(&invalid_two)
+        .output()
+        .unwrap();
+    assert_eq!(batch.status.code(), Some(3), "{batch:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&batch.stdout).unwrap()["error"]["code"],
+        "run_file_unavailable"
+    );
+
+    let invalid_output = directory
+        .path()
+        .join(OsString::from_vec(b"images-\x82".to_vec()));
+    let invalid_output_plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "1",
+            "--max-assets",
+            "1",
+            "--json",
+        ])
+        .arg("--output-dir")
+        .arg(&invalid_output)
+        .output()
+        .unwrap();
+    assert_eq!(invalid_output_plan.status.code(), Some(3));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&invalid_output_plan.stdout).unwrap()["error"]["code"],
+        "unsafe_output_directory"
+    );
 }

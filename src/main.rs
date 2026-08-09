@@ -9,9 +9,10 @@ use std::{
 use clap::{error::ErrorKind, Parser};
 use codex_image_cli::{
     batch,
-    cli::{BatchCommand, Cli, Command},
+    cli::{BatchCommand, Cli, Command, RunCommand},
     provider,
     report::{AppError, BatchReport, RunReport, SCHEMA_VERSION},
+    run::{self, RunReport as BulkRunReport},
     run_generate,
 };
 use serde::Serialize;
@@ -71,6 +72,11 @@ fn main() {
             BatchCommand::Cancel(args) => emit_batch(batch::cancel(&args), cli.json),
             BatchCommand::Recover(args) => emit_batch(batch::recover(&args), cli.json),
         },
+        Command::Run { command } => match command {
+            RunCommand::Plan(args) => emit_bulk(run::plan(&args), cli.json),
+            RunCommand::Direct(args) => emit_bulk(run::direct(&args), cli.json),
+            RunCommand::Batch(args) => emit_bulk(run::batch(&args), cli.json),
+        },
         Command::Doctor => run_doctor(cli.json),
         Command::AiHelp => run_ai_help(cli.json),
     };
@@ -119,6 +125,36 @@ fn emit_batch(
                 }
             }
             exit_code
+        }
+    }
+}
+
+fn emit_bulk(result: Result<BulkRunReport, AppError>, json: bool) -> i32 {
+    match result {
+        Ok(report) => {
+            let exit_code = report.exit_code;
+            if json {
+                print_json(&report);
+            } else {
+                println!("{}: {}", report.status, report.plan_digest);
+                for asset in report
+                    .assets
+                    .iter()
+                    .filter(|asset| !asset.outputs.is_empty())
+                {
+                    for output in &asset.outputs {
+                        println!("{output}");
+                    }
+                }
+                if let Some(next_action) = report.next_action {
+                    println!("next: {next_action}");
+                }
+            }
+            exit_code
+        }
+        Err(error) => {
+            emit_error(&error, 0, json);
+            error.status.exit_code()
         }
     }
 }
@@ -372,6 +408,9 @@ fn run_ai_help(json: bool) -> i32 {
         safe_template: "codex-image generate --provider api --prompt \"<prompt>\" --output-dir ./artifacts/design --name <safe-stem> --n 1 --size 1024x1024 --quality low --json",
         planning_template: "codex-image generate --provider api --prompt \"<prompt>\" --output-dir ./artifacts/design --prefix <safe-stem> --n 1 --size 1024x1024 --quality low --dry-run --json",
         batch_template: "codex-image batch submit --provider api --prompt \"<prompt>\" --output-dir ./artifacts/design --prefix <safe-stem> --n 2 --size 1024x1024 --quality low --job-file ./batch-job.json --json",
+        run_plan_template: "codex-image run plan --manifest ./assets.jsonl --output-dir ./artifacts/design --mode direct --parallelism 2 --json",
+        run_direct_template: "codex-image run direct --manifest ./assets.jsonl --output-dir ./artifacts/design --run-file ./run.json --approve-plan <sha256> --max-concurrency 2 --json",
+        run_batch_template: "codex-image run batch --manifest ./assets.jsonl --output-dir ./artifacts/design --run-file ./batch-run.json --approve-plan <sha256> --shard-size 8 --wait --json",
         request_file_template: "{\"schema_version\":1,\"prompt\":\"<prompt>\",\"provider\":\"api\",\"size\":\"1024x1024\",\"quality\":\"low\"}",
         capabilities: provider::capabilities(),
         rules: vec![
@@ -385,6 +424,9 @@ fn run_ai_help(json: bool) -> i32 {
             "Use --confirm-high-quality with --quality high after reviewing the approximate cost warning.",
             "Batch commands require --provider api; persist the returned job file and use batch status, retrieve, cancel, or recover.",
             "Repeat custom-origin or loopback approval flags on each Batch operation; editable job files never grant credential-destination approval.",
+            "Use run plan or a dry run to obtain a plan digest before a billable manifest run; run state never contains prompts or keys.",
+            "Run direct defaults to one worker and never retries a generation POST; increase --max-concurrency only within account and memory limits.",
+            "Run Batch shards are durable and never resubmit an in-flight or unknown child job automatically.",
         ],
     };
     if json {
@@ -395,6 +437,9 @@ fn run_ai_help(json: bool) -> i32 {
         println!("Required input: {}", help.required.flags.join("; "));
         println!("Plan safely: {}", help.planning_template);
         println!("Batch: {}", help.batch_template);
+        println!("Run plan: {}", help.run_plan_template);
+        println!("Run direct: {}", help.run_direct_template);
+        println!("Run batch: {}", help.run_batch_template);
         println!("Structured request: {}", help.request_file_template);
         println!("Generate: {}", help.safe_template);
         println!("For machine-readable instructions: codex-image ai-help --json");
@@ -411,6 +456,9 @@ struct AiHelp {
     safe_template: &'static str,
     planning_template: &'static str,
     batch_template: &'static str,
+    run_plan_template: &'static str,
+    run_direct_template: &'static str,
+    run_batch_template: &'static str,
     request_file_template: &'static str,
     capabilities: Vec<provider::Capability>,
     rules: Vec<&'static str>,

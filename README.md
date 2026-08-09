@@ -22,6 +22,7 @@ AI tools such as OpenCode need a small, predictable image command—not a browse
 - 📁 **Safe deterministic files** with collision protection, staged writes, and controlled `--overwrite`
 - 🔒 **Explicit providers**: direct Image API by default, authenticated Codex CLI via `--provider codex`
 - ⏳ **Durable Batch lifecycle**: submit, inspect, retrieve, and cancel bounded API jobs without hidden retries
+- 🧭 **Manifest runs**: plan, resume, shard, and execute large asset sets with bounded direct concurrency or durable Batch children
 - 🧪 **Offline-friendly validation**: `--dry-run`, unit tests, fake-API integration tests, and a tmux E2E harness
 
 ## Important account reality ⚠️
@@ -213,6 +214,57 @@ Use `batch cancel --job-file FILE --json` when cancellation is appropriate. The 
 For a custom endpoint, repeat its exact `--dangerously-allow-api-key-to ORIGIN` approval on each status/retrieve/cancel/recover command. For loopback test endpoints, repeat `--allow-insecure-localhost`; trust approvals are intentionally not taken from an editable job file.
 
 Use `batch recover --job-file FILE --json` for a job left in the safe `input_uploaded` state. For an unknown upload outcome, first inspect the remote Files API and pass `--input-file-id FILE_ID`; for an unknown create outcome, inspect the remote Batches API and pass `--batch-id BATCH_ID`. These explicit reconciliation flags never cause an automatic upload or duplicate creation.
+
+### Large manifest runs
+
+Use a bounded JSONL manifest for a large, parameterized asset set. Each non-empty line contains `id`, `prompt`, and an optional safe output `name` stem:
+
+```jsonl
+{"id":"hero-001","prompt":"A warm editorial hero image","name":"hero-001"}
+{"id":"hero-002","prompt":"A cool editorial hero image","name":"hero-002"}
+```
+
+Plan before spending credits. The plan digest binds the manifest, parameters, output directory, endpoint, and worker/shard settings; reports and run files never contain prompts or keys:
+
+```bash
+codex-image run plan \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --mode direct \
+  --parallelism 2 \
+  --json
+
+codex-image run direct \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --run-file artifacts/design/run.json \
+  --approve-plan <plan-sha256> \
+  --max-concurrency 2 \
+  --json
+
+# For Batch, obtain a separate digest with matching Batch settings first:
+codex-image run plan \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --mode batch \
+  --parallelism 8 \
+  --max-active-batches 1 \
+  --wait \
+  --max-wait-seconds 300 \
+  --poll-interval-seconds 10 \
+  --json
+
+codex-image run batch \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --run-file artifacts/design/batch-run.json \
+  --approve-plan <plan-sha256> \
+  --shard-size 8 \
+  --wait \
+  --json
+```
+
+`run direct` is API-only, defaults to one worker, and never retries generation POSTs. A definitive failure stops new dispatches unless `--continue-on-error` is explicit; ambiguous or invalid billed outcomes always stop. `run batch` persists its complete shard map before upload/create, allows bounded active child jobs, and never resubmits an in-flight or unknown child job. Resume the same run with the same approved settings after read-only Batch work completes. See [the run manifest contract](docs/specs/run-manifest.md).
 
 ### Endpoint overrides (advanced) 🔐
 
