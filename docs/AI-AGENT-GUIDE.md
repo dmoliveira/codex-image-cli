@@ -72,6 +72,9 @@ codex-image batch retrieve \
 - **No credential argument:** keys belong in the child process environment only.
 - **No hidden retry:** one command makes at most one image-generation operation.
 - **Batch recovery:** `batch submit` persists a job file; use `batch status`, `batch retrieve`, or `batch cancel` instead of resubmitting an unknown POST.
+- **Files permission:** Batch input upload requires OpenAI `api.files.write`. A
+  401 `api_files_write_scope_missing` result is terminal for that submission;
+  grant the scope or use an authorized key, then start a fresh explicit job.
 - **Explicit reconciliation:** use `batch recover` with a manually verified `--input-file-id` or `--batch-id` for unknown POST outcomes. It never retries the unknown POST, and may issue one new creation POST only from the confirmed `input_uploaded` state.
 - **Endpoint trust:** repeat exact custom-origin or loopback approval flags on each Batch operation; never treat an editable job file as credential-destination approval.
 - **No unsafe cleanup:** synchronous `generate` reserves private stages before its billable POST, so a known non-overwrite collision yields code 3 and no request. Batch output collisions are checked during retrieval, after remote Batch work may already have been billed; atomic no-clobber publication still protects competing writers.

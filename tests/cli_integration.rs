@@ -801,6 +801,95 @@ fn server_error_does_not_reflect_the_api_key() {
 }
 
 #[test]
+fn batch_upload_missing_files_write_scope_is_actionable_without_echoing_server_body() {
+    let body = r#"{"error":{"message":"Missing scopes: api.files.write; tenant detail must not be echoed","type":"invalid_request_error","code":null}}"#;
+    let (url, server) = spawn_fixed_response_server("POST", "/v1/files", "401 Unauthorized", body);
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let job_file = directory.path().join("files-scope-job.json");
+
+    let output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "batch",
+            "submit",
+            "--provider",
+            "api",
+            "--prompt",
+            "files scope diagnostic",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--prefix",
+            "scope",
+            "--n",
+            "1",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("tenant detail must not be echoed"));
+    assert!(!stdout.contains("test-key"));
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["status"], "api_rejected");
+    assert_eq!(report["error"]["code"], "api_files_write_scope_missing");
+    assert_eq!(report["error"]["automatic_retry_safe"], false);
+    assert!(report["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("api.files.write"));
+    assert_eq!(report["http"]["status"], 401);
+    let request = server.join().unwrap();
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/v1/files");
+}
+
+#[test]
+fn direct_generation_keeps_files_scope_text_as_a_generic_api_rejection() {
+    let body = r#"{"error":{"message":"Missing scopes: api.files.write","type":"invalid_request_error","code":null}}"#.to_owned();
+    let (url, server) = spawn_server("401 Unauthorized", body);
+    let directory = safe_tempdir();
+
+    let output = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "generate",
+            "--provider",
+            "api",
+            "--prompt",
+            "scope text is not a Batch upload",
+            "--output-dir",
+            directory.path().to_str().unwrap(),
+            "--name",
+            "scope",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "api_rejected");
+    assert!(!report["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("api.files.write"));
+    let request = server.join().unwrap();
+    assert!(request.path_is_correct);
+}
+
+#[test]
 fn redirect_is_refused_without_following_it() {
     let (url, server) = spawn_server("302 Found", "{}".to_owned());
     let directory = safe_tempdir();

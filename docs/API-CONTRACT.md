@@ -119,6 +119,13 @@ Responses must contain exactly `n` `data[].b64_json` values. The CLI limits a de
 - Any non-loopback custom HTTPS origin requires `--dangerously-allow-api-key-to` containing that exact origin.
 - URL userinfo, query, fragment, and non-loopback HTTP are rejected before a request.
 
+Batch input upload requires an API key with OpenAI's `api.files.write` scope. A
+recognized HTTP 401 response that explicitly reports this missing scope is
+returned as the stable `api_files_write_scope_missing` API-rejection code. The
+CLI never echoes the server message, never retries the rejected upload, and
+does not proceed to Batch creation; grant the scope or use an authorized key
+before beginning a fresh explicit submission.
+
 Custom endpoint approval is an explicit trust decision, not a statement of OpenAI compatibility.
 
 ## Structured requests

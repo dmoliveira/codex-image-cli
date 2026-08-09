@@ -155,7 +155,7 @@ impl ApiClient {
             .with_http(status.as_u16(), request_id));
         }
         if status.is_client_error() {
-            let code = safe_error_code(response, api_key);
+            let code = safe_error_code(response, api_key, false);
             return Err(AppError::api_rejected(
                 "api_rejected",
                 format!(
@@ -236,7 +236,7 @@ impl ApiClient {
             url,
             api_key,
             RequestPayload::Multipart(form),
-            RequestKind::BillablePost,
+            RequestKind::BatchInputUpload,
             MAX_BATCH_RESPONSE_BYTES,
         )
     }
@@ -252,7 +252,7 @@ impl ApiClient {
             endpoint.batches_url()?,
             api_key,
             request,
-            RequestKind::BillablePost,
+            RequestKind::BatchCreate,
             MAX_BATCH_RESPONSE_BYTES,
         )
     }
@@ -393,7 +393,21 @@ impl ApiClient {
             return Err(kind.redirect_error().with_http(status.as_u16(), request_id));
         }
         if status.is_client_error() {
-            let code = safe_error_code(response, api_key);
+            let code = safe_error_code(
+                response,
+                api_key,
+                matches!(kind, RequestKind::BatchInputUpload) && status.as_u16() == 401,
+            );
+            if matches!(kind, RequestKind::BatchInputUpload)
+                && code.as_deref() == Some(FILES_WRITE_SCOPE_ERROR_CODE)
+            {
+                return Err(AppError::api_rejected(
+                    FILES_WRITE_SCOPE_ERROR_CODE,
+                    "The API rejected the Batch input upload because the key lacks the required api.files.write scope. Grant that scope to the OpenAI project key or use an authorized key, then begin a fresh explicit Batch submission; this CLI will not retry the rejected upload automatically.",
+                    status.as_u16(),
+                    request_id,
+                ));
+            }
             if matches!(kind, RequestKind::FileContent) && matches!(status.as_u16(), 404 | 410) {
                 return Err(AppError::batch_failed(
                     if status.as_u16() == 410 {
@@ -467,10 +481,13 @@ enum RequestPayload {
 pub const MAX_BATCH_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH_INPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_BATCH_CONTENT_BYTES: usize = 256 * 1024 * 1024;
+const FILES_WRITE_SCOPE_ERROR_CODE: &str = "api_files_write_scope_missing";
+const FILES_WRITE_SCOPE_MARKER: &str = "Missing scopes: api.files.write";
 
 #[derive(Clone, Copy)]
 enum RequestKind {
-    BillablePost,
+    BatchInputUpload,
+    BatchCreate,
     ControlPost,
     Observation,
     FileContent,
@@ -480,7 +497,7 @@ enum RequestKind {
 impl RequestKind {
     fn transport_error(self) -> AppError {
         match self {
-            Self::BillablePost => AppError::indeterminate(
+            Self::BatchInputUpload | Self::BatchCreate => AppError::indeterminate(
                 "batch_submission_outcome_unknown",
                 "The batch submission POST may have been processed. Do not retry automatically; inspect the persisted job state.",
             ),
@@ -505,7 +522,7 @@ impl RequestKind {
 
     fn redirect_error(self) -> AppError {
         match self {
-            Self::BillablePost => AppError::indeterminate(
+            Self::BatchInputUpload | Self::BatchCreate => AppError::indeterminate(
                 "batch_submission_redirected",
                 "The batch submission returned a redirect. Credentials were not forwarded and the submission outcome may be unknown; do not retry automatically.",
             ),
@@ -530,7 +547,7 @@ impl RequestKind {
 
     fn status_error(self, status: u16, request_id: Option<String>) -> AppError {
         match self {
-            Self::BillablePost => AppError::indeterminate(
+            Self::BatchInputUpload | Self::BatchCreate => AppError::indeterminate(
                 "batch_submission_server_error",
                 "The batch submission returned a server error; the operation outcome may be unknown. Do not retry automatically.",
             )
@@ -560,7 +577,7 @@ impl RequestKind {
 
     fn size_error(self, max: usize) -> AppError {
         match self {
-            Self::BillablePost => AppError::invalid_response(
+            Self::BatchInputUpload | Self::BatchCreate => AppError::invalid_response(
                 "batch_response_too_large",
                 format!("The batch submission response exceeded the {max}-byte safety limit; do not retry automatically."),
             ),
@@ -585,7 +602,7 @@ impl RequestKind {
 
     fn read_error(self) -> AppError {
         match self {
-            Self::BillablePost => AppError::invalid_response(
+            Self::BatchInputUpload | Self::BatchCreate => AppError::invalid_response(
                 "batch_response_read_failed",
                 "The batch submission response could not be read completely; do not retry automatically.",
             ),
@@ -640,16 +657,30 @@ struct SafeError {
     code: Option<String>,
     #[serde(rename = "type")]
     kind: Option<String>,
+    message: Option<String>,
 }
 
 /// Read an error response only to extract a short identifier. Arbitrary server
 /// messages are intentionally not echoed because compatible endpoints can
 /// reflect credentials or other sensitive text.
-fn safe_error_code(response: reqwest::blocking::Response, api_key: &str) -> Option<String> {
+fn safe_error_code(
+    response: reqwest::blocking::Response,
+    api_key: &str,
+    recognize_files_write_scope: bool,
+) -> Option<String> {
     let mut body = Vec::new();
     let _ = response.take(MAX_ERROR_BODY_BYTES).read_to_end(&mut body);
     let envelope = serde_json::from_slice::<ErrorEnvelope>(&body).ok()?;
-    let candidate = envelope.error.and_then(|error| error.code.or(error.kind))?;
+    let error = envelope.error?;
+    if recognize_files_write_scope
+        && error
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains(FILES_WRITE_SCOPE_MARKER))
+    {
+        return Some(FILES_WRITE_SCOPE_ERROR_CODE.to_owned());
+    }
+    let candidate = error.code.or(error.kind)?;
     if candidate.contains(api_key)
         || candidate.len() > 80
         || !candidate.chars().all(|character| {
