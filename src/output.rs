@@ -231,6 +231,29 @@ mod secure {
         }
     }
 
+    pub fn entry_exists(output_dir: &Path, name: &str) -> Result<bool, AppError> {
+        if !is_safe_output_name(name) {
+            return Err(AppError::preflight(
+                "unsafe_output_name",
+                "The output entry name is not a safe single filename.",
+            ));
+        }
+        let directory = PinnedDirectory::open(output_dir).map_err(|_| {
+            AppError::preflight(
+                "output_directory_unavailable",
+                "The output directory could not be pinned safely before the run.",
+            )
+        })?;
+        raw_entry_info(directory.directory(), name)
+            .map(|entry| entry.is_some())
+            .map_err(|_| {
+                AppError::preflight(
+                    "output_directory_unavailable",
+                    "The output directory could not be inspected safely before the run.",
+                )
+            })
+    }
+
     enum Reservation {
         NoOverwrite,
         Overwrite { expected_id: Option<FileId> },
@@ -504,6 +527,29 @@ mod secure {
             }
             for (index, image) in images.iter().enumerate() {
                 self.stage_one(index, image)?;
+            }
+            Ok(())
+        }
+
+        pub fn stage_selected(
+            &mut self,
+            selected_indices: &[usize],
+            images: &[Vec<u8>],
+        ) -> Result<(), AppError> {
+            if selected_indices.len() != self.entries.len() {
+                return Err(AppError::output_commit(
+                    "internal_image_count_mismatch",
+                    "The selected image count did not match the reserved output count; no success was reported.",
+                ));
+            }
+            for (position, image_index) in selected_indices.iter().copied().enumerate() {
+                let Some(image) = images.get(image_index) else {
+                    return Err(AppError::output_commit(
+                        "internal_image_index_mismatch",
+                        "A validated image index did not match the reserved output count; no success was reported.",
+                    ));
+                };
+                self.stage_one(position, image)?;
             }
             Ok(())
         }
@@ -1863,13 +1909,37 @@ mod secure {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use secure::{
-    inspect_recovery_plan, read_and_sync_regular_file, read_regular_file,
+    entry_exists, inspect_recovery_plan, read_and_sync_regular_file, read_regular_file,
     read_regular_file_with_identity, sync_regular_file_identity, sync_regular_files,
     verify_and_sync_plan, verify_regular_file_identity, CommitResult, OutputTransaction,
 };
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub struct OutputTransaction;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn entry_exists(output_dir: &Path, name: &str) -> Result<bool, AppError> {
+    if name.is_empty()
+        || Path::new(name).components().count() != 1
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(AppError::preflight(
+            "unsafe_output_name",
+            "The output entry name is not a safe single filename.",
+        ));
+    }
+    match std::fs::symlink_metadata(output_dir.join(name)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(AppError::preflight(
+            "output_directory_unavailable",
+            "The output directory could not be inspected safely before the run.",
+        )),
+    }
+}
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn read_regular_file(_path: &Path, _max_bytes: usize) -> Result<Vec<u8>, AppError> {
@@ -1997,6 +2067,14 @@ impl OutputTransaction {
     }
 
     pub fn stage_all(&mut self, _images: &[Vec<u8>]) -> Result<(), AppError> {
+        unreachable!("unsupported platforms cannot reserve an output transaction")
+    }
+
+    pub fn stage_selected(
+        &mut self,
+        _selected_indices: &[usize],
+        _images: &[Vec<u8>],
+    ) -> Result<(), AppError> {
         unreachable!("unsupported platforms cannot reserve an output transaction")
     }
 

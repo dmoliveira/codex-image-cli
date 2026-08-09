@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::{
@@ -13,6 +13,12 @@ use std::{
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::os::unix::fs::MetadataExt;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use rustix::{
+    fs::{mkdirat, openat, renameat_with, statat, AtFlags, Mode, OFlags, RenameFlags, CWD},
+    io::Errno,
+};
+
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
@@ -25,11 +31,14 @@ use crate::{
     endpoint::Endpoint,
     manifest::{self, Manifest, ManifestAsset},
     report::{AppError, Status},
-    run_generate, MODEL,
+    run_generate_with_preflight, MODEL,
 };
 
 const RUN_STATE_SCHEMA_VERSION: u8 = 1;
+const DIRECT_RUN_STATE_SCHEMA_VERSION: u8 = 2;
+const LEGACY_DIRECT_RUN_STATE_SCHEMA_VERSION: u8 = 1;
 const MAX_RUN_FILE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ASSET_STATE_BYTES: usize = 1024 * 1024;
 const MAX_DIRECT_CONCURRENCY: usize = 4;
 const MAX_BATCH_SHARD_SIZE: usize = crate::cli::MAX_BATCH_IMAGES as usize;
 const MAX_BATCH_CONCURRENCY: usize = 4;
@@ -78,12 +87,13 @@ pub struct RunAssetError {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PersistedShardState {
     Planned,
     Submitting,
     Submitted,
+    Observing,
     Retrieved,
     Failed,
     OutcomeUnknown,
@@ -137,6 +147,15 @@ enum BatchClaim {
     CapacityFull,
 }
 
+#[derive(Debug)]
+struct BatchStatusObservation {
+    index: usize,
+    batch_id: Option<String>,
+    remote_status: Option<String>,
+    state: PersistedShardState,
+    error: Option<RunAssetError>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RunShardReport {
     pub index: usize,
@@ -151,7 +170,7 @@ pub struct RunShardReport {
     pub error: Option<RunAssetError>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PersistedAssetState {
     Planned,
@@ -161,7 +180,7 @@ enum PersistedAssetState {
     OutcomeUnknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedAsset {
     id: String,
@@ -175,11 +194,16 @@ struct PersistedAsset {
     error: Option<PersistedAssetError>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedAssetError {
     code: String,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AssetClaim {
+    identity: Option<crate::output::OutputIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,36 +375,26 @@ pub fn direct(args: &RunDirectArgs) -> Result<RunReport, AppError> {
             if index >= plan.manifest.assets.len() {
                 break;
             }
-            let marked = store.update_value(|state| {
-                let asset = state.assets.get_mut(index).ok_or_else(|| {
-                    AppError::preflight(
-                        "run_state_invalid",
-                        "The run state asset list changed unexpectedly.",
-                    )
-                })?;
-                if !matches!(asset.state, PersistedAssetState::Planned) {
-                    return Ok(false);
-                }
-                asset.state = PersistedAssetState::DispatchInFlight;
-                Ok(true)
-            });
-            let marked = match marked {
-                Ok(marked) => marked,
+            let claim = match store.claim_asset(index) {
+                Ok(claim) => claim,
                 Err(_) => {
                     stop.store(true, Ordering::Release);
                     break;
                 }
             };
-            if !marked {
-                continue;
+            let Some(claim) = claim else { continue };
+            if store.verify_asset_claim(index, claim).is_err() {
+                stop.store(true, Ordering::Release);
+                break;
             }
             let asset = &plan.manifest.assets[index];
             let generation = generation_args(&plan, asset);
-            let result = run_generate(&generation);
+            let result =
+                run_generate_with_preflight(&generation, || store.verify_asset_claim(index, claim));
             let hard_stop = match &result {
                 Ok(report) => store
-                    .update(|state| {
-                        record_success(&mut state.assets[index], report);
+                    .update_asset(index, |asset| {
+                        record_success(asset, report);
                         Ok(())
                     })
                     .is_err(),
@@ -392,8 +406,8 @@ pub fn direct(args: &RunDirectArgs) -> Result<RunReport, AppError> {
                             | Status::OutputCommitFailed
                     );
                     let recorded = store
-                        .update(|state| {
-                            record_error(&mut state.assets[index], error, unknown);
+                        .update_asset(index, |asset| {
+                            record_error(asset, error, unknown);
                             Ok(())
                         })
                         .is_ok();
@@ -468,7 +482,9 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
     if state.shards.iter().any(|shard| {
         matches!(
             shard.state,
-            PersistedShardState::Submitting | PersistedShardState::OutcomeUnknown
+            PersistedShardState::Submitting
+                | PersistedShardState::Observing
+                | PersistedShardState::OutcomeUnknown
         )
     }) {
         reconcile_submitting_batch_shards(&plan, &shards, &store)?;
@@ -476,7 +492,9 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
         if state.shards.iter().any(|shard| {
             matches!(
                 shard.state,
-                PersistedShardState::Submitting | PersistedShardState::OutcomeUnknown
+                PersistedShardState::Submitting
+                    | PersistedShardState::Observing
+                    | PersistedShardState::OutcomeUnknown
             )
         }) {
             return Ok(batch_report_from_state(&plan, &state));
@@ -489,7 +507,12 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
             .filter(|shard| matches!(shard.state, PersistedShardState::Submitted))
             .map(|shard| shard.index)
             .collect::<Vec<_>>();
+        let mut wait_incomplete = false;
         for index in submitted {
+            if !claim_batch_observation(&store, index)? {
+                wait_incomplete = true;
+                continue;
+            }
             let outcome = observe_batch_shard(
                 &plan,
                 &shards[index],
@@ -498,8 +521,11 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
                 args.poll_interval_seconds,
             )?;
             if outcome != BatchObservationOutcome::Retrieved {
-                return Ok(batch_report_from_state(&plan, &store.snapshot()?));
+                wait_incomplete = true;
             }
+        }
+        if wait_incomplete {
+            return Ok(batch_report_from_state(&plan, &store.snapshot()?));
         }
     } else {
         refresh_submitted_batch_status(&plan, &shards, &store)?;
@@ -509,8 +535,9 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
         .shards
         .iter()
         .filter(|shard| {
-            matches!(shard.state, PersistedShardState::Submitted)
-                && is_remote_active(shard.remote_status.as_deref())
+            matches!(shard.state, PersistedShardState::Observing)
+                || (matches!(shard.state, PersistedShardState::Submitted)
+                    && is_remote_active(shard.remote_status.as_deref()))
         })
         .count();
     let available_slots = args.max_active_batches.saturating_sub(active_remote);
@@ -583,15 +610,18 @@ pub fn batch(args: &RunBatchArgs) -> Result<RunReport, AppError> {
                     {
                         hard_stop = true;
                     } else if wait {
-                        hard_stop = observe_batch_shard(
-                            &plan,
-                            shard,
-                            &store,
-                            max_wait_seconds,
-                            poll_interval_seconds,
-                        )
-                        .map(|outcome| outcome == BatchObservationOutcome::Failed)
-                        .unwrap_or(true);
+                        hard_stop = match claim_batch_observation(&store, index) {
+                            Ok(true) => observe_batch_shard(
+                                &plan,
+                                shard,
+                                &store,
+                                max_wait_seconds,
+                                poll_interval_seconds,
+                            )
+                            .map(|outcome| outcome == BatchObservationOutcome::Failed)
+                            .unwrap_or(true),
+                            Ok(false) | Err(_) => true,
+                        };
                     }
                 }
                 Err(failure) => {
@@ -802,9 +832,7 @@ fn preflight_outputs(
         if !matches!(asset.state, PersistedAssetState::Planned) {
             continue;
         }
-        if !overwrite
-            && fs::symlink_metadata(plan.output_dir.join(&plan.output_names[index])).is_ok()
-        {
+        if !overwrite && crate::output::entry_exists(&plan.output_dir, &plan.output_names[index])? {
             return Err(AppError::preflight(
                 "output_collision",
                 "A planned run output already exists; no run requests were sent.",
@@ -1006,8 +1034,10 @@ fn preflight_batch_outputs(
         .collect::<std::collections::HashSet<_>>();
     for asset in &plan.manifest.assets {
         if planned_ids.contains(&asset.id)
-            && fs::symlink_metadata(plan.output_dir.join(asset.output_name(plan.common.format)))
-                .is_ok()
+            && crate::output::entry_exists(
+                &plan.output_dir,
+                &asset.output_name(plan.common.format),
+            )?
         {
             return Err(AppError::preflight(
                 "output_collision",
@@ -1035,7 +1065,9 @@ fn batch_report_from_state(plan: &ExecutionPlan, state: &BatchRunState) -> RunRe
                     not_started_assets += asset_count;
                     "not_started"
                 }
-                PersistedShardState::Submitting | PersistedShardState::OutcomeUnknown => {
+                PersistedShardState::Submitting
+                | PersistedShardState::Observing
+                | PersistedShardState::OutcomeUnknown => {
                     started_assets += asset_count;
                     outcome_unknown_assets += asset_count;
                     "outcome_unknown"
@@ -1134,7 +1166,9 @@ fn reconcile_submitting_batch_shards(
     for persisted in state.shards.iter().filter(|shard| {
         matches!(
             shard.state,
-            PersistedShardState::Submitting | PersistedShardState::OutcomeUnknown
+            PersistedShardState::Submitting
+                | PersistedShardState::Observing
+                | PersistedShardState::OutcomeUnknown
         )
     }) {
         let shard_index = persisted.index;
@@ -1160,7 +1194,9 @@ fn reconcile_submitting_batch_shards(
             })?;
             if !matches!(
                 persisted.state,
-                PersistedShardState::Submitting | PersistedShardState::OutcomeUnknown
+                PersistedShardState::Submitting
+                    | PersistedShardState::Observing
+                    | PersistedShardState::OutcomeUnknown
             ) {
                 return Ok(());
             }
@@ -1247,9 +1283,9 @@ fn reconciled_child_state(
                     .to_owned(),
             }),
         )),
-        // Publishing is not yet a durable success: local output commit may still fail.
-        batch::JobState::Publishing
-        | batch::JobState::Prepared
+        // Retrieval can resume the child's durable publication journal.
+        batch::JobState::Publishing => Some((PersistedShardState::Submitted, None)),
+        batch::JobState::Prepared
         | batch::JobState::UploadInFlight
         | batch::JobState::UploadOutcomeUnknown
         | batch::JobState::InputUploaded
@@ -1277,7 +1313,15 @@ fn observe_batch_shard(
         Ok(report) => {
             let retrieved = report.status == "retrieved";
             store.update(|state| {
-                let persisted = &mut state.shards[shard.index];
+                let persisted = state.shards.get_mut(shard.index).ok_or_else(|| {
+                    AppError::preflight(
+                        "run_state_invalid",
+                        "The Batch run shard index changed unexpectedly during retrieval.",
+                    )
+                })?;
+                if !matches!(persisted.state, PersistedShardState::Observing) {
+                    return Ok(());
+                }
                 persisted.state = if retrieved {
                     PersistedShardState::Retrieved
                 } else {
@@ -1305,9 +1349,17 @@ fn observe_batch_shard(
             let retryable = matches!(
                 failure.error.status,
                 Status::BatchNotReady | Status::BatchObservationFailed
-            );
+            ) || failure.error.code == "job_changed_concurrently";
             store.update(|state| {
-                let persisted = &mut state.shards[shard.index];
+                let persisted = state.shards.get_mut(shard.index).ok_or_else(|| {
+                    AppError::preflight(
+                        "run_state_invalid",
+                        "The Batch run shard index changed unexpectedly during retrieval.",
+                    )
+                })?;
+                if !matches!(persisted.state, PersistedShardState::Observing) {
+                    return Ok(());
+                }
                 persisted.state = if retryable {
                     PersistedShardState::Submitted
                 } else {
@@ -1340,33 +1392,91 @@ fn refresh_submitted_batch_status(
     store: &BatchStore,
 ) -> Result<(), AppError> {
     let state = store.snapshot()?;
+    let mut observations = Vec::new();
     for persisted in state
         .shards
         .iter()
         .filter(|shard| matches!(shard.state, PersistedShardState::Submitted))
     {
-        let shard = &shards[persisted.index];
+        let shard = shards.get(persisted.index).ok_or_else(|| {
+            AppError::preflight(
+                "run_state_invalid",
+                "The Batch run shard index is outside the approved shard plan.",
+            )
+        })?;
         let args = batch_job_args(plan, shard);
         match batch::status(&args) {
             Ok(report) => {
-                store.update(|state| {
-                    let persisted = &mut state.shards[shard.index];
-                    persisted.batch_id = report.batch_id.clone().or(persisted.batch_id.clone());
-                    persisted.remote_status = report.remote_status.clone();
-                    Ok(())
-                })?;
+                let failed = matches!(
+                    report.remote_status.as_deref(),
+                    Some("failed" | "expired" | "cancelled")
+                );
+                let observed_state = if report.status == "retrieved"
+                    || report.remote_status.as_deref() == Some("retrieved")
+                {
+                    PersistedShardState::Retrieved
+                } else if failed {
+                    PersistedShardState::Failed
+                } else {
+                    PersistedShardState::Submitted
+                };
+                observations.push(BatchStatusObservation {
+                    index: shard.index,
+                    batch_id: report.batch_id,
+                    remote_status: report.remote_status,
+                    state: observed_state,
+                    error: failed.then(|| RunAssetError {
+                        code: "batch_failed".to_owned(),
+                        message: "The child Batch reached a terminal failed or cancelled state."
+                            .to_owned(),
+                    }),
+                });
             }
             Err(failure) => {
                 if failure.context.remote_status.is_some() {
-                    store.update(|state| {
-                        let persisted = &mut state.shards[shard.index];
-                        persisted.remote_status = failure.context.remote_status.clone();
-                        Ok(())
-                    })?;
+                    let failed = matches!(
+                        failure.context.remote_status.as_deref(),
+                        Some("failed" | "expired" | "cancelled")
+                    );
+                    observations.push(BatchStatusObservation {
+                        index: shard.index,
+                        batch_id: failure.context.batch_id.clone(),
+                        remote_status: failure.context.remote_status.clone(),
+                        state: if failed {
+                            PersistedShardState::Failed
+                        } else {
+                            PersistedShardState::Submitted
+                        },
+                        error: failed.then(|| RunAssetError {
+                            code: failure.error.code.to_owned(),
+                            message: failure.error.message.clone(),
+                        }),
+                    });
                 }
             }
         }
     }
+    if observations.is_empty() {
+        return Ok(());
+    }
+    store.update(|state| {
+        for observation in observations {
+            let persisted = state.shards.get_mut(observation.index).ok_or_else(|| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The Batch run shard index changed unexpectedly during status refresh.",
+                )
+            })?;
+            if !matches!(persisted.state, PersistedShardState::Submitted) {
+                continue;
+            }
+            persisted.state = observation.state;
+            persisted.batch_id = observation.batch_id.or(persisted.batch_id.take());
+            persisted.remote_status = observation.remote_status;
+            persisted.error = observation.error;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1383,6 +1493,22 @@ fn claim_batch_shard(
     max_active_batches: usize,
 ) -> Result<BatchClaim, AppError> {
     store.update_value(|state| claim_batch_shard_state(state, index, max_active_batches))
+}
+
+fn claim_batch_observation(store: &BatchStore, index: usize) -> Result<bool, AppError> {
+    store.update_value(|state| {
+        let persisted = state.shards.get_mut(index).ok_or_else(|| {
+            AppError::preflight(
+                "run_state_invalid",
+                "The Batch run shard list changed unexpectedly.",
+            )
+        })?;
+        if !matches!(persisted.state, PersistedShardState::Submitted) {
+            return Ok(false);
+        }
+        persisted.state = PersistedShardState::Observing;
+        Ok(true)
+    })
 }
 
 fn claim_batch_shard_state(
@@ -1448,6 +1574,8 @@ fn record_error(asset: &mut PersistedAsset, error: &AppError, unknown: bool) {
 struct RunStore {
     path: PathBuf,
     thread_lock: Arc<Mutex<()>>,
+    parent_directory: Arc<Mutex<Option<File>>>,
+    asset_directory: Arc<Mutex<Option<File>>>,
 }
 
 impl RunStore {
@@ -1482,6 +1610,12 @@ impl RunStore {
             "run_file_unavailable",
             "The run file path must not contain symlinked components or '..'.",
         )?;
+        let parent_directory = open_pinned_directory(parent).map_err(|_| {
+            AppError::preflight(
+                "run_file_unavailable",
+                "The run file parent directory could not be pinned safely.",
+            )
+        })?;
         let path_metadata = fs::symlink_metadata(&path).ok();
         if path_metadata
             .as_ref()
@@ -1505,19 +1639,42 @@ impl RunStore {
         Ok(Self {
             path,
             thread_lock: Arc::new(Mutex::new(())),
+            parent_directory: Arc::new(Mutex::new(Some(parent_directory))),
+            asset_directory: Arc::new(Mutex::new(None)),
         })
     }
 
     fn initialize(&self, plan: &ExecutionPlan) -> Result<(), AppError> {
         self.with_lock(|store| {
-            if store.path.exists() {
-                let state = store.read_unlocked()?;
+            if store.state_file_exists()? {
+                let state = store.read_base_unlocked()?;
                 store.validate_state(&state, plan)?;
+                if state.schema_version == LEGACY_DIRECT_RUN_STATE_SCHEMA_VERSION {
+                    store.migrate_legacy_state(&state)?;
+                } else {
+                    store.pin_existing_asset_state_dir()?;
+                    store.validate_asset_state_files(&state)?;
+                }
                 return Ok(());
+            }
+            match fs::symlink_metadata(store.asset_state_dir()) {
+                Ok(_) => {
+                    return Err(AppError::preflight(
+                        "run_state_orphaned",
+                        "Per-asset run state exists without its coordinator file; inspect it before cleanup rather than starting a new billable run.",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(AppError::preflight(
+                        "run_state_unavailable",
+                        "The per-asset run state path could not be inspected safely.",
+                    ));
+                }
             }
             let now = now_seconds();
             let state = RunState {
-                schema_version: RUN_STATE_SCHEMA_VERSION,
+                schema_version: DIRECT_RUN_STATE_SCHEMA_VERSION,
                 operation: plan.operation.to_owned(),
                 plan_digest: plan.digest.clone(),
                 manifest_sha256: plan.manifest.source_sha256.clone(),
@@ -1543,7 +1700,48 @@ impl RunStore {
                 created_at: now,
                 updated_at: now,
             };
+            store.ensure_asset_state_dir()?;
+            store.write_all_asset_state(&state)?;
             store.write_unlocked(&state)
+        })
+    }
+
+    fn state_file_exists(&self) -> Result<bool, AppError> {
+        self.with_parent_directory(|parent| {
+            if !pinned_path_exists(parent, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_file_unavailable",
+                    "The run state path could not be inspected safely.",
+                )
+            })? {
+                return Ok(false);
+            }
+            let file = open_pinned_asset_file(parent, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_file_unavailable",
+                    "The run state path could not be opened safely.",
+                )
+            })?;
+            let metadata = file.metadata().map_err(|_| {
+                AppError::preflight(
+                    "run_file_unavailable",
+                    "The run state file could not be inspected safely.",
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(AppError::preflight(
+                    "run_file_unavailable",
+                    "The run state path must be a regular file.",
+                ));
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if metadata.nlink() != 1 {
+                return Err(AppError::preflight(
+                    "run_file_hard_linked",
+                    "The run file must have exactly one filesystem link; use the original path rather than an alias.",
+                ));
+            }
+            Ok(true)
         })
     }
 
@@ -1551,26 +1749,124 @@ impl RunStore {
         self.with_lock(|store| store.read_unlocked())
     }
 
-    fn update<F>(&self, update: F) -> Result<(), AppError>
+    fn update_asset<F, T>(&self, index: usize, update: F) -> Result<T, AppError>
     where
-        F: FnOnce(&mut RunState) -> Result<(), AppError>,
+        F: FnOnce(&mut PersistedAsset) -> Result<T, AppError>,
     {
-        self.update_value(|state| {
-            update(state)?;
+        self.with_lock(|store| {
+            let state = store.read_base_unlocked()?;
+            if state.schema_version != DIRECT_RUN_STATE_SCHEMA_VERSION {
+                return Err(AppError::preflight(
+                    "run_state_invalid",
+                    "The direct run coordinator has not completed its durable state migration.",
+                ));
+            }
+            store.pin_existing_asset_state_dir()?;
+            let base_asset = state.assets.get(index).ok_or_else(|| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The run state asset list changed unexpectedly.",
+                )
+            })?;
+            let mut asset = store.read_asset_unlocked(index, base_asset)?;
+            let value = update(&mut asset)?;
+            store.write_asset_unlocked(index, &state, &asset)?;
+            Ok(value)
+        })
+    }
+
+    fn claim_asset(&self, index: usize) -> Result<Option<AssetClaim>, AppError> {
+        let marked = self.update_asset(index, |asset| {
+            if !matches!(asset.state, PersistedAssetState::Planned) {
+                return Ok(false);
+            }
+            asset.state = PersistedAssetState::DispatchInFlight;
+            Ok(true)
+        })?;
+        if !marked {
+            return Ok(None);
+        }
+        self.with_lock(|store| {
+            Ok(Some(AssetClaim {
+                identity: store.asset_identity_unlocked(index)?,
+            }))
+        })
+    }
+
+    fn verify_asset_claim(&self, index: usize, claim: AssetClaim) -> Result<(), AppError> {
+        self.with_lock(|store| {
+            let state = store.read_base_unlocked()?;
+            if state.schema_version != DIRECT_RUN_STATE_SCHEMA_VERSION {
+                return Err(AppError::preflight(
+                    "run_state_invalid",
+                    "The direct run coordinator has not completed its durable state migration.",
+                ));
+            }
+            store.pin_existing_asset_state_dir()?;
+            let base_asset = state.assets.get(index).ok_or_else(|| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The run state asset list changed unexpectedly.",
+                )
+            })?;
+            let asset = store.read_asset_unlocked(index, base_asset)?;
+            if !matches!(asset.state, PersistedAssetState::DispatchInFlight) {
+                return Err(AppError::preflight(
+                    "run_state_changed",
+                    "The direct asset claim changed before its request was dispatched; inspect durable state before resuming.",
+                ));
+            }
+            if store.asset_identity_unlocked(index)? != claim.identity {
+                return Err(AppError::preflight(
+                    "run_state_changed",
+                    "The direct asset claim file changed before its request was dispatched; inspect durable state before resuming.",
+                ));
+            }
             Ok(())
         })
     }
 
-    fn update_value<F, T>(&self, update: F) -> Result<T, AppError>
-    where
-        F: FnOnce(&mut RunState) -> Result<T, AppError>,
-    {
-        self.with_lock(|store| {
-            let mut state = store.read_unlocked()?;
-            let value = update(&mut state)?;
-            state.updated_at = now_seconds();
-            store.write_unlocked(&state)?;
-            Ok(value)
+    fn asset_identity_unlocked(
+        &self,
+        index: usize,
+    ) -> Result<Option<crate::output::OutputIdentity>, AppError> {
+        let path = self.asset_state_path(index);
+        self.with_asset_directory(|directory| {
+            let file = open_pinned_asset_file(directory, &path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_incomplete",
+                    "The per-asset run state file could not be opened before dispatch; do not retry the request.",
+                )
+            })?;
+            let metadata = file.metadata().map_err(|_| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The per-asset run state file could not be inspected safely.",
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(AppError::preflight(
+                    "run_state_invalid",
+                    "The per-asset run state file must be a regular file.",
+                ));
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                if metadata.nlink() != 1 {
+                    return Err(AppError::preflight(
+                        "run_state_hard_linked",
+                        "The per-asset run state file must have exactly one filesystem link.",
+                    ));
+                }
+                Ok(Some(crate::output::OutputIdentity {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                }))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                Ok(None)
+            }
         })
     }
 
@@ -1588,11 +1884,58 @@ impl RunStore {
     }
 
     fn acquire_execution_lock(&self) -> Result<File, AppError> {
-        lock_parent_directory(
-            &self.path,
-            "run_execution_lock_unavailable",
-            "The direct run execution directory lock could not be acquired safely.",
-        )
+        let directory = self.with_parent_directory(|directory| {
+            open_directory_for_lock(directory).map_err(|_| {
+                AppError::preflight(
+                    "run_execution_lock_unavailable",
+                    "The direct run execution directory could not be opened safely.",
+                )
+            })
+        })?;
+        directory.lock_exclusive().map_err(|_| {
+            AppError::preflight(
+                "run_execution_lock_unavailable",
+                "The direct run execution directory lock could not be acquired safely.",
+            )
+        })?;
+        Ok(directory)
+    }
+
+    fn with_parent_directory<F, T>(&self, operation: F) -> Result<T, AppError>
+    where
+        F: FnOnce(&File) -> Result<T, AppError>,
+    {
+        let pinned = self.parent_directory.lock().map_err(|_| {
+            AppError::preflight(
+                "run_lock_unavailable",
+                "The run state parent directory lock could not be acquired safely.",
+            )
+        })?;
+        let directory = pinned.as_ref().ok_or_else(|| {
+            AppError::preflight(
+                "run_file_unavailable",
+                "The run state parent directory has not been pinned safely.",
+            )
+        })?;
+        let parent = self.path.parent().ok_or_else(|| {
+            AppError::preflight(
+                "run_file_unavailable",
+                "The run state parent directory could not be resolved safely.",
+            )
+        })?;
+        let current = open_pinned_directory(parent).map_err(|_| {
+            AppError::preflight(
+                "run_state_changed",
+                "The run state parent directory could not be revalidated safely.",
+            )
+        })?;
+        if !pinned_directory_matches(directory, &current) {
+            return Err(AppError::preflight(
+                "run_state_changed",
+                "The run state parent directory changed during execution; inspect durable state before resuming.",
+            ));
+        }
+        operation(directory)
     }
 
     fn validate_state_path(&self, state_path: &str) -> Result<(), AppError> {
@@ -1606,32 +1949,55 @@ impl RunStore {
     }
 
     fn read_unlocked(&self) -> Result<RunState, AppError> {
-        let metadata = fs::symlink_metadata(&self.path).map_err(|_| {
+        let mut state = self.read_base_unlocked()?;
+        if state.schema_version != DIRECT_RUN_STATE_SCHEMA_VERSION {
+            return Err(AppError::preflight(
+                "run_state_invalid",
+                "The direct run coordinator has not completed its durable state migration.",
+            ));
+        }
+        self.pin_existing_asset_state_dir()?;
+        self.validate_asset_state_files(&state)?;
+        for index in 0..state.assets.len() {
+            let base_asset = state.assets.get(index).ok_or_else(|| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The run state asset list changed unexpectedly.",
+                )
+            })?;
+            state.assets[index] = self.read_asset_unlocked(index, base_asset)?;
+        }
+        Ok(state)
+    }
+
+    fn read_base_unlocked(&self) -> Result<RunState, AppError> {
+        let mut file = self.with_parent_directory(|directory| {
+            open_pinned_asset_file(directory, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The durable run state file could not be opened safely.",
+                )
+            })
+        })?;
+        let metadata = file.metadata().map_err(|_| {
             AppError::preflight(
-                "run_state_missing",
-                "The durable run state file is missing; do not start a duplicate billable run.",
+                "run_state_invalid",
+                "The durable run state file could not be inspected safely.",
             )
         })?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() > MAX_RUN_FILE_BYTES as u64
-        {
+        if !metadata.is_file() || metadata.len() > MAX_RUN_FILE_BYTES as u64 {
             return Err(AppError::preflight(
                 "run_state_invalid",
                 "The durable run state file is unsafe, not regular, or too large.",
             ));
         }
-        reject_hard_linked_state(
-            &self.path,
-            "run_state_hard_linked",
-            "The durable run state file must have exactly one filesystem link.",
-        )?;
-        let mut file = File::open(&self.path).map_err(|_| {
-            AppError::preflight(
-                "run_state_invalid",
-                "The durable run state file could not be opened.",
-            )
-        })?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if metadata.nlink() != 1 {
+            return Err(AppError::preflight(
+                "run_state_hard_linked",
+                "The durable run state file must have exactly one filesystem link.",
+            ));
+        }
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
             .take((MAX_RUN_FILE_BYTES as u64).saturating_add(1))
@@ -1658,9 +2024,439 @@ impl RunStore {
         Ok(state)
     }
 
+    fn asset_state_dir(&self) -> PathBuf {
+        PathBuf::from(format!("{}.assets", self.path.display()))
+    }
+
+    fn asset_state_path(&self, index: usize) -> PathBuf {
+        self.asset_state_dir()
+            .join(format!("asset-{index:08}.json"))
+    }
+
+    fn validate_asset_state_files(&self, state: &RunState) -> Result<(), AppError> {
+        self.with_asset_directory(|directory| {
+            for index in 0..state.assets.len() {
+                let path = self.asset_state_path(index);
+                let file = open_pinned_asset_file(directory, &path).map_err(|_| {
+                    if fs::symlink_metadata(&path).is_err() {
+                        AppError::preflight(
+                            "run_state_incomplete",
+                            "A per-asset run state file is missing; do not start a duplicate billable run.",
+                        )
+                    } else {
+                        AppError::preflight(
+                            "run_state_invalid",
+                            "Every per-asset run state entry must be a regular non-symlink file.",
+                        )
+                    }
+                })?;
+                let metadata = file.metadata().map_err(|_| {
+                    AppError::preflight(
+                        "run_state_invalid",
+                        "A per-asset run state file could not be inspected safely.",
+                    )
+                })?;
+                if !metadata.is_file() || metadata.len() > MAX_ASSET_STATE_BYTES as u64 {
+                    return Err(AppError::preflight(
+                        "run_state_invalid",
+                        "Every per-asset run state entry must be a regular file within the local size limit.",
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn write_all_asset_state(&self, state: &RunState) -> Result<(), AppError> {
+        for index in 0..state.assets.len() {
+            let asset = state.assets.get(index).ok_or_else(|| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The run state asset list changed unexpectedly.",
+                )
+            })?;
+            self.write_asset_unlocked(index, state, asset)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_legacy_state(&self, state: &RunState) -> Result<(), AppError> {
+        match fs::symlink_metadata(self.asset_state_dir()) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(AppError::preflight(
+                        "run_state_invalid",
+                        "The legacy per-asset run state path must be a regular non-symlink directory.",
+                    ));
+                }
+                self.pin_existing_asset_state_dir()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.ensure_asset_state_dir()?;
+            }
+            Err(_) => {
+                return Err(AppError::preflight(
+                    "run_state_unavailable",
+                    "The legacy per-asset run state path could not be inspected safely.",
+                ));
+            }
+        }
+        for index in 0..state.assets.len() {
+            let base_asset = state.assets.get(index).ok_or_else(|| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The legacy run state asset list changed unexpectedly.",
+                )
+            })?;
+            if self.asset_state_file_exists(index)? {
+                let sidecar = self.read_asset_unlocked(index, base_asset)?;
+                if sidecar != *base_asset {
+                    return Err(AppError::preflight(
+                        "run_state_invalid",
+                        "The legacy per-asset state does not match its coordinator; inspect it before resuming.",
+                    ));
+                }
+            } else {
+                self.write_asset_unlocked(index, state, base_asset)?;
+            }
+        }
+        let mut migrated = state.clone();
+        migrated.schema_version = DIRECT_RUN_STATE_SCHEMA_VERSION;
+        migrated.updated_at = now_seconds();
+        self.write_unlocked(&migrated)
+    }
+
+    fn ensure_asset_state_dir(&self) -> Result<(), AppError> {
+        let directory = self.asset_state_dir();
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(AppError::preflight(
+                        "run_state_unavailable",
+                        "The per-asset run state path must be a regular directory.",
+                    ));
+                }
+                self.pin_existing_asset_state_dir()?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.with_parent_directory(|parent| {
+                    create_pinned_asset_directory(parent, &directory).map_err(|_| {
+                        AppError::preflight(
+                            "run_state_unavailable",
+                            "The per-asset run state directory could not be created safely.",
+                        )
+                    })
+                })?;
+            }
+            Err(_) => {
+                return Err(AppError::preflight(
+                    "run_state_unavailable",
+                    "The per-asset run state directory could not be inspected safely.",
+                ));
+            }
+        }
+        self.with_parent_directory(|parent| {
+            parent.sync_all().map_err(|_| {
+                AppError::preflight(
+                    "run_directory_sync_failed",
+                    "The run state parent directory could not be synchronized after creating per-asset state.",
+                )
+            })
+        })?;
+        self.pin_existing_asset_state_dir()
+    }
+
+    fn pin_existing_asset_state_dir(&self) -> Result<(), AppError> {
+        let directory = self.asset_state_dir();
+        let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AppError::preflight(
+                    "run_state_incomplete",
+                    "The per-asset run state directory is missing; do not start a duplicate billable run.",
+                )
+            } else {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The per-asset run state directory could not be inspected safely.",
+                )
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AppError::preflight(
+                "run_state_invalid",
+                "The per-asset run state directory must be a regular non-symlink directory.",
+            ));
+        }
+        let current = self.with_parent_directory(|parent| {
+            open_pinned_child_directory(parent, &directory).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The per-asset run state directory could not be pinned safely.",
+                )
+            })
+        })?;
+        let mut pinned = self.asset_directory.lock().map_err(|_| {
+            AppError::preflight(
+                "run_lock_unavailable",
+                "The per-asset run state directory lock could not be acquired safely.",
+            )
+        })?;
+        if let Some(existing) = pinned.as_ref() {
+            if !pinned_directory_matches(existing, &current) {
+                return Err(AppError::preflight(
+                    "run_state_changed",
+                    "The per-asset run state directory changed during execution; inspect durable state before resuming.",
+                ));
+            }
+        } else {
+            *pinned = Some(current);
+        }
+        Ok(())
+    }
+
+    fn with_asset_directory<F, T>(&self, operation: F) -> Result<T, AppError>
+    where
+        F: FnOnce(&File) -> Result<T, AppError>,
+    {
+        let directory_path = self.asset_state_dir();
+        let current = self.with_parent_directory(|parent| {
+            open_pinned_child_directory(parent, &directory_path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_changed",
+                    "The per-asset run state directory could not be revalidated safely.",
+                )
+            })
+        })?;
+        let pinned = self.asset_directory.lock().map_err(|_| {
+            AppError::preflight(
+                "run_lock_unavailable",
+                "The per-asset run state directory lock could not be acquired safely.",
+            )
+        })?;
+        let directory = pinned.as_ref().ok_or_else(|| {
+            AppError::preflight(
+                "run_state_unavailable",
+                "The per-asset run state directory has not been pinned safely.",
+            )
+        })?;
+        if !pinned_directory_matches(directory, &current) {
+            return Err(AppError::preflight(
+                "run_state_changed",
+                "The per-asset run state directory changed during execution; inspect durable state before resuming.",
+            ));
+        }
+        operation(directory)
+    }
+
+    fn asset_state_file_exists(&self, index: usize) -> Result<bool, AppError> {
+        let path = self.asset_state_path(index);
+        self.with_asset_directory(|directory| {
+            if !pinned_path_exists(directory, &path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "A per-asset run state path could not be inspected safely.",
+                )
+            })? {
+                return Ok(false);
+            }
+            let file = open_pinned_asset_file(directory, &path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "A per-asset run state path is unsafe or not a regular non-symlink file.",
+                )
+            })?;
+            let metadata = file.metadata().map_err(|_| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "A per-asset run state file could not be inspected safely.",
+                )
+            })?;
+            if !metadata.is_file() || metadata.len() > MAX_ASSET_STATE_BYTES as u64 {
+                return Err(AppError::preflight(
+                    "run_state_invalid",
+                    "A per-asset run state file is unsafe, not regular, or too large.",
+                ));
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if metadata.nlink() != 1 {
+                return Err(AppError::preflight(
+                    "run_state_hard_linked",
+                    "The per-asset run state file must have exactly one filesystem link.",
+                ));
+            }
+            Ok(true)
+        })
+    }
+
+    fn read_asset_unlocked(
+        &self,
+        index: usize,
+        base_asset: &PersistedAsset,
+    ) -> Result<PersistedAsset, AppError> {
+        let path = self.asset_state_path(index);
+        let mut file = self.with_asset_directory(|directory| {
+            open_pinned_asset_file(directory, &path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The per-asset run state file could not be opened safely.",
+                )
+            })
+        })?;
+        let metadata = file.metadata().map_err(|_| {
+            AppError::preflight(
+                "run_state_invalid",
+                "The per-asset run state file could not be inspected safely.",
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() > MAX_ASSET_STATE_BYTES as u64 {
+            return Err(AppError::preflight(
+                "run_state_invalid",
+                "The per-asset run state file is unsafe, not regular, or too large.",
+            ));
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if metadata.nlink() != 1 {
+            return Err(AppError::preflight(
+                "run_state_hard_linked",
+                "The per-asset run state file must have exactly one filesystem link.",
+            ));
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((MAX_ASSET_STATE_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The per-asset run state file could not be read.",
+                )
+            })?;
+        if bytes.len() > MAX_ASSET_STATE_BYTES {
+            return Err(AppError::preflight(
+                "run_state_invalid",
+                "The per-asset run state file is too large.",
+            ));
+        }
+        let asset: PersistedAsset = serde_json::from_slice(&bytes).map_err(|_| {
+            AppError::preflight(
+                "run_state_invalid",
+                "The per-asset run state file is not valid JSON.",
+            )
+        })?;
+        if asset.id != base_asset.id || asset.output != base_asset.output {
+            return Err(AppError::preflight(
+                "run_state_invalid",
+                "The per-asset run state mapping is inconsistent with the approved plan.",
+            ));
+        }
+        Ok(asset)
+    }
+
+    fn write_asset_unlocked(
+        &self,
+        index: usize,
+        state: &RunState,
+        asset: &PersistedAsset,
+    ) -> Result<(), AppError> {
+        let base_asset = state.assets.get(index).ok_or_else(|| {
+            AppError::preflight(
+                "run_state_invalid",
+                "The run state asset list changed unexpectedly.",
+            )
+        })?;
+        if asset.id != base_asset.id || asset.output != base_asset.output {
+            return Err(AppError::preflight(
+                "run_state_invalid",
+                "The per-asset run state mapping cannot be changed.",
+            ));
+        }
+        self.ensure_asset_state_dir()?;
+        let path = self.asset_state_path(index);
+        self.with_asset_directory(|directory| {
+            if !pinned_path_exists(directory, &path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The per-asset run state path could not be inspected safely.",
+                )
+            })? {
+                return Ok(());
+            }
+            let file = open_pinned_asset_file(directory, &path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The per-asset run state path must be a regular non-symlink file.",
+                )
+            })?;
+            let metadata = file.metadata().map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The per-asset run state file could not be inspected safely.",
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(AppError::preflight(
+                    "run_state_unavailable",
+                    "The per-asset run state path must be a regular file.",
+                ));
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if metadata.nlink() != 1 {
+                return Err(AppError::preflight(
+                    "run_state_hard_linked",
+                    "The per-asset run state file must have exactly one filesystem link.",
+                ));
+            }
+            Ok(())
+        })?;
+        let bytes = serde_json::to_vec(asset).map_err(|_| {
+            AppError::preflight(
+                "run_state_unavailable",
+                "The per-asset run state could not be serialized safely.",
+            )
+        })?;
+        if bytes.len() > MAX_ASSET_STATE_BYTES {
+            return Err(AppError::preflight(
+                "run_state_too_large",
+                "The per-asset run state exceeded its local safety limit.",
+            ));
+        }
+        let temporary = self
+            .asset_state_dir()
+            .join(format!(".asset-{index:08}.tmp-{}", now_nanos()));
+        self.with_asset_directory(|directory| {
+            let mut file = create_pinned_asset_temp(directory, &temporary).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The temporary per-asset run state file could not be created safely.",
+                )
+            })?;
+            if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+                return Err(AppError::preflight(
+                    "run_state_unavailable",
+                    format!("The per-asset run state could not be synchronized: {error}"),
+                ));
+            }
+            rename_pinned_asset_file(directory, &temporary, &path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The per-asset run state could not be atomically published.",
+                )
+            })?;
+            directory.sync_all().map_err(|_| {
+                AppError::preflight(
+                    "run_directory_sync_failed",
+                    "The per-asset run state directory could not be synchronized after the atomic update.",
+                )
+            })
+        })
+    }
+
     fn validate_state(&self, state: &RunState, plan: &ExecutionPlan) -> Result<(), AppError> {
-        if state.schema_version != RUN_STATE_SCHEMA_VERSION
-            || state.operation != plan.operation
+        if !matches!(
+            state.schema_version,
+            LEGACY_DIRECT_RUN_STATE_SCHEMA_VERSION | DIRECT_RUN_STATE_SCHEMA_VERSION
+        ) || state.operation != plan.operation
             || state.plan_digest != plan.digest
             || state.manifest_sha256 != plan.manifest.source_sha256
             || state.output_dir != plan.output_dir.to_string_lossy()
@@ -1689,12 +2485,48 @@ impl RunStore {
     }
 
     fn write_unlocked(&self, state: &RunState) -> Result<(), AppError> {
+        if state.schema_version != DIRECT_RUN_STATE_SCHEMA_VERSION {
+            return Err(AppError::preflight(
+                "run_state_invalid",
+                "The direct run coordinator has an unsupported state schema.",
+            ));
+        }
         self.validate_state_path(&state.state_path)?;
-        reject_hard_linked_state(
-            &self.path,
-            "run_state_hard_linked",
-            "The durable run state file must have exactly one filesystem link.",
-        )?;
+        self.with_parent_directory(|parent| {
+            if pinned_path_exists(parent, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The durable run state path could not be inspected safely.",
+                )
+            })? {
+                let file = open_pinned_asset_file(parent, &self.path).map_err(|_| {
+                    AppError::preflight(
+                        "run_state_unavailable",
+                        "The durable run state path could not be opened safely.",
+                    )
+                })?;
+                let metadata = file.metadata().map_err(|_| {
+                    AppError::preflight(
+                        "run_state_unavailable",
+                        "The durable run state file could not be inspected safely.",
+                    )
+                })?;
+                if !metadata.is_file() {
+                    return Err(AppError::preflight(
+                        "run_state_unavailable",
+                        "The durable run state path must be a regular file.",
+                    ));
+                }
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if metadata.nlink() != 1 {
+                    return Err(AppError::preflight(
+                        "run_state_hard_linked",
+                        "The durable run state file must have exactly one filesystem link.",
+                    ));
+                }
+            }
+            Ok(())
+        })?;
         let bytes = serde_json::to_vec_pretty(state).map_err(|_| {
             AppError::preflight(
                 "run_state_unavailable",
@@ -1713,63 +2545,32 @@ impl RunStore {
             std::process::id(),
             now_nanos()
         ));
-        if fs::symlink_metadata(&temporary)
-            .ok()
-            .is_some_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(AppError::preflight(
-                "run_state_unavailable",
-                "The temporary run state path must not be a symlink.",
-            ));
-        }
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|_| {
+        self.with_parent_directory(|parent| {
+            let mut file = create_pinned_asset_temp(parent, &temporary).map_err(|_| {
                 AppError::preflight(
                     "run_state_unavailable",
                     "The temporary run state file could not be created safely.",
                 )
             })?;
-        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
-            let _ = fs::remove_file(&temporary);
-            return Err(AppError::preflight(
-                "run_state_unavailable",
-                format!("The durable run state could not be synchronized: {error}"),
-            ));
-        }
-        fs::rename(&temporary, &self.path).map_err(|_| {
-            let _ = fs::remove_file(&temporary);
-            AppError::preflight(
-                "run_state_unavailable",
-                "The durable run state could not be atomically published.",
-            )
-        })?;
-        let parent = self.path.parent().ok_or_else(|| {
-            AppError::preflight(
-                "run_directory_sync_failed",
-                "The run state parent directory could not be resolved after publication.",
-            )
-        })?;
-        manifest::validate_path_components(
-            parent,
-            "run_directory_sync_failed",
-            "The run state parent directory changed or contains an unsafe component.",
-        )?;
-        let directory = File::open(parent).map_err(|_| {
-            AppError::preflight(
-                "run_directory_sync_failed",
-                "The run state parent directory could not be opened for durability verification.",
-            )
-        })?;
-        directory.sync_all().map_err(|_| {
-            AppError::preflight(
-                "run_directory_sync_failed",
-                "The run state parent directory could not be synchronized after the atomic update.",
-            )
-        })?;
-        Ok(())
+            if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+                return Err(AppError::preflight(
+                    "run_state_unavailable",
+                    format!("The durable run state could not be synchronized: {error}"),
+                ));
+            }
+            rename_pinned_asset_file(parent, &temporary, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The durable run state could not be atomically published.",
+                )
+            })?;
+            parent.sync_all().map_err(|_| {
+                AppError::preflight(
+                    "run_directory_sync_failed",
+                    "The run state parent directory could not be synchronized after the atomic update.",
+                )
+            })
+        })
     }
 }
 
@@ -1777,6 +2578,7 @@ impl RunStore {
 struct BatchStore {
     path: PathBuf,
     thread_lock: Arc<Mutex<()>>,
+    parent_directory: Arc<Mutex<Option<File>>>,
 }
 
 impl BatchStore {
@@ -1811,6 +2613,12 @@ impl BatchStore {
             "run_file_unavailable",
             "The Batch run file path must not contain symlinked components or '..'.",
         )?;
+        let parent_directory = open_pinned_directory(parent).map_err(|_| {
+            AppError::preflight(
+                "run_file_unavailable",
+                "The Batch run file parent directory could not be pinned safely.",
+            )
+        })?;
         let path_metadata = fs::symlink_metadata(&path).ok();
         if path_metadata
             .as_ref()
@@ -1834,12 +2642,13 @@ impl BatchStore {
         Ok(Self {
             path,
             thread_lock: Arc::new(Mutex::new(())),
+            parent_directory: Arc::new(Mutex::new(Some(parent_directory))),
         })
     }
 
     fn initialize(&self, plan: &ExecutionPlan, shards: &[BatchShardPlan]) -> Result<(), AppError> {
         self.with_lock(|store| {
-            if store.path.exists() {
+            if store.state_file_exists()? {
                 let state = store.read_unlocked()?;
                 store.validate_state(&state, plan, shards)?;
                 return Ok(());
@@ -1871,6 +2680,45 @@ impl BatchStore {
                 updated_at: now,
             };
             store.write_unlocked(&state)
+        })
+    }
+
+    fn state_file_exists(&self) -> Result<bool, AppError> {
+        self.with_parent_directory(|parent| {
+            if !pinned_path_exists(parent, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_file_unavailable",
+                    "The Batch run state path could not be inspected safely.",
+                )
+            })? {
+                return Ok(false);
+            }
+            let file = open_pinned_asset_file(parent, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_file_unavailable",
+                    "The Batch run state path could not be opened safely.",
+                )
+            })?;
+            let metadata = file.metadata().map_err(|_| {
+                AppError::preflight(
+                    "run_file_unavailable",
+                    "The Batch run state file could not be inspected safely.",
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(AppError::preflight(
+                    "run_file_unavailable",
+                    "The Batch run state path must be a regular file.",
+                ));
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if metadata.nlink() != 1 {
+                return Err(AppError::preflight(
+                    "run_file_hard_linked",
+                    "The Batch run file must have exactly one filesystem link; use the original path rather than an alias.",
+                ));
+            }
+            Ok(true)
         })
     }
 
@@ -1921,41 +2769,89 @@ impl BatchStore {
                 "The Batch run state lock could not be acquired safely after a worker failure.",
             )
         })?;
-        let _directory_lock = lock_parent_directory(
-            &self.path,
-            "run_lock_unavailable",
-            "The Batch run directory lock could not be acquired safely.",
-        )?;
+        let _directory_lock = self.with_parent_directory(|directory| {
+            let directory = open_directory_for_lock(directory).map_err(|_| {
+                AppError::preflight(
+                    "run_lock_unavailable",
+                    "The Batch run directory could not be opened safely.",
+                )
+            })?;
+            directory.lock_exclusive().map_err(|_| {
+                AppError::preflight(
+                    "run_lock_unavailable",
+                    "The Batch run directory lock could not be acquired safely.",
+                )
+            })?;
+            Ok(directory)
+        })?;
         operation(self)
     }
 
-    fn read_unlocked(&self) -> Result<BatchRunState, AppError> {
-        let metadata = fs::symlink_metadata(&self.path).map_err(|_| {
+    fn with_parent_directory<F, T>(&self, operation: F) -> Result<T, AppError>
+    where
+        F: FnOnce(&File) -> Result<T, AppError>,
+    {
+        let pinned = self.parent_directory.lock().map_err(|_| {
             AppError::preflight(
-                "run_state_missing",
-                "The durable Batch run state file is missing; do not start a duplicate run.",
+                "run_lock_unavailable",
+                "The Batch run state parent directory lock could not be acquired safely.",
             )
         })?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() > MAX_RUN_FILE_BYTES as u64
-        {
+        let directory = pinned.as_ref().ok_or_else(|| {
+            AppError::preflight(
+                "run_file_unavailable",
+                "The Batch run state parent directory has not been pinned safely.",
+            )
+        })?;
+        let parent = self.path.parent().ok_or_else(|| {
+            AppError::preflight(
+                "run_file_unavailable",
+                "The Batch run state parent directory could not be resolved safely.",
+            )
+        })?;
+        let current = open_pinned_directory(parent).map_err(|_| {
+            AppError::preflight(
+                "run_state_changed",
+                "The Batch run state parent directory could not be revalidated safely.",
+            )
+        })?;
+        if !pinned_directory_matches(directory, &current) {
+            return Err(AppError::preflight(
+                "run_state_changed",
+                "The Batch run state parent directory changed during execution; inspect durable state before resuming.",
+            ));
+        }
+        operation(directory)
+    }
+
+    fn read_unlocked(&self) -> Result<BatchRunState, AppError> {
+        let mut file = self.with_parent_directory(|directory| {
+            open_pinned_asset_file(directory, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_invalid",
+                    "The durable Batch run state file could not be opened safely.",
+                )
+            })
+        })?;
+        let metadata = file.metadata().map_err(|_| {
+            AppError::preflight(
+                "run_state_invalid",
+                "The durable Batch run state file could not be inspected safely.",
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() > MAX_RUN_FILE_BYTES as u64 {
             return Err(AppError::preflight(
                 "run_state_invalid",
                 "The durable Batch run state file is unsafe, not regular, or too large.",
             ));
         }
-        reject_hard_linked_state(
-            &self.path,
-            "run_state_hard_linked",
-            "The durable Batch run state file must have exactly one filesystem link.",
-        )?;
-        let mut file = File::open(&self.path).map_err(|_| {
-            AppError::preflight(
-                "run_state_invalid",
-                "The durable Batch run state file could not be opened.",
-            )
-        })?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if metadata.nlink() != 1 {
+            return Err(AppError::preflight(
+                "run_state_hard_linked",
+                "The durable Batch run state file must have exactly one filesystem link.",
+            ));
+        }
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
             .take((MAX_RUN_FILE_BYTES as u64).saturating_add(1))
@@ -2021,11 +2917,41 @@ impl BatchStore {
 
     fn write_unlocked(&self, state: &BatchRunState) -> Result<(), AppError> {
         self.validate_state_path(&state.state_path)?;
-        reject_hard_linked_state(
-            &self.path,
-            "run_state_hard_linked",
-            "The durable Batch run state file must have exactly one filesystem link.",
-        )?;
+        self.with_parent_directory(|parent| {
+            if pinned_path_exists(parent, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The durable Batch run state path could not be inspected safely.",
+                )
+            })? {
+                let file = open_pinned_asset_file(parent, &self.path).map_err(|_| {
+                    AppError::preflight(
+                        "run_state_unavailable",
+                        "The durable Batch run state path could not be opened safely.",
+                    )
+                })?;
+                let metadata = file.metadata().map_err(|_| {
+                    AppError::preflight(
+                        "run_state_unavailable",
+                        "The durable Batch run state file could not be inspected safely.",
+                    )
+                })?;
+                if !metadata.is_file() {
+                    return Err(AppError::preflight(
+                        "run_state_unavailable",
+                        "The durable Batch run state path must be a regular file.",
+                    ));
+                }
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if metadata.nlink() != 1 {
+                    return Err(AppError::preflight(
+                        "run_state_hard_linked",
+                        "The durable Batch run state file must have exactly one filesystem link.",
+                    ));
+                }
+            }
+            Ok(())
+        })?;
         let bytes = serde_json::to_vec_pretty(state).map_err(|_| {
             AppError::preflight(
                 "run_state_unavailable",
@@ -2044,72 +2970,267 @@ impl BatchStore {
             std::process::id(),
             now_nanos()
         ));
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|_| {
+        self.with_parent_directory(|parent| {
+            let mut file = create_pinned_asset_temp(parent, &temporary).map_err(|_| {
                 AppError::preflight(
                     "run_state_unavailable",
                     "The temporary Batch run state file could not be created safely.",
                 )
             })?;
-        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
-            let _ = fs::remove_file(&temporary);
-            return Err(AppError::preflight(
-                "run_state_unavailable",
-                format!("The durable Batch run state could not be synchronized: {error}"),
-            ));
-        }
-        fs::rename(&temporary, &self.path).map_err(|_| {
-            let _ = fs::remove_file(&temporary);
-            AppError::preflight(
-                "run_state_unavailable",
-                "The durable Batch run state could not be atomically published.",
-            )
-        })?;
-        let parent = self.path.parent().ok_or_else(|| {
-            AppError::preflight(
-                "run_directory_sync_failed",
-                "The Batch run state parent directory could not be resolved after publication.",
-            )
-        })?;
-        manifest::validate_path_components(
-            parent,
-            "run_directory_sync_failed",
-            "The Batch run state parent directory changed or contains an unsafe component.",
-        )?;
-        let directory = File::open(parent).map_err(|_| {
-            AppError::preflight(
-                "run_directory_sync_failed",
-                "The Batch run state parent directory could not be opened for durability verification.",
-            )
-        })?;
-        directory.sync_all().map_err(|_| {
-            AppError::preflight(
-                "run_directory_sync_failed",
-                "The Batch run state parent directory could not be synchronized after the atomic update.",
-            )
-        })?;
-        Ok(())
+            if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+                return Err(AppError::preflight(
+                    "run_state_unavailable",
+                    format!("The durable Batch run state could not be synchronized: {error}"),
+                ));
+            }
+            rename_pinned_asset_file(parent, &temporary, &self.path).map_err(|_| {
+                AppError::preflight(
+                    "run_state_unavailable",
+                    "The durable Batch run state could not be atomically published.",
+                )
+            })?;
+            parent.sync_all().map_err(|_| {
+                AppError::preflight(
+                    "run_directory_sync_failed",
+                    "The Batch run state parent directory could not be synchronized after the atomic update.",
+                )
+            })
+        })
     }
 }
 
-fn reject_hard_linked_state(
-    path: &Path,
-    code: &'static str,
-    message: &'static str,
-) -> Result<(), AppError> {
+pub(crate) fn open_pinned_directory(path: &Path) -> Result<File, ()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|metadata| metadata.is_file() && metadata.nlink() != 1)
     {
-        return Err(AppError::preflight(code, message));
+        let root = openat(
+            CWD,
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ())?;
+        let mut current: File = root.into();
+        for component in path.components() {
+            let Component::Normal(name) = component else {
+                if matches!(component, Component::ParentDir) {
+                    return Err(());
+                }
+                continue;
+            };
+            let fd = openat(
+                &current,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| ())?;
+            current = fd.into();
+        }
+        Ok(current)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let _ = (path, code, message);
-    Ok(())
+    {
+        File::open(path).map_err(|_| ())
+    }
+}
+
+fn open_pinned_child_directory(parent: &File, path: &Path) -> Result<File, ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let name = path.file_name().ok_or(())?;
+        let fd = openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ())?;
+        Ok(fd.into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = parent;
+        File::open(path).map_err(|_| ())
+    }
+}
+
+pub(crate) fn open_directory_for_lock(parent: &File) -> Result<File, ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let fd = openat(
+            parent,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ())?;
+        Ok(fd.into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        parent.try_clone().map_err(|_| ())
+    }
+}
+
+pub(crate) fn open_pinned_lock_file(directory: &File, path: &Path) -> Result<File, ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let name = path.file_name().ok_or(())?;
+        let fd = openat(
+            directory,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|_| ())?;
+        Ok(fd.into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = directory;
+        fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|_| ())
+    }
+}
+
+pub(crate) fn pinned_path_exists(directory: &File, path: &Path) -> Result<bool, ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let name = path.file_name().ok_or(())?;
+        match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(Errno::NOENT) => Ok(false),
+            Err(_) => Err(()),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(()),
+        }
+    }
+}
+
+fn create_pinned_asset_directory(parent: &File, path: &Path) -> Result<(), ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let name = path.file_name().ok_or(())?;
+        mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR).map_err(|_| ())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = parent;
+        fs::create_dir(path).map_err(|_| ())
+    }
+}
+
+pub(crate) fn pinned_directory_matches(expected: &File, current: &File) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let Ok(expected) = expected.metadata() else {
+            return false;
+        };
+        let Ok(current) = current.metadata() else {
+            return false;
+        };
+        expected.dev() == current.dev() && expected.ino() == current.ino()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (expected, current);
+        true
+    }
+}
+
+pub(crate) fn open_pinned_asset_file(directory: &File, path: &Path) -> Result<File, ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let name = path.file_name().ok_or(())?;
+        let fd = openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ())?;
+        Ok(fd.into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = directory;
+        File::open(path).map_err(|_| ())
+    }
+}
+
+pub(crate) fn create_pinned_asset_temp(directory: &File, path: &Path) -> Result<File, ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let name = path.file_name().ok_or(())?;
+        let fd = openat(
+            directory,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|_| ())?;
+        Ok(fd.into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = directory;
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(|_| ())
+    }
+}
+
+pub(crate) fn rename_pinned_asset_file(
+    directory: &File,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), ()> {
+    rename_pinned_asset_file_with_policy(directory, source, destination, false)
+}
+
+pub(crate) fn rename_pinned_asset_file_with_policy(
+    directory: &File,
+    source: &Path,
+    destination: &Path,
+    no_clobber: bool,
+) -> Result<(), ()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let source_name = source.file_name().ok_or(())?;
+        let destination_name = destination.file_name().ok_or(())?;
+        renameat_with(
+            directory,
+            source_name,
+            directory,
+            destination_name,
+            if no_clobber {
+                RenameFlags::NOREPLACE
+            } else {
+                RenameFlags::empty()
+            },
+        )
+        .map_err(|_| ())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = directory;
+        if no_clobber && fs::symlink_metadata(destination).is_ok() {
+            return Err(());
+        }
+        fs::rename(source, destination).map_err(|_| ())
+    }
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, AppError> {
@@ -2143,22 +3264,6 @@ fn normalize_absolute_path(path: &Path) -> Result<PathBuf, AppError> {
         }
     }
     Ok(normalized)
-}
-
-fn lock_parent_directory(
-    path: &Path,
-    code: &'static str,
-    message: &'static str,
-) -> Result<File, AppError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::preflight(code, message))?;
-    manifest::validate_path_components(parent, code, message)?;
-    let directory = File::open(parent).map_err(|_| AppError::preflight(code, message))?;
-    directory
-        .lock_exclusive()
-        .map_err(|_| AppError::preflight(code, message))?;
-    Ok(directory)
 }
 
 fn now_seconds() -> u64 {
@@ -2362,9 +3467,14 @@ mod tests {
     }
 
     #[test]
-    fn child_reconciliation_never_promotes_publishing_or_mismatched_jobs() {
+    fn child_reconciliation_recovers_publishing_and_rejects_mismatches() {
         let publishing = test_child_job(batch::JobState::Publishing);
-        assert!(reconciled_child_state(&publishing).is_none());
+        let publishing_reconciliation =
+            reconciled_child_state(&publishing).map(|(state, error)| (state, error.is_none()));
+        assert_eq!(
+            publishing_reconciliation,
+            Some((PersistedShardState::Submitted, true))
+        );
 
         let common = test_common();
         let plan = ExecutionPlan {

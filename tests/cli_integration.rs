@@ -515,10 +515,13 @@ fn spawn_batch_create_overlap_server() -> (String, JoinHandle<Vec<RawHttpRequest
     (format!("http://{address}/v1"), handle)
 }
 
-fn spawn_competing_run_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>>) {
+fn spawn_competing_run_batch_server(
+    terminal_status: &str,
+) -> (String, JoinHandle<Vec<RawHttpRequest>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
+    let terminal_status = terminal_status.to_owned();
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -537,7 +540,10 @@ fn spawn_competing_run_batch_server() -> (String, JoinHandle<Vec<RawHttpRequest>
                     "application/json",
                 ),
                 (2, "GET", "/v1/batches/batch-competing") => (
-                    r#"{"id":"batch-competing","status":"in_progress","input_file_id":"file-input","request_counts":{"completed":0,"failed":0,"total":1}}"#.to_owned(),
+                    format!(
+                        r#"{{"id":"batch-competing","status":"{terminal_status}","input_file_id":"file-input","request_counts":{{"completed":0,"failed":{},"total":1}}}}"#,
+                        if terminal_status == "failed" { 1 } else { 0 }
+                    ),
                     "application/json",
                 ),
                 _ => panic!(
@@ -2978,6 +2984,211 @@ fn run_direct_resume_skips_completed_prefix_and_dispatches_planned_suffix() {
 }
 
 #[test]
+fn run_direct_fails_closed_when_an_asset_sidecar_is_missing() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
+    let (url, server) = spawn_server(
+        "200 OK",
+        format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#),
+    );
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap();
+    let run_file = directory.path().join("run.json");
+    let first = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            digest,
+            "--max-concurrency",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "{first:?}");
+    assert!(server.join().unwrap().path_is_correct);
+
+    let sidecar = run_file
+        .with_file_name("run.json.assets")
+        .join("asset-00000000.json");
+    fs::remove_file(sidecar).unwrap();
+    let resumed = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            digest,
+            "--max-concurrency",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(3), "{resumed:?}");
+    let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["error"]["code"], "run_state_incomplete");
+}
+
+#[test]
+fn run_direct_migrates_legacy_coordinator_state_before_resume() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
+    let (url, server) = spawn_server(
+        "200 OK",
+        format!(r#"{{"data":[{{"b64_json":"{PNG_BASE64}"}}]}}"#),
+    );
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--mode",
+            "direct",
+            "--parallelism",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let plan_report: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let digest = plan_report["plan_digest"].as_str().unwrap().to_owned();
+    let run_file = directory.path().join("run.json");
+    let first = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-concurrency",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "{first:?}");
+    assert!(server.join().unwrap().path_is_correct);
+
+    let sidecar_dir = run_file.with_file_name("run.json.assets");
+    let sidecar = sidecar_dir.join("asset-00000000.json");
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&run_file).unwrap()).unwrap();
+    let asset: Value = serde_json::from_slice(&fs::read(sidecar).unwrap()).unwrap();
+    legacy["schema_version"] = Value::from(1);
+    legacy["assets"] = Value::Array(vec![asset]);
+    fs::write(&run_file, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    fs::remove_dir_all(sidecar_dir).unwrap();
+
+    let resumed = command()
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "run",
+            "direct",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--max-concurrency",
+            "1",
+            "--max-assets",
+            "1",
+            "--api-base-url",
+            &url,
+            "--allow-insecure-localhost",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(resumed.status.success(), "{resumed:?}");
+    let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["assets"][0]["state"], "succeeded");
+    let migrated: Value = serde_json::from_slice(&fs::read(&run_file).unwrap()).unwrap();
+    assert_eq!(migrated["schema_version"], 2);
+    assert!(run_file
+        .with_file_name("run.json.assets")
+        .join("asset-00000000.json")
+        .is_file());
+}
+
+#[test]
 fn run_direct_rejects_a_mutated_manifest_before_network() {
     let directory = safe_tempdir();
     let output_dir = directory.path().join("images");
@@ -3184,7 +3395,7 @@ fn run_batch_serializes_competing_coordinators_without_duplicate_submission() {
         "{\"id\":\"one\",\"prompt\":\"first asset\"}\n{\"id\":\"two\",\"prompt\":\"second asset\"}\n",
     )
     .unwrap();
-    let (url, server) = spawn_competing_run_batch_server();
+    let (url, server) = spawn_competing_run_batch_server("in_progress");
     let plan = command()
         .env_remove("OPENAI_API_KEY")
         .args([
@@ -3282,7 +3493,7 @@ fn run_batch_reconciles_a_submitted_child_after_coordinator_state_gap() {
     fs::create_dir(&output_dir).unwrap();
     let manifest = directory.path().join("assets.jsonl");
     fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
-    let (url, server) = spawn_competing_run_batch_server();
+    let (url, server) = spawn_competing_run_batch_server("in_progress");
     let plan = command()
         .env_remove("OPENAI_API_KEY")
         .args([
@@ -3353,6 +3564,76 @@ fn run_batch_reconciles_a_submitted_child_after_coordinator_state_gap() {
     assert_eq!(resumed.status.code(), Some(8), "{resumed:?}");
     let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(report["status"], "pending");
+    assert_eq!(server.join().unwrap().len(), 3);
+}
+
+#[test]
+fn run_batch_marks_terminal_remote_failures_in_no_wait_status() {
+    let directory = safe_tempdir();
+    let output_dir = directory.path().join("images");
+    fs::create_dir(&output_dir).unwrap();
+    let manifest = directory.path().join("assets.jsonl");
+    fs::write(&manifest, "{\"id\":\"one\",\"prompt\":\"one asset\"}\n").unwrap();
+    let (url, server) = spawn_competing_run_batch_server("failed");
+    let common = [
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--output-dir",
+        output_dir.to_str().unwrap(),
+        "--max-assets",
+        "1",
+        "--shard-size",
+        "1",
+        "--max-active-batches",
+        "1",
+        "--api-base-url",
+        &url,
+        "--allow-insecure-localhost",
+    ];
+    let plan = command()
+        .env_remove("OPENAI_API_KEY")
+        .args(["run", "batch"])
+        .args(common)
+        .args(["--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(plan.status.success(), "{plan:?}");
+    let digest = serde_json::from_slice::<Value>(&plan.stdout).unwrap()["plan_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let run_file = directory.path().join("batch-run.json");
+    let first = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(["run", "batch"])
+        .args(common)
+        .args([
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(8), "{first:?}");
+    let resumed = command()
+        .env("OPENAI_API_KEY", "test-key")
+        .args(["run", "batch"])
+        .args(common)
+        .args([
+            "--run-file",
+            run_file.to_str().unwrap(),
+            "--approve-plan",
+            &digest,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(10), "{resumed:?}");
+    let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["failed_assets"], 1);
     assert_eq!(server.join().unwrap().len(), 3);
 }
 

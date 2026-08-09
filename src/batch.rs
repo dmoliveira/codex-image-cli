@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env,
     fs::{self, File},
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -28,12 +28,17 @@ use crate::{
     image::decode_base64_image,
     manifest::ManifestAsset,
     output::{
-        derive_file_names, derive_output_paths, inspect_recovery_plan, read_regular_file,
+        derive_file_names, derive_output_paths, inspect_recovery_plan,
         read_regular_file_with_identity, verify_and_sync_plan, verify_regular_file_identity,
         OutputIdentity, OutputTransaction, OutputVerificationArtifact, RecoveryArtifact,
         RecoveryVerificationArtifact, RetainedVerificationArtifact,
     },
     report::{AppError, BatchContext, BatchReport, BatchRequestCountsReport},
+    run::{
+        create_pinned_asset_temp, open_pinned_asset_file, open_pinned_directory,
+        open_pinned_lock_file, pinned_directory_matches, pinned_path_exists,
+        rename_pinned_asset_file_with_policy,
+    },
     MODEL,
 };
 
@@ -401,7 +406,31 @@ fn submit_prepared(
             )),
         )
     })?;
-    JobStore::create(&job_file, &job).map_err(|error| {
+    let job_store = JobStore::open(&job_file).map_err(|error| {
+        failure(
+            error,
+            "batch.submit",
+            Some(context_for_job(
+                &base_context,
+                &job.job_id,
+                None,
+                Some(&job_file),
+            )),
+        )
+    })?;
+    let _job_lock = job_store.lock().map_err(|error| {
+        failure(
+            error,
+            "batch.submit",
+            Some(context_for_job(
+                &base_context,
+                &job.job_id,
+                None,
+                Some(&job_file),
+            )),
+        )
+    })?;
+    job_store.create_unlocked(&job).map_err(|error| {
         failure(
             error,
             "batch.submit",
@@ -426,7 +455,7 @@ fn submit_prepared(
         )
     })?;
 
-    let upload_in_flight = transition(&job_file, |job| {
+    let upload_in_flight = transition_store(&job_store, |job| {
         job.state = JobState::UploadInFlight;
         Ok(())
     })
@@ -442,12 +471,38 @@ fn submit_prepared(
             )),
         )
     })?;
+    let upload_claim = job_store
+        .claim(upload_in_flight.revision)
+        .map_err(|error| {
+            failure(
+                error,
+                "batch.submit",
+                Some(context_for_job(
+                    &base_context,
+                    &job_id,
+                    None,
+                    Some(&job_file),
+                )),
+            )
+        })?;
     base_context.attempted = true;
+    job_store.verify_claim(upload_claim).map_err(|error| {
+        failure(
+            error,
+            "batch.submit",
+            Some(context_for_job(
+                &base_context,
+                &job_id,
+                None,
+                Some(&job_file),
+            )),
+        )
+    })?;
     let upload = match client.upload_batch_input(&endpoint, &api_key, input) {
         Ok(response) => response,
         Err(error) => {
-            let error = mark_unknown(
-                &job_file,
+            let error = mark_unknown_store(
+                &job_store,
                 upload_in_flight.revision,
                 JobState::UploadOutcomeUnknown,
                 error,
@@ -473,8 +528,8 @@ fn submit_prepared(
             );
             response_error.set_http_status(upload.status);
             response_error.set_request_id(upload.request_id.clone());
-            let error = mark_unknown(
-                &job_file,
+            let error = mark_unknown_store(
+                &job_store,
                 upload_in_flight.revision,
                 JobState::UploadOutcomeUnknown,
                 response_error,
@@ -491,32 +546,71 @@ fn submit_prepared(
             ));
         }
     };
-    let input_uploaded = transition_if_revision(&job_file, upload_in_flight.revision, |job| {
-        job.state = JobState::InputUploaded;
-        job.input_file_id = Some(file_info.id.clone());
-        Ok(())
-    })
-    .map_err(|error| {
-        let mut recovery_error = state_persistence_error("input upload", &file_info.id, error);
-        recovery_error.set_http_status(upload.status);
-        recovery_error.set_request_id(upload.request_id.clone());
-        failure(
-            recovery_error,
-            "batch.submit",
-            Some(context_for_input_job(
-                &base_context,
-                &job_id,
-                &file_info.id,
-                None,
-                Some(&job_file),
-            )),
-        )
-    })?;
-    let create_in_flight = transition_if_revision(&job_file, input_uploaded.revision, |job| {
-        job.state = JobState::CreateInFlight;
-        Ok(())
-    })
-    .map_err(|error| {
+    let input_uploaded =
+        transition_if_revision_store(&job_store, upload_in_flight.revision, |job| {
+            job.state = JobState::InputUploaded;
+            job.input_file_id = Some(file_info.id.clone());
+            Ok(())
+        })
+        .map_err(|error| {
+            let mut recovery_error = state_persistence_error("input upload", &file_info.id, error);
+            recovery_error.set_http_status(upload.status);
+            recovery_error.set_request_id(upload.request_id.clone());
+            failure(
+                recovery_error,
+                "batch.submit",
+                Some(context_for_input_job(
+                    &base_context,
+                    &job_id,
+                    &file_info.id,
+                    None,
+                    Some(&job_file),
+                )),
+            )
+        })?;
+    let create_in_flight =
+        transition_if_revision_store(&job_store, input_uploaded.revision, |job| {
+            job.state = JobState::CreateInFlight;
+            Ok(())
+        })
+        .map_err(|error| {
+            failure(
+                error,
+                "batch.submit",
+                Some(context_for_input_job(
+                    &base_context,
+                    &job_id,
+                    &file_info.id,
+                    None,
+                    Some(&job_file),
+                )),
+            )
+        })?;
+    let create_claim = job_store
+        .claim(create_in_flight.revision)
+        .map_err(|error| {
+            failure(
+                error,
+                "batch.submit",
+                Some(context_for_input_job(
+                    &base_context,
+                    &job_id,
+                    &file_info.id,
+                    None,
+                    Some(&job_file),
+                )),
+            )
+        })?;
+    let create_request = BatchCreateRequest {
+        input_file_id: &file_info.id,
+        endpoint: "/v1/images/generations",
+        completion_window: "24h",
+        output_expires_after: OutputExpiresAfter {
+            anchor: "created_at",
+            seconds: DEFAULT_OUTPUT_EXPIRY_SECONDS,
+        },
+    };
+    job_store.verify_claim(create_claim).map_err(|error| {
         failure(
             error,
             "batch.submit",
@@ -529,20 +623,11 @@ fn submit_prepared(
             )),
         )
     })?;
-    let create_request = BatchCreateRequest {
-        input_file_id: &file_info.id,
-        endpoint: "/v1/images/generations",
-        completion_window: "24h",
-        output_expires_after: OutputExpiresAfter {
-            anchor: "created_at",
-            seconds: DEFAULT_OUTPUT_EXPIRY_SECONDS,
-        },
-    };
     let created = match client.create_batch(&endpoint, &api_key, &create_request) {
         Ok(response) => response,
         Err(error) => {
-            let error = mark_unknown(
-                &job_file,
+            let error = mark_unknown_store(
+                &job_store,
                 create_in_flight.revision,
                 JobState::CreateOutcomeUnknown,
                 error,
@@ -567,8 +652,8 @@ fn submit_prepared(
                 let mut error = error;
                 error.set_http_status(created.status);
                 error.set_request_id(created.request_id.clone());
-                let error = mark_unknown(
-                    &job_file,
+                let error = mark_unknown_store(
+                    &job_store,
                     create_in_flight.revision,
                     JobState::CreateOutcomeUnknown,
                     error,
@@ -586,7 +671,7 @@ fn submit_prepared(
                 ));
             }
         };
-    job = transition_if_revision(&job_file, create_in_flight.revision, |job| {
+    job = transition_if_revision_store(&job_store, create_in_flight.revision, |job| {
         job.state = state_for_remote_status(&batch_info.status);
         job.batch_id = Some(batch_info.id.clone());
         job.remote_status = Some(batch_info.status.clone());
@@ -844,6 +929,11 @@ fn create_batch_from_job(
     mut job: BatchJob,
 ) -> Result<BatchReport, BatchFailure> {
     let mut context = context_from_job("batch.recover", job_file, &job);
+    let job_store =
+        JobStore::open(job_file).map_err(|error| BatchFailure::new(error, context.clone()))?;
+    let _job_lock = job_store
+        .lock()
+        .map_err(|error| BatchFailure::new(error, context.clone()))?;
     ensure_billable_platform().map_err(|error| BatchFailure::new(error, context.clone()))?;
     let input_file_id = job.input_file_id.clone().ok_or_else(|| {
         BatchFailure::new(
@@ -858,11 +948,14 @@ fn create_batch_from_job(
     let key = api_key().map_err(|error| BatchFailure::new(error, context.clone()))?;
     let client = ApiClient::new(args.timeout_seconds)
         .map_err(|error| BatchFailure::new(error, context.clone()))?;
-    let create_in_flight = transition_if_revision(job_file, job.revision, |job| {
+    let create_in_flight = transition_if_revision_store(&job_store, job.revision, |job| {
         job.state = JobState::CreateInFlight;
         Ok(())
     })
     .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    let create_claim = job_store
+        .claim(create_in_flight.revision)
+        .map_err(|error| BatchFailure::new(error, context.clone()))?;
     let request = BatchCreateRequest {
         input_file_id: &input_file_id,
         endpoint: "/v1/images/generations",
@@ -873,11 +966,14 @@ fn create_batch_from_job(
         },
     };
     context.attempted = true;
+    job_store
+        .verify_claim(create_claim)
+        .map_err(|error| BatchFailure::new(error, context.clone()))?;
     let response = match client.create_batch(&endpoint, &key, &request) {
         Ok(response) => response,
         Err(error) => {
-            let error = mark_unknown(
-                job_file,
+            let error = mark_unknown_store(
+                &job_store,
                 create_in_flight.revision,
                 JobState::CreateOutcomeUnknown,
                 error,
@@ -891,8 +987,8 @@ fn create_batch_from_job(
             let mut error = error;
             error.set_http_status(response.status);
             error.set_request_id(response.request_id.clone());
-            let error = mark_unknown(
-                job_file,
+            let error = mark_unknown_store(
+                &job_store,
                 create_in_flight.revision,
                 JobState::CreateOutcomeUnknown,
                 error,
@@ -900,8 +996,8 @@ fn create_batch_from_job(
             return Err(BatchFailure::new(error, context));
         }
     };
-    job = persist_batch_observation(
-        job_file,
+    job = persist_batch_observation_store(
+        &job_store,
         &create_in_flight,
         &info,
         response.status,
@@ -932,7 +1028,23 @@ fn persist_batch_observation(
     request_id: Option<String>,
     context: &BatchContext,
 ) -> Result<BatchJob, BatchFailure> {
-    transition_if_revision(job_file, job.revision, |job| {
+    let store = JobStore::open(job_file)
+        .map_err(|error| failure(error, "batch.persist", Some(context.clone())))?;
+    let _lock = store
+        .lock()
+        .map_err(|error| failure(error, "batch.persist", Some(context.clone())))?;
+    persist_batch_observation_store(&store, job, info, http_status, request_id, context)
+}
+
+fn persist_batch_observation_store(
+    store: &JobStore,
+    job: &BatchJob,
+    info: &BatchInfo,
+    http_status: u16,
+    request_id: Option<String>,
+    context: &BatchContext,
+) -> Result<BatchJob, BatchFailure> {
+    transition_if_revision_store(store, job.revision, |job| {
         job.state = state_for_remote_status(&info.status);
         job.batch_id = Some(info.id.clone());
         job.remote_status = Some(info.status.clone());
@@ -1415,11 +1527,7 @@ fn publish_batch_content(
         attach_response_metadata(&mut failure, http_status, request_id.as_deref());
         failure
     })?;
-    let selected_images = selected_indices
-        .iter()
-        .map(|index| images[*index].clone())
-        .collect::<Vec<_>>();
-    if let Err(mut error) = transaction.stage_all(&selected_images) {
+    if let Err(mut error) = transaction.stage_selected(&selected_indices, &images) {
         error.add_possibly_modified_paths(transaction.abort());
         error.set_http_status(http_status);
         error.set_request_id(request_id.clone());
@@ -2433,11 +2541,11 @@ fn load_job(
     Ok((path, job))
 }
 
-fn transition<F>(path: &Path, update: F) -> Result<BatchJob, AppError>
+fn transition_store<F>(store: &JobStore, update: F) -> Result<BatchJob, AppError>
 where
     F: FnOnce(&mut BatchJob) -> Result<(), AppError>,
 {
-    JobStore::update(path, update)
+    store.update_unlocked(None, update)
 }
 
 fn transition_if_revision<F>(
@@ -2451,6 +2559,17 @@ where
     JobStore::update_if_revision(path, Some(expected_revision), update)
 }
 
+fn transition_if_revision_store<F>(
+    store: &JobStore,
+    expected_revision: u64,
+    update: F,
+) -> Result<BatchJob, AppError>
+where
+    F: FnOnce(&mut BatchJob) -> Result<(), AppError>,
+{
+    store.update_unlocked(Some(expected_revision), update)
+}
+
 fn mark_unknown(
     path: &Path,
     expected_revision: u64,
@@ -2458,6 +2577,25 @@ fn mark_unknown(
     mut error: AppError,
 ) -> AppError {
     if let Err(state_error) = transition_if_revision(path, expected_revision, |job| {
+        job.state = state;
+        Ok(())
+    }) {
+        error.message = format!(
+            "{} The remote operation outcome remains unknown and the local job state could not be persisted: {}",
+            error.message, state_error.message
+        );
+        error.automatic_retry_safe = false;
+    }
+    error
+}
+
+fn mark_unknown_store(
+    store: &JobStore,
+    expected_revision: u64,
+    state: JobState,
+    mut error: AppError,
+) -> AppError {
+    if let Err(state_error) = transition_if_revision_store(store, expected_revision, |job| {
         job.state = state;
         Ok(())
     }) {
@@ -2640,20 +2778,16 @@ fn sha256(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-struct JobStore;
+#[derive(Debug, Clone, Copy)]
+struct JobClaim {
+    revision: u64,
+    identity: Option<OutputIdentity>,
+}
 
-fn validate_job_link(path: &Path) -> Result<(), AppError> {
-    #[cfg(unix)]
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|metadata| metadata.is_file() && metadata.nlink() != 1)
-    {
-        return Err(AppError::preflight(
-            "job_file_hard_linked",
-            "The Batch job file must have exactly one filesystem link; use the original path rather than an alias.",
-        ));
-    }
-    Ok(())
+struct JobStore {
+    path: PathBuf,
+    parent: File,
+    lock_path: PathBuf,
 }
 
 fn validate_job_path(path: &Path, job: &BatchJob) -> Result<(), AppError> {
@@ -2669,7 +2803,7 @@ fn validate_job_path(path: &Path, job: &BatchJob) -> Result<(), AppError> {
             "The Batch job belongs to a different job-file path; use the original path.",
         ));
     }
-    validate_job_link(path)
+    Ok(())
 }
 
 fn validate_job(job: &BatchJob) -> Result<(), AppError> {
@@ -3019,37 +3153,121 @@ impl JobStore {
         Ok(path)
     }
 
-    fn create(path: &Path, job: &BatchJob) -> Result<(), AppError> {
-        validate_job(job)?;
+    fn open(path: &Path) -> Result<Self, AppError> {
         ensure_parent(path)?;
-        let _lock = Self::lock(path)?;
-        if path.exists() {
+        let parent = path.parent().ok_or_else(|| {
+            AppError::preflight(
+                "job_path_invalid",
+                "The Batch job path has no parent directory.",
+            )
+        })?;
+        validate_no_symlink_components(parent)?;
+        let parent = open_pinned_directory(parent).map_err(|_| {
+            AppError::preflight(
+                "job_directory_unavailable",
+                "The Batch job parent directory could not be pinned safely.",
+            )
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            AppError::preflight("job_path_invalid", "The Batch job path has no filename.")
+        })?;
+        let lock_path = path.with_file_name(format!(".{}.lock", file_name.to_string_lossy()));
+        Ok(Self {
+            path: path.to_owned(),
+            parent,
+            lock_path,
+        })
+    }
+
+    fn verify_parent(&self) -> Result<(), AppError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            AppError::preflight(
+                "job_path_invalid",
+                "The Batch job path has no parent directory.",
+            )
+        })?;
+        let current = open_pinned_directory(parent).map_err(|_| {
+            AppError::preflight(
+                "job_directory_changed",
+                "The Batch job parent directory could not be revalidated safely.",
+            )
+        })?;
+        if !pinned_directory_matches(&self.parent, &current) {
+            return Err(AppError::preflight(
+                "job_directory_changed",
+                "The Batch job parent directory changed during execution; inspect the durable job before resuming.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn create_unlocked(&self, job: &BatchJob) -> Result<(), AppError> {
+        validate_job(job)?;
+        self.verify_parent()?;
+        if pinned_path_exists(&self.parent, &self.path).map_err(|_| {
+            AppError::preflight(
+                "job_file_unavailable",
+                "The requested job file could not be inspected safely.",
+            )
+        })? {
             return Err(AppError::preflight(
                 "job_file_exists",
                 "The requested job file already exists; refusing to replace an existing Batch record.",
             ));
         }
-        validate_job_path(path, job)?;
-        write_atomic(path, job, true)
+        validate_job_path(&self.path, job)?;
+        self.write_atomic(job, true)
     }
 
     fn load(path: &Path) -> Result<BatchJob, AppError> {
-        let _lock = Self::lock(path)?;
-        Self::load_unlocked(path)
+        let store = Self::open(path)?;
+        let _lock = store.lock()?;
+        store.load_unlocked()
     }
 
-    fn load_unlocked(path: &Path) -> Result<BatchJob, AppError> {
-        validate_job_link(path)?;
-        let bytes = read_regular_file(path, MAX_JOB_FILE_BYTES).map_err(|error| {
+    fn load_unlocked(&self) -> Result<BatchJob, AppError> {
+        self.verify_parent()?;
+        let mut file = open_pinned_asset_file(&self.parent, &self.path).map_err(|_| {
             AppError::preflight(
-                if error.code == "publishing_output_too_large" {
-                    "job_file_too_large"
-                } else {
-                    "job_file_unreadable"
-                },
+                "job_file_unreadable",
                 "The Batch job record could not be read safely.",
             )
         })?;
+        let metadata = file.metadata().map_err(|_| {
+            AppError::preflight(
+                "job_file_unreadable",
+                "The Batch job record could not be inspected safely.",
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() > MAX_JOB_FILE_BYTES as u64 {
+            return Err(AppError::preflight(
+                "job_file_too_large",
+                "The Batch job record could not be read safely.",
+            ));
+        }
+        #[cfg(unix)]
+        if metadata.nlink() != 1 {
+            return Err(AppError::preflight(
+                "job_file_hard_linked",
+                "The Batch job file must have exactly one filesystem link; use the original path rather than an alias.",
+            ));
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((MAX_JOB_FILE_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| {
+                AppError::preflight(
+                    "job_file_unreadable",
+                    "The Batch job record could not be read safely.",
+                )
+            })?;
+        if bytes.len() > MAX_JOB_FILE_BYTES {
+            return Err(AppError::preflight(
+                "job_file_too_large",
+                "The Batch job record could not be read safely.",
+            ));
+        }
         let job: BatchJob = serde_json::from_slice(&bytes).map_err(|_| {
             AppError::preflight(
                 "job_file_invalid",
@@ -3062,16 +3280,72 @@ impl JobStore {
                 "The Batch job record uses an unsupported schema version.",
             ));
         }
-        validate_job_path(path, &job)?;
+        validate_job_path(&self.path, &job)?;
         validate_job(&job)?;
         Ok(job)
     }
 
-    fn update<F>(path: &Path, update: F) -> Result<BatchJob, AppError>
-    where
-        F: FnOnce(&mut BatchJob) -> Result<(), AppError>,
-    {
-        Self::update_if_revision(path, None, update)
+    fn claim(&self, revision: u64) -> Result<JobClaim, AppError> {
+        let job = self.load_unlocked()?;
+        if job.revision != revision {
+            return Err(AppError::preflight(
+                "job_changed_concurrently",
+                "The Batch job changed before its remote request; inspect the current state before retrying.",
+            ));
+        }
+        Ok(JobClaim {
+            revision,
+            identity: self.identity_unlocked()?,
+        })
+    }
+
+    fn verify_claim(&self, claim: JobClaim) -> Result<(), AppError> {
+        let job = self.load_unlocked()?;
+        if job.revision != claim.revision || self.identity_unlocked()? != claim.identity {
+            return Err(AppError::preflight(
+                "job_changed_concurrently",
+                "The Batch job changed before its remote request; inspect the current state before retrying.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn identity_unlocked(&self) -> Result<Option<OutputIdentity>, AppError> {
+        let file = open_pinned_asset_file(&self.parent, &self.path).map_err(|_| {
+            AppError::preflight(
+                "job_file_unreadable",
+                "The Batch job record could not be opened safely before its remote request.",
+            )
+        })?;
+        let metadata = file.metadata().map_err(|_| {
+            AppError::preflight(
+                "job_file_unreadable",
+                "The Batch job record could not be inspected safely before its remote request.",
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(AppError::preflight(
+                "job_file_invalid",
+                "The Batch job record must be a regular file.",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            if metadata.nlink() != 1 {
+                return Err(AppError::preflight(
+                    "job_file_hard_linked",
+                    "The Batch job file must have exactly one filesystem link; use the original path rather than an alias.",
+                ));
+            }
+            Ok(Some(OutputIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
     }
 
     fn update_if_revision<F>(
@@ -3082,8 +3356,21 @@ impl JobStore {
     where
         F: FnOnce(&mut BatchJob) -> Result<(), AppError>,
     {
-        let _lock = Self::lock(path)?;
-        let mut job = Self::load_unlocked(path)?;
+        let store = Self::open(path)?;
+        let _lock = store.lock()?;
+        store.update_unlocked(expected_revision, update)
+    }
+
+    fn update_unlocked<F>(
+        &self,
+        expected_revision: Option<u64>,
+        update: F,
+    ) -> Result<BatchJob, AppError>
+    where
+        F: FnOnce(&mut BatchJob) -> Result<(), AppError>,
+    {
+        self.verify_parent()?;
+        let mut job = self.load_unlocked()?;
         if expected_revision.is_some_and(|expected| expected != job.revision) {
             return Err(AppError::preflight(
                 "job_changed_concurrently",
@@ -3099,23 +3386,16 @@ impl JobStore {
         })?;
         job.updated_at = now_seconds();
         validate_job(&job)?;
-        write_atomic(path, &job, false)?;
+        self.write_atomic(&job, false)?;
         Ok(job)
     }
 
-    fn lock(path: &Path) -> Result<File, AppError> {
-        ensure_parent(path)?;
-        let parent = path.parent().ok_or_else(|| {
+    fn lock(&self) -> Result<File, AppError> {
+        self.verify_parent()?;
+        let lock = open_pinned_lock_file(&self.parent, &self.lock_path).map_err(|_| {
             AppError::preflight(
                 "job_lock_unavailable",
-                "The Batch job directory could not be resolved for locking.",
-            )
-        })?;
-        validate_no_symlink_components(parent)?;
-        let lock = File::open(parent).map_err(|_| {
-            AppError::preflight(
-                "job_lock_unavailable",
-                "Another Batch operation is updating this job; retry after it exits.",
+                "The Batch job lock file could not be opened safely.",
             )
         })?;
         lock.lock_exclusive().map_err(|_| {
@@ -3125,6 +3405,56 @@ impl JobStore {
             )
         })?;
         Ok(lock)
+    }
+
+    fn write_atomic(&self, value: &BatchJob, no_clobber: bool) -> Result<(), AppError> {
+        self.verify_parent()?;
+        validate_job_path(&self.path, value)?;
+        let bytes = serde_json::to_vec_pretty(value).map_err(|_| {
+            AppError::preflight(
+                "job_write_failed",
+                "The Batch job record could not be serialized safely.",
+            )
+        })?;
+        let file_name = self.path.file_name().ok_or_else(|| {
+            AppError::preflight("job_path_invalid", "The Batch job path has no filename.")
+        })?;
+        let temporary = self.path.with_file_name(format!(
+            ".{}.tmp-{}",
+            file_name.to_string_lossy(),
+            new_job_id()
+        ));
+        let mut file = create_pinned_asset_temp(&self.parent, &temporary).map_err(|_| {
+            AppError::preflight(
+                "job_write_failed",
+                "The Batch job record could not be staged safely.",
+            )
+        })?;
+        file.write_all(&bytes).map_err(|_| {
+            AppError::preflight(
+                "job_write_failed",
+                "The Batch job record could not be written safely.",
+            )
+        })?;
+        file.sync_all().map_err(|_| {
+            AppError::preflight(
+                "job_write_failed",
+                "The Batch job record could not be synchronized safely.",
+            )
+        })?;
+        rename_pinned_asset_file_with_policy(&self.parent, &temporary, &self.path, no_clobber)
+            .map_err(|_| {
+                AppError::preflight(
+                    "job_write_failed",
+                    "The Batch job record could not be committed atomically.",
+                )
+            })?;
+        self.parent.sync_all().map_err(|_| {
+            AppError::preflight(
+                "job_directory_sync_failed",
+                "The Batch job directory could not be synchronized after the atomic update.",
+            )
+        })
     }
 }
 
@@ -3188,74 +3518,6 @@ fn validate_no_symlink_components(path: &Path) -> Result<(), AppError> {
             }
         }
     }
-    Ok(())
-}
-
-fn write_atomic(path: &Path, value: &BatchJob, no_clobber: bool) -> Result<(), AppError> {
-    validate_job_path(path, value)?;
-    let parent = path.parent().ok_or_else(|| {
-        AppError::preflight(
-            "job_path_invalid",
-            "The Batch job path has no parent directory.",
-        )
-    })?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| {
-        AppError::preflight(
-            "job_write_failed",
-            "The Batch job record could not be staged safely.",
-        )
-    })?;
-    let bytes = serde_json::to_vec_pretty(value).map_err(|_| {
-        AppError::preflight(
-            "job_write_failed",
-            "The Batch job record could not be serialized safely.",
-        )
-    })?;
-    temporary.write_all(&bytes).map_err(|_| {
-        AppError::preflight(
-            "job_write_failed",
-            "The Batch job record could not be written safely.",
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o600)).map_err(|_| {
-            AppError::preflight(
-                "job_write_failed",
-                "The Batch job record permissions could not be restricted.",
-            )
-        })?;
-    }
-    temporary.as_file().sync_all().map_err(|_| {
-        AppError::preflight(
-            "job_write_failed",
-            "The Batch job record could not be synchronized safely.",
-        )
-    })?;
-    let persist = if no_clobber {
-        temporary.persist_noclobber(path)
-    } else {
-        temporary.persist(path)
-    };
-    persist.map_err(|_| {
-        AppError::preflight(
-            "job_write_failed",
-            "The Batch job record could not be committed atomically.",
-        )
-    })?;
-    let directory = File::open(parent).map_err(|_| {
-        AppError::preflight(
-            "job_directory_sync_failed",
-            "The Batch job directory could not be opened for durability verification.",
-        )
-    })?;
-    directory.sync_all().map_err(|_| {
-        AppError::preflight(
-            "job_directory_sync_failed",
-            "The Batch job directory could not be synchronized after the atomic update.",
-        )
-    })?;
     Ok(())
 }
 
