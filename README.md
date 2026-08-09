@@ -86,7 +86,7 @@ codex-image generate \
   --prefix fox-terminal \
   --n 1 \
   --size 1536x1024 \
-  --quality medium \
+  --quality low \
   --dry-run \
   --json
 
@@ -98,7 +98,7 @@ codex-image generate \
   --prefix fox-terminal \
   --n 1 \
   --size 1536x1024 \
-  --quality medium \
+  --quality low \
   --json
 ```
 
@@ -190,10 +190,11 @@ Batch is an explicit API-only workflow. It accepts at most 8 image requests loca
 codex-image batch submit \
   --provider api \
   --prompt "A warm editorial illustration of a rust-orange fox using a terminal" \
-  --output-dir artifacts/design \
-  --prefix fox-batch \
-  --n 2 \
-  --job-file artifacts/design/fox-batch-job.json \
+   --output-dir artifacts/design \
+   --prefix fox-batch \
+   --n 2 \
+   --quality low \
+   --job-file artifacts/design/fox-batch-job.json \
   --json
 
 codex-image batch status \

@@ -651,6 +651,7 @@ fn generate_writes_a_valid_png_from_a_loopback_mock() {
     assert!(request.authorization_was_present);
     assert_eq!(request.request_json["model"], "gpt-image-2");
     assert_eq!(request.request_json["n"], 1);
+    assert_eq!(request.request_json["quality"], "low");
 }
 
 #[test]
@@ -1622,7 +1623,9 @@ fn batch_submit_status_and_retrieve_publish_in_order() {
     assert_eq!(requests.len(), 6);
     assert_eq!(requests[0].method, "POST");
     assert_eq!(requests[0].path, "/v1/files");
-    assert!(String::from_utf8_lossy(&requests[0].body).contains("purpose"));
+    let batch_input = String::from_utf8_lossy(&requests[0].body);
+    assert!(batch_input.contains("purpose"));
+    assert!(batch_input.contains("\"quality\":\"low\""));
     assert_eq!(requests[1].path, "/v1/batches");
     assert_eq!(requests[2].path, "/v1/batches/batch-test");
     assert_eq!(requests[3].path, "/v1/batches/batch-test");

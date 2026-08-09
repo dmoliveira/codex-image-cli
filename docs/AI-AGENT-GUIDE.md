@@ -32,7 +32,7 @@ codex-image generate \
   --prefix robot-garden \
   --n 1 \
   --format png \
-  --quality medium \
+  --quality low \
   --dry-run \
   --json
 
@@ -43,7 +43,7 @@ codex-image generate \
   --prefix robot-garden \
   --n 1 \
   --format png \
-  --quality medium \
+  --quality low \
   --json
 ```
 
@@ -56,6 +56,7 @@ codex-image batch submit \
   --output-dir artifacts/design \
   --prefix robot-garden \
   --n 2 \
+  --quality low \
   --job-file artifacts/design/robot-garden-job.json \
   --json
 

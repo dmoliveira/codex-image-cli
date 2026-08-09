@@ -387,10 +387,11 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         failure(
             recovery_error,
             "batch.submit",
-            Some(context_for_job(
+            Some(context_for_input_job(
                 &base_context,
                 &job_id,
-                Some(&file_info.id),
+                &file_info.id,
+                None,
                 Some(&job_file),
             )),
         )
@@ -403,9 +404,10 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         failure(
             error,
             "batch.submit",
-            Some(context_for_job(
+            Some(context_for_input_job(
                 &base_context,
                 &job_id,
+                &file_info.id,
                 None,
                 Some(&job_file),
             )),
@@ -432,10 +434,11 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
             return Err(failure(
                 error,
                 "batch.submit",
-                Some(context_for_job(
+                Some(context_for_input_job(
                     &base_context,
                     &job_id,
-                    Some(&file_info.id),
+                    &file_info.id,
+                    None,
                     Some(&job_file),
                 )),
             ));
@@ -457,10 +460,11 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
                 return Err(failure(
                     error,
                     "batch.submit",
-                    Some(context_for_job(
+                    Some(context_for_input_job(
                         &base_context,
                         &job_id,
-                        Some(&file_info.id),
+                        &file_info.id,
+                        None,
                         Some(&job_file),
                     )),
                 ));
@@ -485,10 +489,11 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         failure(
             recovery_error,
             "batch.submit",
-            Some(context_for_job(
+            Some(context_for_input_job(
                 &base_context,
                 &job_id,
-                Some(&file_info.id),
+                &file_info.id,
+                Some(&batch_info.id),
                 Some(&job_file),
             )),
         )
@@ -2066,11 +2071,7 @@ fn validate_batch_info(
         }
     }
     if let Some(counts) = &info.request_counts {
-        if counts.total != u32::from(expected_image_count)
-            || counts.completed > counts.total
-            || counts.failed > counts.total
-            || counts.completed.saturating_add(counts.failed) > counts.total
-        {
+        if !request_counts_are_valid(counts, expected_image_count, &info.status) {
             return Err(AppError::observation(
                 "batch_counts_invalid",
                 "The Batch endpoint returned inconsistent request counts; retrying the read-only operation is safe.",
@@ -2078,6 +2079,20 @@ fn validate_batch_info(
         }
     }
     Ok(())
+}
+
+fn request_counts_are_valid(
+    counts: &BatchRequestCounts,
+    expected_image_count: u8,
+    status: &str,
+) -> bool {
+    // OpenAI may return zero counts while it is still validating the input.
+    let zero_before_processing =
+        counts.total == 0 && counts.completed == 0 && counts.failed == 0 && status == "validating";
+    (zero_before_processing || counts.total == u32::from(expected_image_count))
+        && counts.completed <= counts.total
+        && counts.failed <= counts.total
+        && counts.completed.saturating_add(counts.failed) <= counts.total
 }
 
 fn validate_remote_transition(job: &BatchJob, info: &BatchInfo) -> Result<(), AppError> {
@@ -2331,6 +2346,18 @@ fn context_for_job(
     context
 }
 
+fn context_for_input_job(
+    base: &BatchContext,
+    job_id: &str,
+    input_file_id: &str,
+    batch_id: Option<&str>,
+    job_file: Option<&Path>,
+) -> BatchContext {
+    let mut context = context_for_job(base, job_id, batch_id, job_file);
+    context.input_file_id = Some(input_file_id.to_owned());
+    context
+}
+
 fn context_from_job(operation: &'static str, path: &Path, job: &BatchJob) -> BatchContext {
     BatchContext {
         operation,
@@ -2518,11 +2545,12 @@ fn validate_job(job: &BatchJob) -> Result<(), AppError> {
         }
     }
     if let Some(counts) = &job.request_counts {
-        if counts.total != u32::from(job.image_count)
-            || counts.completed > counts.total
-            || counts.failed > counts.total
-            || counts.completed.saturating_add(counts.failed) > counts.total
-        {
+        let counts = BatchRequestCounts::from(counts);
+        if !request_counts_are_valid(
+            &counts,
+            job.image_count,
+            job.remote_status.as_deref().unwrap_or_default(),
+        ) {
             return Err(invalid_job(
                 "The Batch job contains inconsistent request counts.",
             ));
@@ -3013,6 +3041,36 @@ mod tests {
         assert!(id
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '-'));
+    }
+
+    #[test]
+    fn accepts_zero_counts_while_batch_is_validating() {
+        let info = BatchInfo {
+            id: "batch-test".to_owned(),
+            status: "validating".to_owned(),
+            input_file_id: "file-input".to_owned(),
+            endpoint: Some("/v1/images/generations".to_owned()),
+            completion_window: Some("24h".to_owned()),
+            output_file_id: None,
+            error_file_id: None,
+            request_counts: Some(BatchRequestCounts {
+                completed: 0,
+                failed: 0,
+                total: 0,
+            }),
+        };
+        assert!(validate_batch_info(&info, None, Some("file-input"), 1).is_ok());
+
+        let mut processing = info.clone();
+        processing.status = "in_progress".to_owned();
+        assert!(validate_batch_info(&processing, None, Some("file-input"), 1).is_err());
+        for status in ["cancelling", "cancelled", "failed", "expired"] {
+            processing.status = status.to_owned();
+            assert!(
+                validate_batch_info(&processing, None, Some("file-input"), 1).is_err(),
+                "zero counts must not bypass validation for {status}"
+            );
+        }
     }
 
     #[test]

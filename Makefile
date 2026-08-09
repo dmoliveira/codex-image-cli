@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help fmt lint test build check install install-check update e2e docs-check
+.PHONY: help fmt lint test build check install install-check update e2e e2e-batch docs-check
 
 help: ## Show available development commands.
 	@awk 'BEGIN {FS = ":.*##"}; /^[a-zA-Z0-9_-]+:.*##/ {printf "\033[36m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -19,7 +19,7 @@ build: ## Build a release binary.
 
 docs-check: ## Check internal Markdown links and Python helper syntax.
 	python3 scripts/check_links.py
-	python3 -m py_compile scripts/mock_openai_image_api.py scripts/check_links.py
+	python3 -m py_compile scripts/mock_openai_image_api.py scripts/mock_openai_batch_api.py scripts/check_links.py
 
 check: ## Run formatting, linting, tests, docs checks, and release build.
 	cargo fmt --all -- --check
@@ -41,3 +41,6 @@ update: ## Update from a specific release; set VERSION=0.1.0 (or newer).
 
 e2e: ## Run the offline tmux fake-API end-to-end certification.
 	./scripts/e2e-local.sh
+
+e2e-batch: ## Run the offline tmux fake-Batch lifecycle certification.
+	./scripts/e2e-batch-local.sh
