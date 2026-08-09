@@ -1,22 +1,24 @@
 use std::{
-    fs::{self, File},
+    fs::File,
     io::Read,
     path::{Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::report::AppError;
 
 const MAX_PROMPT_FILE_BYTES: usize = 256 * 1024;
+pub const MAX_BATCH_IMAGES: u8 = 8;
+const MAX_REQUEST_FILE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "codex-image",
     version,
     about = "Generate OpenAI GPT Image 2 assets without interactive prompts.",
-    long_about = "A non-interactive, AI-friendly CLI for OpenAI GPT Image 2. It uses OPENAI_API_KEY; ChatGPT/Codex subscription logins are not reused."
+    long_about = "A non-interactive, AI-friendly CLI for GPT Image 2. It uses the Image API by default, or the authenticated Codex CLI with --provider codex."
 )]
 pub struct Cli {
     /// Emit exactly one machine-readable JSON object on stdout.
@@ -31,25 +33,139 @@ pub struct Cli {
 pub enum Command {
     /// Generate one or more images from a prompt.
     Generate(Box<GenerateArgs>),
+    /// Submit and recover asynchronous OpenAI Batch API image jobs.
+    Batch {
+        #[command(subcommand)]
+        command: BatchCommand,
+    },
     /// Check local configuration without sending a request or spending credits.
     Doctor,
     /// Print the non-interactive contract that AI agents can consume.
     AiHelp,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum BatchCommand {
+    /// Upload and submit a bounded image batch, persisting a recovery job.
+    Submit(Box<BatchSubmitArgs>),
+    /// Query one persisted Batch job once.
+    Status(BatchJobArgs),
+    /// Retrieve completed results, optionally polling with a bounded timeout.
+    Retrieve(BatchRetrieveArgs),
+    /// Request cancellation for one persisted Batch job.
+    Cancel(BatchCancelArgs),
+    /// Resume a safe local state or attach a manually reconciled remote ID.
+    Recover(Box<BatchRecoverArgs>),
+}
+
+#[derive(Debug, Args)]
+pub struct BatchSubmitArgs {
+    #[command(flatten)]
+    pub generation: GenerateArgs,
+
+    /// Exact local job record path. If omitted, use ~/.config/codex-image/jobs.
+    #[arg(long, value_name = "FILE")]
+    pub job_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct BatchJobArgs {
+    /// Persisted local Batch job record to inspect or update.
+    #[arg(long, value_name = "FILE")]
+    pub job_file: PathBuf,
+
+    /// Timeout for one HTTP operation, in seconds (1-300).
+    #[arg(long, default_value_t = 180, value_name = "SECONDS")]
+    pub timeout_seconds: u64,
+
+    /// Explicitly approve sending OPENAI_API_KEY to the persisted custom HTTPS origin.
+    #[arg(long, value_name = "ORIGIN")]
+    pub dangerously_allow_api_key_to: Option<String>,
+
+    /// Re-approve a persisted loopback HTTP endpoint for this operation.
+    #[arg(long)]
+    pub allow_insecure_localhost: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BatchRetrieveArgs {
+    #[command(flatten)]
+    pub job: BatchJobArgs,
+
+    /// Poll until a terminal remote state or the bounded maximum wait.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Maximum polling duration, in seconds (1-86400).
+    #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+    pub max_wait_seconds: u64,
+
+    /// Delay between status reads while --wait is active (1-3600 seconds).
+    #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+    pub poll_interval_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct BatchCancelArgs {
+    #[command(flatten)]
+    pub job: BatchJobArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct BatchRecoverArgs {
+    #[command(flatten)]
+    pub job: BatchJobArgs,
+
+    /// Confirmed remote input file ID after inspecting the account/files API.
+    #[arg(long, value_name = "FILE_ID", conflicts_with = "batch_id")]
+    pub input_file_id: Option<String>,
+
+    /// Confirmed remote Batch ID after inspecting the account/Batches API.
+    #[arg(long, value_name = "BATCH_ID", conflicts_with = "input_file_id")]
+    pub batch_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct GenerateArgs {
+    /// Versioned JSON file containing structured generation parameters.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "provider",
+            "prompt",
+            "prompt_file",
+            "n",
+            "format",
+            "size",
+            "quality",
+            "background",
+            "compression",
+            "moderation",
+            "timeout_seconds"
+        ]
+    )]
+    pub request_file: Option<PathBuf>,
+
+    /// Image backend. The direct Image API is the default; Codex is explicit.
+    #[arg(long, value_enum, default_value_t = Provider::Api)]
+    pub provider: Provider,
+
     /// Text prompt for the image. Mutually exclusive with --prompt-file.
     #[arg(
         long,
         value_name = "TEXT",
-        required_unless_present = "prompt_file",
-        conflicts_with = "prompt_file"
+        required_unless_present_any = ["prompt_file", "request_file"],
+        conflicts_with_all = ["prompt_file", "request_file"]
     )]
     pub prompt: Option<String>,
 
     /// UTF-8 file containing the prompt. The special path '-' is intentionally unsupported.
-    #[arg(long, value_name = "FILE", conflicts_with = "prompt")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["prompt", "request_file"]
+    )]
     pub prompt_file: Option<PathBuf>,
 
     /// Number of images to request in one API call (1-4).
@@ -76,9 +192,13 @@ pub struct GenerateArgs {
     #[arg(long, default_value = "auto", value_name = "SIZE")]
     pub size: String,
 
-    /// Render quality. `low` is useful for quick drafts; `high` can cost more.
-    #[arg(long, value_enum, default_value_t = Quality::Auto)]
+    /// Render quality. `low` is the cost-conscious default; `high` requires explicit confirmation.
+    #[arg(long, value_enum, default_value_t = Quality::Low)]
     pub quality: Quality,
+
+    /// Confirm the approximate cost and increased usage of high-quality generation.
+    #[arg(long)]
+    pub confirm_high_quality: bool,
 
     /// Background behavior. GPT Image 2 currently supports `auto` and `opaque` only.
     #[arg(long, value_enum, default_value_t = Background::Auto)]
@@ -117,12 +237,28 @@ pub struct GenerateArgs {
     pub allow_insecure_localhost: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     Png,
     Jpeg,
     Webp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Codex,
+    Api,
+}
+
+impl Provider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Api => "api",
+        }
+    }
 }
 
 impl OutputFormat {
@@ -139,7 +275,7 @@ impl OutputFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
     Auto,
@@ -159,7 +295,7 @@ impl Quality {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Background {
     Auto,
@@ -177,7 +313,7 @@ impl Background {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Moderation {
     Auto,
@@ -194,6 +330,65 @@ impl Moderation {
 }
 
 impl GenerateArgs {
+    pub fn resolve_request_file(&self) -> Result<Self, AppError> {
+        let Some(path) = &self.request_file else {
+            return Ok(self.clone());
+        };
+        if path.as_os_str() == "-" {
+            return Err(AppError::usage(
+                "request_file_stdin_not_supported",
+                "--request-file - is not supported because this CLI never waits for interactive stdin. Use a UTF-8 JSON file path instead.",
+            ));
+        }
+        let bytes = read_bounded_file(
+            path,
+            MAX_REQUEST_FILE_BYTES,
+            request_file_unreadable,
+            request_file_unreadable,
+        )?;
+        let request: RequestFile = serde_json::from_slice(&bytes).map_err(|_| {
+            AppError::usage(
+                "request_file_invalid_json",
+                "The request file is not valid UTF-8 JSON matching the documented schema.",
+            )
+        })?;
+        if request.schema_version != 1 {
+            return Err(AppError::usage(
+                "request_file_schema_unsupported",
+                "The request file schema_version must be 1.",
+            ));
+        }
+        let mut resolved = self.clone();
+        resolved.request_file = None;
+        resolved.prompt = Some(request.prompt);
+        resolved.prompt_file = None;
+        if let Some(provider) = request.provider {
+            resolved.provider = provider;
+        }
+        if let Some(n) = request.n {
+            resolved.n = n;
+        }
+        if let Some(format) = request.format {
+            resolved.format = format;
+        }
+        if let Some(size) = request.size {
+            resolved.size = size;
+        }
+        if let Some(quality) = request.quality {
+            resolved.quality = quality;
+        }
+        if let Some(background) = request.background {
+            resolved.background = background;
+        }
+        if let Some(compression) = request.compression {
+            resolved.compression = compression;
+        }
+        if let Some(moderation) = request.moderation {
+            resolved.moderation = moderation;
+        }
+        Ok(resolved)
+    }
+
     pub fn read_prompt(&self) -> Result<String, AppError> {
         let prompt = match (&self.prompt, &self.prompt_file) {
             (Some(prompt), None) => prompt.clone(),
@@ -217,6 +412,14 @@ impl GenerateArgs {
     }
 
     pub fn validate(&self, prompt: &str) -> Result<(), AppError> {
+        self.validate_with_limit(prompt, 4)
+    }
+
+    pub fn validate_batch(&self, prompt: &str) -> Result<(), AppError> {
+        self.validate_with_limit(prompt, MAX_BATCH_IMAGES)
+    }
+
+    fn validate_with_limit(&self, prompt: &str, image_limit: u8) -> Result<(), AppError> {
         if prompt.trim().is_empty() {
             return Err(AppError::usage(
                 "empty_prompt",
@@ -229,10 +432,10 @@ impl GenerateArgs {
                 "The prompt exceeds the local 32,000-character safety limit.",
             ));
         }
-        if !(1..=4).contains(&self.n) {
+        if !(1..=image_limit).contains(&self.n) {
             return Err(AppError::usage(
                 "invalid_image_count",
-                "--n must be between 1 and 4.",
+                format!("--n must be between 1 and {image_limit}."),
             ));
         }
         if self.name.is_some() && self.n != 1 {
@@ -269,45 +472,88 @@ impl GenerateArgs {
                 "gpt-image-2 does not currently support transparent backgrounds. Use --background auto or opaque.",
             ));
         }
+        if self.quality == Quality::High && !self.confirm_high_quality {
+            return Err(AppError::usage(
+                "high_quality_confirmation_required",
+                high_quality_confirmation_message(self.provider),
+            ));
+        }
         Ok(())
     }
 }
 
+fn high_quality_confirmation_message(provider: Provider) -> String {
+    let provider_note = match provider {
+        Provider::Api => {
+            "For a typical 1024x1024 image, the current approximate API estimate is about $0.277 on Standard or $0.138 through Batch."
+        }
+        Provider::Codex => {
+            "Codex subscription usage and limits are account-dependent; the CLI cannot verify a dollar estimate locally."
+        }
+    };
+    format!(
+        "--quality high requires --confirm-high-quality. {provider_note} Actual cost varies with resolution and image-output tokens."
+    )
+}
+
 fn read_prompt_file(path: &Path) -> Result<String, AppError> {
-    let metadata = fs::metadata(path).map_err(|_| {
-        AppError::usage(
-            "prompt_file_unreadable",
-            "The prompt file could not be read as UTF-8.",
-        )
-    })?;
-    if metadata.len() > MAX_PROMPT_FILE_BYTES as u64 {
-        return Err(prompt_file_too_large());
-    }
-    let mut file = File::open(path).map_err(|_| {
-        AppError::usage(
-            "prompt_file_unreadable",
-            "The prompt file could not be read as UTF-8.",
-        )
-    })?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
-        .take(MAX_PROMPT_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
+    let bytes = read_bounded_file(
+        path,
+        MAX_PROMPT_FILE_BYTES,
+        || {
             AppError::usage(
                 "prompt_file_unreadable",
                 "The prompt file could not be read as UTF-8.",
             )
-        })?;
-    if bytes.len() > MAX_PROMPT_FILE_BYTES {
-        return Err(prompt_file_too_large());
-    }
+        },
+        prompt_file_too_large,
+    )?;
     String::from_utf8(bytes).map_err(|_| {
         AppError::usage(
             "prompt_file_unreadable",
             "The prompt file could not be read as UTF-8.",
         )
     })
+}
+
+fn read_bounded_file(
+    path: &Path,
+    limit: usize,
+    error: fn() -> AppError,
+    too_large: fn() -> AppError,
+) -> Result<Vec<u8>, AppError> {
+    let mut file = File::open(path).map_err(|_| error())?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| error())?;
+    if bytes.len() > limit {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
+fn request_file_unreadable() -> AppError {
+    AppError::usage(
+        "request_file_unreadable",
+        "The request file could not be read as bounded UTF-8 JSON.",
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestFile {
+    schema_version: u8,
+    prompt: String,
+    provider: Option<Provider>,
+    n: Option<u8>,
+    format: Option<OutputFormat>,
+    size: Option<String>,
+    quality: Option<Quality>,
+    background: Option<Background>,
+    compression: Option<Option<u8>>,
+    moderation: Option<Moderation>,
 }
 
 fn prompt_file_too_large() -> AppError {
@@ -375,5 +621,12 @@ mod tests {
         std::fs::write(&path, vec![b'x'; MAX_PROMPT_FILE_BYTES + 1]).unwrap();
         let error = read_prompt_file(&path).unwrap_err();
         assert_eq!(error.code, "prompt_file_too_large");
+    }
+
+    #[test]
+    fn high_quality_requires_explicit_confirmation() {
+        let error = high_quality_confirmation_message(Provider::Api);
+        assert!(error.contains("$0.277"));
+        assert!(error.contains("--confirm-high-quality"));
     }
 }

@@ -18,16 +18,17 @@
 AI tools such as OpenCode need a small, predictable image command—not a browser flow or an interactive wizard. `codex-image` provides:
 
 - 🤖 **Agent-ready JSON** via `ai-help --json`, `doctor --json`, and `generate --json`
-- 🧾 **One explicit POST** per generation command; no automatic retry of billable image requests
+- 🧾 **One explicit generation operation** per command; no automatic retry of billable image requests
 - 📁 **Safe deterministic files** with collision protection, staged writes, and controlled `--overwrite`
-- 🔒 **Key-aware endpoint policy**: API keys only from `OPENAI_API_KEY`, no proxy, no redirect forwarding
+- 🔒 **Explicit providers**: direct Image API by default, authenticated Codex CLI via `--provider codex`
+- ⏳ **Durable Batch lifecycle**: submit, inspect, retrieve, and cancel bounded API jobs without hidden retries
 - 🧪 **Offline-friendly validation**: `--dry-run`, unit tests, fake-API integration tests, and a tmux E2E harness
 
 ## Important account reality ⚠️
 
-This tool uses the documented **OpenAI API** endpoint with `OPENAI_API_KEY` and the `gpt-image-2` model.
+The direct Image API is the default provider and reads `OPENAI_API_KEY` only from the environment. The explicit `--provider codex` path delegates to the locally authenticated Codex CLI and validates the resulting PNG before publishing it.
 
-**ChatGPT/Codex subscriptions and API billing are separate.** A subscription login is not a documented Image API credential, and this project will not scrape, replay, or repurpose browser/Codex credentials. API access can also require billing setup and [organization verification](https://help.openai.com/en/articles/10910291-api-organization-verification).
+ChatGPT/Codex subscriptions and API billing remain separate. API access can also require billing setup and [organization verification](https://help.openai.com/en/articles/10910291-api-organization-verification).
 
 ## Install from any terminal 🚀
 
@@ -74,7 +75,7 @@ Verify the published checksum from the release before installing artifacts direc
 ## Fast start ✨
 
 ```bash
-# 1. Local-only check: does not send a request or spend credits.
+# 1. Check local providers without generating an image.
 codex-image doctor --json
 
 # 2. Prepare an explicit output directory and validate the plan.
@@ -83,25 +84,27 @@ codex-image generate \
   --prompt "A warm editorial illustration of a rust-orange fox using a terminal" \
   --output-dir artifacts/design \
   --prefix fox-terminal \
-  --n 2 \
+  --n 1 \
   --size 1536x1024 \
   --quality medium \
   --dry-run \
   --json
 
-# 3. Send exactly one API request after the dry run looks right.
-OPENAI_API_KEY="${OPENAI_API_KEY:?set OPENAI_API_KEY first}" \
+# 3. Generate through the direct Image API after the dry run looks right.
 codex-image generate \
+  --provider api \
   --prompt "A warm editorial illustration of a rust-orange fox using a terminal" \
   --output-dir artifacts/design \
   --prefix fox-terminal \
-  --n 2 \
+  --n 1 \
   --size 1536x1024 \
   --quality medium \
   --json
 ```
 
-That writes `fox-terminal-01.png` and `fox-terminal-02.png` only after every response image has passed base64 and PNG-container validation.
+That writes `fox-terminal.png` after the generated PNG has passed container validation.
+
+The default API provider supports the documented Image API parameters. Use `--provider codex` for the explicit local subscription path; it currently supports one PNG per command. Use the Batch commands below for bounded asynchronous API jobs.
 
 ## For AI agents 🤖
 
@@ -116,7 +119,9 @@ Required facts for an agent:
 | Need | Safe action |
 | --- | --- |
 | Prompt | `--prompt TEXT` or `--prompt-file FILE` (UTF-8 file; `-`/stdin is refused) |
-| API key | Set `OPENAI_API_KEY` in the environment—never in flags or JSON |
+| Structured request | `--request-file FILE` with versioned JSON; exclusive with generation flags |
+| Provider | Omit `--provider` for the direct Image API; use `--provider codex` for the authenticated Codex CLI subscription |
+| Capabilities | `codex-image ai-help --json` returns supported, best-effort, and unsupported fields per provider |
 | Output directory | Create it first; it must be non-symlinked and already exist |
 | One output | `--name hero` with `--n 1` |
 | Several outputs | `--prefix hero --n 3` → `hero-01.png` … `hero-03.png` |
@@ -134,13 +139,14 @@ codex-image generate --prompt <TEXT> [OPTIONS]
 | Option | Default | Notes |
 | --- | --- | --- |
 | `--prompt TEXT` | required* | Prompt text. Use a UTF-8 `--prompt-file FILE` up to 256 KiB for long local prompts. |
+| `--request-file FILE` | — | Version 1 JSON generation request; cannot be combined with generation-setting flags. |
 | `--n COUNT` | `1` | 1–4 images in one request. |
 | `--output-dir DIR` | `.` | Existing, non-symlink directory. The CLI never creates it implicitly. |
 | `--name STEM` | — | Exact safe stem for one image only: `hero` → `hero.png`. |
 | `--prefix STEM` | `codex-image` | Safe stem for one/many images: `hero` + 3 → `hero-01.png` … |
 | `--format` | `png` | `png`, `jpeg`, or `webp`; response container is verified. |
 | `--size` | `auto` | `auto` or `WIDTHxHEIGHT` within documented GPT Image 2 constraints. |
-| `--quality` | `auto` | `auto`, `low`, `medium`, `high`. Lower quality helps rapid iteration. |
+| `--quality` | `low` | `low`, `medium`, `high`, or `auto`; `high` requires `--confirm-high-quality`. |
 | `--background` | `auto` | `auto` or `opaque`; GPT Image 2 currently rejects transparent output. |
 | `--compression` | — | 0–100 for JPEG/WebP only. |
 | `--moderation` | `auto` | `auto` or `low`, following the documented API option. |
@@ -150,6 +156,62 @@ codex-image generate --prompt <TEXT> [OPTIONS]
 | `--json` | off | Stable JSON schema on stdout; diagnostics are not mixed in. |
 
 `*` Exactly one of `--prompt` and `--prompt-file` is required.
+
+### Structured request file
+
+Use a request file when an agent already has typed parameters:
+
+```json
+{
+  "schema_version": 1,
+  "prompt": "A warm editorial illustration of a rust-orange fox using a terminal",
+  "provider": "codex",
+  "size": "1536x1024",
+  "quality": "medium"
+}
+```
+
+```bash
+codex-image generate \
+  --request-file request.json \
+  --output-dir artifacts/design \
+  --name fox-terminal \
+  --dry-run \
+  --json
+```
+
+The file cannot authorize overwrites, custom endpoints, API-key destinations, or insecure HTTP. Use CLI flags for those explicit trust decisions.
+
+### Batch lifecycle
+
+Batch is an explicit API-only workflow. It accepts at most 8 image requests locally, writes a durable job record, and never silently resubmits an upload or creation POST:
+
+```bash
+codex-image batch submit \
+  --provider api \
+  --prompt "A warm editorial illustration of a rust-orange fox using a terminal" \
+  --output-dir artifacts/design \
+  --prefix fox-batch \
+  --n 2 \
+  --job-file artifacts/design/fox-batch-job.json \
+  --json
+
+codex-image batch status \
+  --job-file artifacts/design/fox-batch-job.json \
+  --json
+
+codex-image batch retrieve \
+  --job-file artifacts/design/fox-batch-job.json \
+  --wait \
+  --max-wait-seconds 300 \
+  --json
+```
+
+Use `batch cancel --job-file FILE --json` when cancellation is appropriate. The job record contains remote IDs and recovery state but never stores the prompt, API key, or image data. Batch output is configured to expire after 30 days; retrieve results before expiry. Inspect `retained_artifacts` and `possibly_modified_paths` before any cleanup.
+
+For a custom endpoint, repeat its exact `--dangerously-allow-api-key-to ORIGIN` approval on each status/retrieve/cancel/recover command. For loopback test endpoints, repeat `--allow-insecure-localhost`; trust approvals are intentionally not taken from an editable job file.
+
+Use `batch recover --job-file FILE --json` for a job left in the safe `input_uploaded` state. For an unknown upload outcome, first inspect the remote Files API and pass `--input-file-id FILE_ID`; for an unknown create outcome, inspect the remote Batches API and pass `--batch-id BATCH_ID`. These explicit reconciliation flags never cause an automatic upload or duplicate creation.
 
 ### Endpoint overrides (advanced) 🔐
 
@@ -184,8 +246,11 @@ The CLI rejects non-loopback HTTP, embedded URL credentials, query/fragment URLs
 | 5 | `outcome_indeterminate` | Transport/redirect/5xx failure; the POST may have been processed. **Do not retry automatically.** |
 | 6 | `invalid_success_response` | A 2xx response could not safely produce files. **Do not retry automatically.** |
 | 7 | `output_commit_failed` | Valid returned data could not be completely published. **Do not retry automatically.** |
+| 8 | `batch_not_ready` | A Batch job is still processing or exceeded its bounded wait. Query it again later. |
+| 9 | `batch_observation_failed` | A read-only Batch status or output observation failed; retrying the observation is safe. |
+| 10 | `batch_failed` | A Batch reached a failed or expired terminal state, or its output expired; inspect its error/output file before deciding what to do next. |
 
-For codes 5–7, check API activity and inspect any `possibly_modified_paths` in JSON before deciding what to do next. Successful overwrites expose private backup paths in `retained_artifacts`; error paths retain only private transaction artifacts rather than performing unsafe pathname cleanup. See [the complete contract](docs/API-CONTRACT.md).
+For codes 5–7, check API activity and inspect any `possibly_modified_paths` in JSON before deciding what to do next. Successful overwrites expose private backup paths in `retained_artifacts`; error paths retain only private transaction artifacts rather than performing unsafe pathname cleanup. Batch submission and cancellation outcomes are also never automatically retried. See [the complete contract](docs/API-CONTRACT.md).
 
 ## Quality checks ✅
 

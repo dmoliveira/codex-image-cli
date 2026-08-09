@@ -6,6 +6,7 @@ use crate::report::AppError;
 
 #[derive(Debug, Clone)]
 pub struct Endpoint {
+    base: Url,
     url: Url,
 }
 
@@ -76,12 +77,64 @@ impl Endpoint {
                 "--api-base-url could not be joined with the image generation endpoint.",
             )
         })?;
-        Ok(Self { url })
+        Ok(Self { base, url })
     }
 
     pub fn url(&self) -> &Url {
         &self.url
     }
+
+    pub fn files_url(&self) -> Result<Url, AppError> {
+        self.url_for("files")
+    }
+
+    pub fn batches_url(&self) -> Result<Url, AppError> {
+        self.url_for("batches")
+    }
+
+    pub fn batch_url(&self, batch_id: &str) -> Result<Url, AppError> {
+        validate_remote_id(batch_id, "batch_id")?;
+        self.url_for(&format!("batches/{batch_id}"))
+    }
+
+    pub fn batch_cancel_url(&self, batch_id: &str) -> Result<Url, AppError> {
+        validate_remote_id(batch_id, "batch_id")?;
+        self.url_for(&format!("batches/{batch_id}/cancel"))
+    }
+
+    pub fn file_content_url(&self, file_id: &str) -> Result<Url, AppError> {
+        validate_remote_id(file_id, "file_id")?;
+        self.url_for(&format!("files/{file_id}/content"))
+    }
+
+    pub fn file_url(&self, file_id: &str) -> Result<Url, AppError> {
+        validate_remote_id(file_id, "file_id")?;
+        self.url_for(&format!("files/{file_id}"))
+    }
+
+    fn url_for(&self, path: &str) -> Result<Url, AppError> {
+        self.base.join(path).map_err(|_| {
+            AppError::usage(
+                "invalid_api_base_url",
+                "The approved API base URL could not be joined with the requested endpoint.",
+            )
+        })
+    }
+}
+
+pub fn validate_remote_id(value: &str, name: &str) -> Result<(), AppError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err(AppError::usage(
+            "invalid_remote_id",
+            format!("{name} must be 1-128 ASCII letters, digits, '_' or '-'."),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_base_url(url: &Url) -> Result<(), AppError> {
@@ -154,6 +207,14 @@ mod tests {
             endpoint.url().as_str(),
             "https://api.openai.com/v1/images/generations"
         );
+        assert_eq!(
+            endpoint.files_url().unwrap().as_str(),
+            "https://api.openai.com/v1/files"
+        );
+        assert_eq!(
+            endpoint.batch_url("batch_123").unwrap().as_str(),
+            "https://api.openai.com/v1/batches/batch_123"
+        );
     }
 
     #[test]
@@ -189,5 +250,21 @@ mod tests {
         ] {
             assert!(Endpoint::authorize(url, None, false).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn rejects_remote_ids_that_could_escape_the_allowlisted_path() {
+        assert!(
+            Endpoint::authorize("https://api.openai.com/v1", None, false)
+                .unwrap()
+                .batch_url("../files")
+                .is_err()
+        );
+        assert!(
+            Endpoint::authorize("https://api.openai.com/v1", None, false)
+                .unwrap()
+                .file_content_url("file/id")
+                .is_err()
+        );
     }
 }

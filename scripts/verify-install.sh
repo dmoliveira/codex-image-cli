@@ -18,7 +18,7 @@ CARGO_INSTALL_ROOT="$INSTALL_ROOT" cargo install --path "$ROOT" --locked
   PATH="$INSTALL_ROOT/bin:$PATH" codex-image ai-help --json | python3 -c '
 import json, sys
 report = json.load(sys.stdin)
-assert report["schema_version"] == 1
+assert report["schema_version"] == 2
 assert report["non_interactive"] is True
 assert report["command"] == "codex-image generate"
 '
