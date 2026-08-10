@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Concise command, provider, JSON, exit-code, endpoint, and security reference for Codex Image CLI.">
+  <title>Reference | Codex Image CLI</title><link rel="canonical" href="https://dmoliveira.github.io/codex-image-cli/reference.html"><link rel="stylesheet" href="styles.css"><script>document.documentElement.classList.add("js");</script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><nav class="nav" aria-label="Main navigation"><a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">✦</span> Codex Image CLI</a><div class="nav-links"><a href="get-started.html">Get started</a><a href="guides.html">Guides</a><a href="reference.html" aria-current="page">Reference</a><a href="project.html">Project</a></div><button class="theme-button" type="button" data-theme-toggle aria-pressed="false">◐ Dark</button></nav></header>
+  <main id="main"><section class="page-hero"><div class="container"><p class="eyebrow">📐 Canonical behavior, quickly</p><h1>Reference without the maze.</h1><p>This is the fast map. The full JSON and security contract remains the source of truth in the repository.</p></div></section>
+  <section class="section"><div class="container prose">
+    <div class="callout"><span aria-hidden="true">📖</span><div><strong>Canonical documents</strong><p>For complete schemas and behavior, read the <a href="https://github.com/dmoliveira/codex-image-cli/blob/main/docs/API-CONTRACT.md">API contract ↗</a> and <a href="https://github.com/dmoliveira/codex-image-cli/blob/main/docs/AI-AGENT-GUIDE.md">AI-agent guide ↗</a>.</p></div></div>
+    <h2 id="commands">Command map</h2>
+    <div class="table-wrap"><table><thead><tr><th>Command</th><th>Use it for</th><th>Remember</th></tr></thead><tbody><tr><td><code>ai-help</code></td><td>Discover the stable machine contract.</td><td>Use <code>--json</code> for agents.</td></tr><tr><td><code>doctor</code></td><td>Check local key/Codex clues.</td><td>It does not prove entitlement or billing.</td></tr><tr><td><code>generate</code></td><td>One synchronous image operation.</td><td>Dry-run before the billable call.</td></tr><tr><td><code>batch submit/status/retrieve/cancel/recover</code></td><td>Durable asynchronous API jobs.</td><td>Keep the job file; never silently resubmit.</td></tr><tr><td><code>run plan/direct/batch</code></td><td>Bounded manifest workflows.</td><td>Approve the exact plan digest.</td></tr></tbody></table></div>
+    <h2 id="providers">Provider capabilities</h2>
+    <div class="grid-2"><article class="card"><span class="pill">api</span><h3>Direct Image API</h3><p>Default provider. Uses <code>OPENAI_API_KEY</code>. Supports GPT Image 2 parameters, Batch, and manifest Batch runs.</p></article><article class="card"><span class="pill">codex</span><h3>Local Codex CLI</h3><p>Explicit provider. Uses the authenticated local executable and currently publishes one validated PNG per command.</p></article></div>
+    <h2 id="exit-codes">Exit codes</h2>
+    <div class="table-wrap"><table><thead><tr><th>Code</th><th>Status</th><th>Safe behavior</th></tr></thead><tbody><tr><td><strong>0</strong></td><td>Success or dry run</td><td>Consume outputs or planned paths.</td></tr><tr><td><strong>2–4</strong></td><td>Usage, preflight, or API rejection</td><td>Fix the input/configuration; inspect the request ID.</td></tr><tr><td><strong>5</strong></td><td>Outcome indeterminate</td><td><strong>Do not retry.</strong> The POST may be billed.</td></tr><tr><td><strong>6</strong></td><td>Invalid success response</td><td><strong>Do not retry.</strong> Inspect remote state and paths.</td></tr><tr><td><strong>7</strong></td><td>Output commit failed</td><td><strong>Do not retry.</strong> Inspect retained/modified paths.</td></tr><tr><td><strong>8–10</strong></td><td>Batch observation/terminal state</td><td>Read-only status/retrieve actions are safe as documented.</td></tr></tbody></table></div>
+    <h2 id="security">Endpoint and security rules</h2>
+    <ul><li>Keys come only from <code>OPENAI_API_KEY</code>, never CLI flags or files.</li><li>Redirects and proxies are disabled; credentials never follow a redirect.</li><li>Loopback HTTP requires <code>--allow-insecure-localhost</code>.</li><li>Custom HTTPS requires exact repeated <code>--dangerously-allow-api-key-to ORIGIN</code> approval.</li><li>Output directories must already exist and contain no symlinked components.</li></ul>
+    <p><a href="https://github.com/dmoliveira/codex-image-cli/blob/main/SECURITY.md">Read the security policy ↗</a></p>
+  </div></section></main>
+  <footer class="footer"><div class="container footer-inner"><p>Stable behavior belongs in the contract.</p><div class="link-row"><a href="get-started.html">Get started</a><a href="project.html">Project</a></div></div></footer><script src="script.js"></script>
+</body>
+</html>
