@@ -28,7 +28,8 @@ jobs:
       - name: Check docs and helper scripts
         run: |
           python3 scripts/check_links.py
-          python3 -m py_compile scripts/mock_openai_image_api.py scripts/check_links.py
+          python3 scripts/check_website.py
+          python3 -m py_compile scripts/mock_openai_image_api.py scripts/mock_openai_batch_api.py scripts/check_links.py scripts/check_website.py
       - name: Build release binary
         run: cargo +stable build --release --locked
       - name: Install and update smoke test

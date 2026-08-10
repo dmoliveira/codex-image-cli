@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Guides for Codex Image CLI terminal use, AI agents, Batch jobs, recovery, and large manifest runs.">
+  <title>Guides | Codex Image CLI</title><link rel="canonical" href="https://dmoliveira.github.io/codex-image-cli/guides.html"><link rel="stylesheet" href="styles.css"><script>document.documentElement.classList.add("js");</script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><nav class="nav" aria-label="Main navigation"><a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">✦</span> Codex Image CLI</a><div class="nav-links"><a href="get-started.html">Get started</a><a href="guides.html" aria-current="page">Guides</a><a href="reference.html">Reference</a><a href="project.html">Project</a></div><button class="theme-button" type="button" data-theme-toggle aria-pressed="false">◐ Dark</button></nav></header>
+  <main id="main"><section class="page-hero"><div class="container"><p class="eyebrow">🧭 Practical workflows</p><h1>Choose the workflow that fits the job.</h1><p>Fast synchronous generation for a few images. Durable Batch jobs for asynchronous work. Manifest runs when the list gets serious.</p></div></section>
+  <section class="section"><div class="container">
+    <div class="grid-3">
+      <article class="card accent"><span class="icon" aria-hidden="true">⌘</span><h3>One or two images</h3><p>Use <code>generate</code>. Dry-run, reserve safely, make one request, parse the report.</p><p><a href="get-started.html">Start here →</a></p></article>
+      <article class="card warning"><span class="icon" aria-hidden="true">⏳</span><h3>Asynchronous work</h3><p>Use <code>batch submit</code>, persist the job file, then status, retrieve, cancel, or recover.</p><p><a href="#batch">Read the Batch guide →</a></p></article>
+      <article class="card safe"><span class="icon" aria-hidden="true">🧭</span><h3>Large asset sets</h3><p>Use <code>run plan</code> and approve the exact digest before direct or Batch execution.</p><p><a href="#runs">Read the run guide →</a></p></article>
+    </div>
+
+    <section id="agents" class="section compact grid-2">
+      <div><p class="eyebrow" style="color: var(--cyan);">🤖 For AI agents</p><h2>A machine contract, not a conversation.</h2><p class="lede">The CLI has no interactive mode. Discover capabilities, validate locally, make one operation, and parse the JSON report.</p><a href="https://github.com/dmoliveira/codex-image-cli/blob/main/docs/AI-AGENT-GUIDE.md">Read the full agent guide ↗</a></div>
+      <div class="card"><div class="steps"><div class="step"><div><h3>Discover</h3><p><code>ai-help --json</code> describes the stable command contract.</p></div></div><div class="step"><div><h3>Check</h3><p><code>doctor --json</code> checks local provider clues without generating.</p></div></div><div class="step"><div><h3>Validate</h3><p>Add <code>--dry-run --json</code>; no key, reservation, DNS, or HTTP.</p></div></div><div class="step"><div><h3>Interpret</h3><p>Never retry 5–7 automatically. Surface request IDs and path lists.</p></div></div></div></div>
+    </section>
+
+    <section id="batch" class="section compact">
+      <div class="section-head"><p class="eyebrow" style="color: var(--cyan);">⏳ Batch lifecycle</p><h2>Persist the job. Observe the state.</h2><p>Batch is API-only and locally bounded to eight image requests. Its job file contains recovery state and remote IDs, never prompts, keys, or image bytes.</p></div>
+      <div class="callout"><span aria-hidden="true">📁</span><div><strong>Prepare the output directory</strong><p>The CLI never creates it implicitly: <code>mkdir -p artifacts/design</code></p></div></div>
+      <div class="grid-2"><div class="card"><h3>Validate, then submit once</h3><pre><code>codex-image batch submit \
+  --provider api \
+  --prompt "A luminous rust fox" \
+  --output-dir artifacts/design \
+  --prefix fox-batch --n 2 \
+  --job-file artifacts/design/fox-job.json \
+  --dry-run --json</code></pre><p>When the plan is correct, remove only <code>--dry-run</code> and submit once. Keep the returned job file; an unknown POST is not permission to submit again.</p></div><div class="card"><h3>Read, retrieve, or recover</h3><pre><code>codex-image batch status \
+  --job-file artifacts/design/fox-job.json --json
+
+codex-image batch retrieve \
+  --job-file artifacts/design/fox-job.json \
+  --wait --max-wait-seconds 300 --json</code></pre><p>For unknown outcomes, use explicit <code>batch recover</code> only after read-only remote reconciliation.</p></div></div>
+    </section>
+
+    <section id="runs" class="section compact">
+      <div class="section-head"><p class="eyebrow" style="color: var(--cyan);">🧭 Large runs</p><h2>Plan first. Approve the exact digest.</h2><p>Manifest runs make a large set inspectable before billable execution. The run file records paths, IDs, shard state, and plan digest, never prompt bodies.</p></div>
+      <div class="callout"><span aria-hidden="true">📁</span><div><strong>Prepare the output directory</strong><p><code>mkdir -p artifacts/design</code> before planning or executing.</p></div></div>
+      <div class="card"><pre><code>codex-image run plan \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --mode batch --parallelism 8 --json
+
+codex-image run batch \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --run-file artifacts/design/run.json \
+  --approve-plan PLAN_SHA256 \
+  --shard-size 8 --wait --json</code></pre><p>Do not edit the manifest or run file after approval. Resume durable state; never resubmit assets marked in-flight or outcome-unknown.</p></div>
+    </section>
+
+    <section class="section compact" aria-labelledby="decision-title"><div class="section-head"><p class="eyebrow" style="color: var(--cyan);">When something goes wrong</p><h2 id="decision-title">Read first. Retry second.</h2></div><div class="callout danger"><span aria-hidden="true">🧭</span><div><strong>Use the exit-code map</strong><p>Codes 5–7 can follow a billable POST and are never automatic-retry safe. Codes 8–10 describe read-only Batch observation or terminal state. <a href="reference.html#exit-codes">See the concise exit-code reference →</a></p></div></div></section>
+  </div></section></main>
+  <footer class="footer"><div class="container footer-inner"><p>Durable state makes the next action explicit.</p><div class="link-row"><a href="reference.html">Reference</a><a href="project.html">Project</a></div></div></footer><script src="script.js"></script>
+</body>
+</html>
