@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Install Codex Image CLI and make a safe, validated first image generation.">
+  <title>Get started | Codex Image CLI</title>
+  <link rel="canonical" href="https://dmoliveira.github.io/codex-image-cli/get-started.html">
+  <link rel="stylesheet" href="styles.css">
+  <script>document.documentElement.classList.add("js");</script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><nav class="nav" aria-label="Main navigation"><a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">✦</span> Codex Image CLI</a><div class="nav-links"><a href="get-started.html" aria-current="page">Get started</a><a href="guides.html">Guides</a><a href="reference.html">Reference</a><a href="project.html">Project</a></div><button class="theme-button" type="button" data-theme-toggle aria-pressed="false">◐ Dark</button></nav></header>
+  <main id="main"><section class="page-hero"><div class="container"><p class="eyebrow">🚀 Five calm steps</p><h1>Get from zero to a verified PNG.</h1><p>Install deliberately, inspect your provider, dry-run the plan, then make one explicit request.</p></div></section>
+  <section class="section"><div class="container grid-2">
+    <div class="prose">
+      <div class="callout danger"><span aria-hidden="true">⚠️</span><div><strong>Before you begin</strong><p>API calls can be billable. Never put an API key in flags, prompts, files, URLs, or logs. Never auto-retry exit codes 5, 6, or 7.</p></div></div>
+      <h2 id="install">1. Install</h2>
+      <p>For a tagged release, build from the named source tag:</p>
+      <pre><code>cargo install --git https://github.com/dmoliveira/codex-image-cli.git \
+  --tag v0.1.0 --locked codex-image-cli</code></pre>
+      <p>Then confirm the binary is available:</p>
+      <pre><code>codex-image --help</code></pre>
+
+      <h2 id="api">2. Choose a provider</h2>
+      <p>The default is the direct Image API. Put the key in the environment only:</p>
+      <pre><code>export OPENAI_API_KEY="..."
+codex-image doctor --json</code></pre>
+      <p>Use <code>--provider codex</code> only when you intentionally want the locally authenticated Codex CLI path. A local login does not prove API entitlement.</p>
+
+      <h2 id="dry-run">3. Dry-run first</h2>
+      <p>Create the output directory yourself. It must already exist and contain no symlinked path components.</p>
+      <pre><code>mkdir -p artifacts/design
+codex-image generate \
+  --provider api \
+  --prompt "A warm editorial fox using a terminal" \
+  --output-dir artifacts/design \
+  --prefix fox-terminal \
+  --n 1 \
+  --size 1024x1024 \
+  --quality low \
+  --dry-run --json</code></pre>
+      <p>The dry run reads no key, reserves no files, and opens no network connection.</p>
+
+      <h2 id="generate">4. Make one request</h2>
+      <p>When the dry-run report looks right, remove only <code>--dry-run</code>:</p>
+      <pre><code>codex-image generate \
+  --provider api \
+  --prompt "A warm editorial fox using a terminal" \
+  --output-dir artifacts/design \
+  --prefix fox-terminal \
+  --n 1 --size 1024x1024 --quality low --json</code></pre>
+      <p>The result is written only after the response decodes and matches the requested image container.</p>
+
+      <h2 id="next">5. Read the report</h2>
+      <p>With <code>--json</code>, stdout contains exactly one JSON document. Start with <code>ok</code>, <code>status</code>, <code>exit_code</code>, <code>outputs</code>, <code>retained_artifacts</code>, and <code>possibly_modified_paths</code>.</p>
+      <div class="callout"><span aria-hidden="true">💡</span><div><strong>Need more control?</strong><p>Use a versioned <code>--request-file</code> for typed inputs. Keep output naming, overwrite approval, endpoint trust, and insecure-localhost approval as explicit CLI flags.</p></div></div>
+    </div>
+    <aside>
+      <div class="card"><p class="eyebrow" style="color: var(--cyan);">Quick map</p><h3>Where to go next</h3><p><a href="guides.html#agents">🤖 AI agents</a></p><p><a href="guides.html#batch">⏳ Batch jobs</a></p><p><a href="guides.html#runs">🧭 Large runs</a></p><p><a href="reference.html#exit-codes">📐 Exit codes</a></p></div>
+      <div class="card warning mt-2"><h3>Safe retry rule</h3><p>Codes <strong>5</strong>, <strong>6</strong>, and <strong>7</strong> may follow a POST. Do not submit again automatically. Inspect the report and remote/local state first.</p></div>
+    </aside>
+  </div></section></main>
+  <footer class="footer"><div class="container footer-inner"><p>Start small. Validate first. Make one explicit operation.</p><div class="link-row"><a href="reference.html">Reference</a><a href="project.html">Project</a></div></div></footer><script src="script.js"></script>
+</body>
+</html>

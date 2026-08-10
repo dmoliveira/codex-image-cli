@@ -13,6 +13,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-f0c674.svg)](LICENSE)
 [![Support via Stripe](https://img.shields.io/badge/support-stripe-635bff?logo=stripe&logoColor=white)](https://buy.stripe.com/8x200i8bSgVe3Vl3g8bfO00)
 
+**[Read the friendly documentation site →](https://dmoliveira.github.io/codex-image-cli/)**
+
 ## Why this exists 🎯
 
 AI tools such as OpenCode need a small, predictable image command—not a browser flow or an interactive wizard. `codex-image` provides:

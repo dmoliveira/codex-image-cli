@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Codex Image CLI: safe, non-interactive GPT Image 2 generation for terminals and AI agents.">
+  <title>Codex Image CLI | Safe image generation from the terminal</title>
+  <link rel="canonical" href="https://dmoliveira.github.io/codex-image-cli/">
+  <link rel="stylesheet" href="styles.css">
+  <script>document.documentElement.classList.add("js");</script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <nav class="nav" aria-label="Main navigation">
+      <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">✦</span> Codex Image CLI</a>
+      <div class="nav-links">
+        <a href="get-started.html">Get started</a>
+        <a href="guides.html">Guides</a>
+        <a href="reference.html">Reference</a>
+        <a href="project.html">Project</a>
+      </div>
+      <button class="theme-button" type="button" data-theme-toggle aria-pressed="false">◐ Dark</button>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="container hero-inner hero-grid">
+        <div>
+          <p class="eyebrow">🖼️ Terminal-first image generation</p>
+          <h1>Turn a prompt into a verified image file.</h1>
+          <p>A safe, non-interactive Rust CLI for OpenAI GPT Image 2. One deliberate operation, predictable JSON, durable Batch jobs, and no hidden retries.</p>
+          <div class="hero-actions">
+            <a class="button" href="get-started.html">Get started <span aria-hidden="true">→</span></a>
+            <a class="button secondary" href="guides.html#agents">Build with an agent</a>
+          </div>
+        </div>
+        <div class="terminal-card" aria-label="Example terminal command and result">
+          <div class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+          <div><span class="prompt">$</span> mkdir -p artifacts/design</div>
+          <div><span class="prompt">$</span> codex-image generate --dry-run --json \</div>
+          <div>&nbsp;&nbsp;--prompt "a luminous rust fox" \</div>
+          <div>&nbsp;&nbsp;--output-dir artifacts/design \</div>
+          <div>&nbsp;&nbsp;--prefix hero --n 2</div>
+          <br>
+          <div class="success">→ planned: hero-01.png</div>
+          <div class="success">→ planned: hero-02.png</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="why-title">
+      <div class="container">
+        <div class="section-head">
+          <p class="eyebrow" style="color: var(--cyan);">Why codex-image?</p>
+          <h2 id="why-title">Small surface. Serious guardrails.</h2>
+          <p>It is designed for humans who want a dependable command and agents that need a stable machine contract.</p>
+        </div>
+        <div class="grid-3">
+          <article class="card accent"><span class="icon" aria-hidden="true">🤖</span><h3>Agent-ready JSON</h3><p>Discover capabilities with <code>ai-help --json</code>, validate with <code>--dry-run</code>, and parse exactly one report.</p></article>
+          <article class="card warning"><span class="icon" aria-hidden="true">🧾</span><h3>One explicit request</h3><p>There are no automatic retries for uncertain image POST outcomes. The CLI tells you what to inspect next.</p></article>
+          <article class="card safe"><span class="icon" aria-hidden="true">🔒</span><h3>Verified files</h3><p>Outputs are container-validated, collision-protected, staged, and published with identity checks.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section compact" aria-labelledby="pipeline-title">
+      <div class="container">
+        <figure class="card" style="padding: .5rem; margin: 0;">
+          <img class="site-visual" src="assets/hero-banner.svg" alt="A terminal pipeline turning a prompt into verified image files" width="1600" height="540">
+          <figcaption class="muted" style="padding: .7rem .8rem .35rem;">Prompt → one deliberate operation → verified image files.</figcaption>
+        </figure>
+        <h2 id="pipeline-title" class="center" style="margin-top: 2rem;">A predictable pipeline for creative work.</h2>
+      </div>
+    </section>
+
+    <section class="section band" aria-labelledby="choose-title">
+      <div class="container">
+        <div class="section-head">
+          <p class="eyebrow">Choose your path</p>
+          <h2 id="choose-title">API billing or local Codex?</h2>
+          <p class="muted">The provider is explicit because access, entitlement, and billing are different things.</p>
+        </div>
+        <div class="grid-2">
+          <article class="card"><span class="pill">Default</span><h3>Direct Image API</h3><p>Uses <code>OPENAI_API_KEY</code> and the documented GPT Image 2 API. Supports the full generation and Batch workflow.</p><p><a href="get-started.html#api">Use the API path →</a></p></article>
+          <article class="card"><span class="pill">Explicit</span><h3>Authenticated Codex CLI</h3><p>Uses the locally authenticated Codex executable with <code>--provider codex</code>. It currently publishes one validated PNG per command.</p><p><a href="reference.html#providers">Compare providers →</a></p></article>
+        </div>
+        <div class="callout danger mt-2"><span aria-hidden="true">⚠️</span><div><strong>Account reality</strong><p>ChatGPT/Codex subscriptions and API billing are separate. A key or local login does not prove entitlement, billing setup, organization verification, or model access.</p></div></div>
+      </div>
+    </section>
+
+    <section class="section compact" aria-labelledby="next-title">
+      <div class="container grid-2">
+        <div><p class="eyebrow" style="color: var(--cyan);">Start safely</p><h2 id="next-title">The first useful command is a dry run.</h2><p class="lede">Validate names, formats, output paths, and provider capabilities before any key is read or request is sent.</p><a class="button" href="get-started.html">Follow the quickstart →</a></div>
+        <div class="card"><h3>What happens next?</h3><p><strong>Generate:</strong> synchronous images for quick jobs.</p><p><strong>Batch:</strong> durable asynchronous API jobs with status and retrieval.</p><p><strong>Run:</strong> plan, approve, shard, and resume large manifests.</p></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer"><div class="container footer-inner"><p>Codex Image CLI · MIT licensed · built for predictable automation</p><div class="link-row"><a href="project.html">Project links</a><a href="https://github.com/dmoliveira/codex-image-cli">GitHub ↗</a></div></div></footer>
+  <script src="script.js"></script>
+</body>
+</html>
