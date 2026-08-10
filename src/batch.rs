@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     fs::{self, File, OpenOptions},
     io::Write,
@@ -21,6 +21,10 @@ use crate::{
         BatchCancelArgs, BatchJobArgs, BatchRecoverArgs, BatchRetrieveArgs, BatchSubmitArgs,
         GenerateArgs, OutputFormat, Provider,
     },
+    cost::{
+        self, CostEventKind, CostLedger, CostOperationSpec, CostOutcome, CostResolution,
+        CostTransport,
+    },
     endpoint::{validate_remote_id, Endpoint},
     image::decode_base64_image,
     output::{
@@ -29,7 +33,7 @@ use crate::{
         OutputIdentity, OutputTransaction, OutputVerificationArtifact, RecoveryArtifact,
         RecoveryVerificationArtifact, RetainedVerificationArtifact,
     },
-    report::{AppError, BatchContext, BatchReport},
+    report::{AppError, BatchContext, BatchReport, BatchRequestCountsInfo},
     MODEL,
 };
 
@@ -165,6 +169,196 @@ fn attach_response_metadata(
     failure.context.request_id = request_id;
 }
 
+fn ensure_batch_cost_started(job: &BatchJob) -> Result<CostLedger, AppError> {
+    let ledger = CostLedger::open(None)?;
+    let pricing_eligible = cost::pricing_eligible_for_base_url(&job.api_base_url);
+    let specs = job
+        .custom_ids
+        .iter()
+        .map(|custom_id| CostOperationSpec {
+            operation_id: cost::batch_operation_id(&job.job_id, custom_id),
+            transport: CostTransport::Batch,
+            model: job.model.clone(),
+            image_count: 1,
+            quality: job.quality.as_api_value().to_owned(),
+            size: job.size.clone(),
+            output_format: job.format.as_api_value().to_owned(),
+            pricing_eligible,
+            batch_id: None,
+            custom_id: Some(custom_id.clone()),
+        })
+        .collect::<Vec<_>>();
+    let started_at = if job.created_at == 0 {
+        cost::now_seconds()
+    } else {
+        job.created_at
+    };
+    ledger.start_many(&specs, started_at)?;
+    Ok(ledger)
+}
+
+fn record_batch_created(
+    ledger: &CostLedger,
+    job: &BatchJob,
+    batch_id: &str,
+    request_id: Option<String>,
+) -> Result<(), AppError> {
+    for custom_id in &job.custom_ids {
+        ledger.resolve(CostResolution {
+            operation_id: cost::batch_operation_id(&job.job_id, custom_id),
+            kind: CostEventKind::Observed,
+            outcome: CostOutcome::Accepted,
+            recorded_at: cost::now_seconds(),
+            batch_id: Some(batch_id.to_owned()),
+            request_id: request_id.clone(),
+            usage: None,
+        })?;
+    }
+    Ok(())
+}
+
+fn finalize_terminal_batch_without_output(
+    job: &BatchJob,
+    request_id: Option<String>,
+) -> Result<(), AppError> {
+    if job.output_file_id.is_some()
+        || !is_terminal_remote_status(job.remote_status.as_deref().unwrap_or_default())
+    {
+        return Ok(());
+    }
+    let ledger = ensure_batch_cost_started(job)?;
+    for custom_id in &job.custom_ids {
+        ledger.resolve(CostResolution {
+            operation_id: cost::batch_operation_id(&job.job_id, custom_id),
+            kind: CostEventKind::Final,
+            outcome: CostOutcome::Unknown,
+            recorded_at: cost::now_seconds(),
+            batch_id: job.batch_id.clone(),
+            request_id: request_id.clone(),
+            usage: None,
+        })?;
+    }
+    Ok(())
+}
+
+fn resolve_batch_cost_error(ledger: &CostLedger, job: &BatchJob, error: &mut AppError) {
+    let outcome = if error.status == crate::report::Status::ApiRejected {
+        CostOutcome::Rejected
+    } else if matches!(
+        error.status,
+        crate::report::Status::OutcomeIndeterminate | crate::report::Status::InvalidSuccessResponse
+    ) {
+        CostOutcome::Unknown
+    } else {
+        CostOutcome::Failed
+    };
+    let kind = if outcome == CostOutcome::Unknown {
+        CostEventKind::Observed
+    } else {
+        CostEventKind::Final
+    };
+    for custom_id in &job.custom_ids {
+        if let Err(accounting_error) = ledger.resolve(CostResolution {
+            operation_id: cost::batch_operation_id(&job.job_id, custom_id),
+            kind,
+            outcome,
+            recorded_at: cost::now_seconds(),
+            batch_id: None,
+            request_id: error.request_id.clone(),
+            usage: None,
+        }) {
+            error.message = format!(
+                "{} Cost accounting also failed: {}",
+                error.message, accounting_error.message
+            );
+            error.automatic_retry_safe = false;
+            break;
+        }
+    }
+}
+
+fn cost_accounting_failure(
+    error: AppError,
+    context: BatchContext,
+    http_status: Option<u16>,
+    request_id: Option<String>,
+) -> BatchFailure {
+    let mut failure = AppError::indeterminate(
+        "cost_ledger_write_failed",
+        format!(
+            "The remote Batch operation completed, but local cost accounting failed: {}. Inspect the Batch job before retrying.",
+            error.message
+        ),
+    );
+    failure.http_status = http_status;
+    failure.request_id = request_id;
+    BatchFailure::new(failure, context)
+}
+
+#[derive(Debug)]
+struct BatchUsageObservation {
+    custom_id: String,
+    outcome: CostOutcome,
+    usage: Option<crate::api::TokenUsage>,
+}
+
+fn record_batch_output_cost(
+    job: &BatchJob,
+    content: &[u8],
+    request_id: Option<String>,
+) -> Result<(), AppError> {
+    let ledger = ensure_batch_cost_started(job)?;
+    for observation in collect_batch_usage(content, job) {
+        ledger.resolve(CostResolution {
+            operation_id: cost::batch_operation_id(&job.job_id, &observation.custom_id),
+            kind: CostEventKind::Final,
+            outcome: observation.outcome,
+            recorded_at: cost::now_seconds(),
+            batch_id: job.batch_id.clone(),
+            request_id: request_id.clone(),
+            usage: observation.usage,
+        })?;
+    }
+    Ok(())
+}
+
+fn collect_batch_usage(content: &[u8], job: &BatchJob) -> Vec<BatchUsageObservation> {
+    let mut observations_by_id: HashMap<String, Vec<BatchUsageObservation>> = HashMap::new();
+    for line in content.split(|byte| *byte == b'\n') {
+        if line.is_empty() || line.len() > MAX_RESULT_LINE_BYTES {
+            continue;
+        }
+        let Ok(result) = serde_json::from_slice::<BatchResultLine>(line) else {
+            continue;
+        };
+        if !job.custom_ids.iter().any(|id| id == &result.custom_id) {
+            continue;
+        }
+        let (outcome, usage) = match result.response.as_ref() {
+            Some(response) if result.error.is_none() && response.status_code == 200 => {
+                (CostOutcome::Succeeded, response.body.usage.clone())
+            }
+            Some(response) => (CostOutcome::Failed, response.body.usage.clone()),
+            None => (CostOutcome::Failed, None),
+        };
+        observations_by_id
+            .entry(result.custom_id.clone())
+            .or_default()
+            .push(BatchUsageObservation {
+                custom_id: result.custom_id,
+                outcome,
+                usage,
+            });
+    }
+    job.custom_ids
+        .iter()
+        .filter_map(|custom_id| {
+            let mut observations = observations_by_id.remove(custom_id)?;
+            (observations.len() == 1).then(|| observations.pop().unwrap())
+        })
+        .collect()
+}
+
 fn retain_artifact(
     paths: &mut Vec<String>,
     identities: &mut Vec<OutputIdentity>,
@@ -185,9 +379,15 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     let prompt = generation
         .read_prompt()
         .map_err(|error| failure(error, "batch.submit", None))?;
-    generation
-        .validate_batch(&prompt)
-        .map_err(|error| failure(error, "batch.submit", None))?;
+    if generation.dry_run {
+        generation
+            .validate_batch_dry_run(&prompt)
+            .map_err(|error| failure(error, "batch.submit", None))?;
+    } else {
+        generation
+            .validate_batch(&prompt)
+            .map_err(|error| failure(error, "batch.submit", None))?;
+    }
     require_api_provider(&generation).map_err(|error| failure(error, "batch.submit", None))?;
 
     let output_names = derive_file_names(
@@ -210,6 +410,18 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
         image_count: generation.n,
         ..BatchContext::default()
     };
+    base_context.cost_preview = Some(cost::preflight_preview(
+        CostTransport::Batch,
+        MODEL,
+        generation.n,
+        generation.quality.as_api_value(),
+        &generation.size,
+        endpoint.is_canonical_openai(),
+    ));
+    if generation.dry_run {
+        OutputTransaction::validate_plan(&output_dir, &output_names, generation.overwrite)
+            .map_err(|error| failure(error, "batch.submit", Some(base_context.clone())))?;
+    }
 
     let job_id = new_job_id();
     let job_file = JobStore::resolve(args.job_file.as_deref(), &job_id).map_err(|error| {
@@ -395,6 +607,18 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
             )),
         )
     })?;
+    let cost_ledger = ensure_batch_cost_started(&input_uploaded).map_err(|error| {
+        failure(
+            error,
+            "batch.submit",
+            Some(context_for_job(
+                &base_context,
+                &job_id,
+                Some(&file_info.id),
+                Some(&job_file),
+            )),
+        )
+    })?;
     let create_in_flight = transition_if_revision(&job_file, input_uploaded.revision, |job| {
         job.state = JobState::CreateInFlight;
         Ok(())
@@ -422,7 +646,8 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     };
     let created = match client.create_batch(&endpoint, &api_key, &create_request) {
         Ok(response) => response,
-        Err(error) => {
+        Err(mut error) => {
+            resolve_batch_cost_error(&cost_ledger, &input_uploaded, &mut error);
             let error = mark_unknown(
                 &job_file,
                 create_in_flight.revision,
@@ -448,6 +673,7 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
                 let mut error = error;
                 error.set_http_status(created.status);
                 error.set_request_id(created.request_id.clone());
+                resolve_batch_cost_error(&cost_ledger, &input_uploaded, &mut error);
                 let error = mark_unknown(
                     &job_file,
                     create_in_flight.revision,
@@ -503,8 +729,39 @@ pub fn submit(args: &BatchSubmitArgs) -> Result<BatchReport, BatchFailure> {
     report_context.remote_status = job.remote_status.clone();
     report_context.output_file_id = job.output_file_id.clone();
     report_context.error_file_id = job.error_file_id.clone();
+    report_context.request_counts =
+        job.request_counts
+            .as_ref()
+            .map(|counts| BatchRequestCountsInfo {
+                completed: counts.completed,
+                failed: counts.failed,
+                total: counts.total,
+            });
     report_context.http_status = Some(created.status);
-    report_context.request_id = created.request_id;
+    report_context.request_id = created.request_id.clone();
+    if let Err(error) = record_batch_created(
+        &cost_ledger,
+        &job,
+        job.batch_id.as_deref().unwrap_or_default(),
+        created.request_id.clone(),
+    ) {
+        return Err(cost_accounting_failure(
+            error,
+            report_context,
+            Some(created.status),
+            created.request_id,
+        ));
+    }
+    if let Err(error) =
+        finalize_terminal_batch_without_output(&job, report_context.request_id.clone())
+    {
+        return Err(cost_accounting_failure(
+            error,
+            report_context,
+            Some(created.status),
+            created.request_id,
+        ));
+    }
     if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
         report_context.next_action =
             Some(terminal_batch_next_action(job.output_file_id.as_deref()).to_owned());
@@ -654,7 +911,16 @@ pub fn recover(args: &BatchRecoverArgs) -> Result<BatchReport, BatchFailure> {
         context = context_from_job("batch.recover", &job_file, &job);
         context.attempted = true;
         context.http_status = Some(response.status);
-        context.request_id = response.request_id;
+        context.request_id = response.request_id.clone();
+        if let Err(error) = finalize_terminal_batch_without_output(&job, context.request_id.clone())
+        {
+            return Err(cost_accounting_failure(
+                error,
+                context,
+                Some(response.status),
+                response.request_id,
+            ));
+        }
         if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
             context.next_action =
                 Some(terminal_batch_next_action(job.output_file_id.as_deref()).to_owned());
@@ -726,6 +992,8 @@ fn create_batch_from_job(
     let key = api_key().map_err(|error| BatchFailure::new(error, context.clone()))?;
     let client = ApiClient::new(args.timeout_seconds)
         .map_err(|error| BatchFailure::new(error, context.clone()))?;
+    let cost_ledger = ensure_batch_cost_started(&job)
+        .map_err(|error| BatchFailure::new(error, context.clone()))?;
     let create_in_flight = transition_if_revision(job_file, job.revision, |job| {
         job.state = JobState::CreateInFlight;
         Ok(())
@@ -743,7 +1011,8 @@ fn create_batch_from_job(
     context.attempted = true;
     let response = match client.create_batch(&endpoint, &key, &request) {
         Ok(response) => response,
-        Err(error) => {
+        Err(mut error) => {
+            resolve_batch_cost_error(&cost_ledger, &job, &mut error);
             let error = mark_unknown(
                 job_file,
                 create_in_flight.revision,
@@ -759,6 +1028,7 @@ fn create_batch_from_job(
             let mut error = error;
             error.set_http_status(response.status);
             error.set_request_id(response.request_id.clone());
+            resolve_batch_cost_error(&cost_ledger, &job, &mut error);
             let error = mark_unknown(
                 job_file,
                 create_in_flight.revision,
@@ -779,7 +1049,28 @@ fn create_batch_from_job(
     context = context_from_job("batch.recover", job_file, &job);
     context.attempted = true;
     context.http_status = Some(response.status);
-    context.request_id = response.request_id;
+    context.request_id = response.request_id.clone();
+    if let Err(error) = record_batch_created(
+        &cost_ledger,
+        &job,
+        job.batch_id.as_deref().unwrap_or_default(),
+        response.request_id.clone(),
+    ) {
+        return Err(cost_accounting_failure(
+            error,
+            context,
+            Some(response.status),
+            response.request_id,
+        ));
+    }
+    if let Err(error) = finalize_terminal_batch_without_output(&job, context.request_id.clone()) {
+        return Err(cost_accounting_failure(
+            error,
+            context,
+            Some(response.status),
+            response.request_id,
+        ));
+    }
     if matches!(job.remote_status.as_deref(), Some("failed" | "expired")) {
         context.next_action =
             Some(terminal_batch_next_action(job.output_file_id.as_deref()).to_owned());
@@ -890,6 +1181,15 @@ pub fn status(args: &BatchJobArgs) -> Result<BatchReport, BatchFailure> {
     context = context_from_job("batch.status", &job_file, &updated);
     context.http_status = Some(response.status);
     context.request_id = response.request_id.clone();
+    if let Err(error) = finalize_terminal_batch_without_output(&updated, context.request_id.clone())
+    {
+        return Err(cost_accounting_failure(
+            error,
+            context,
+            Some(response.status),
+            response.request_id,
+        ));
+    }
     if matches!(updated.remote_status.as_deref(), Some("failed" | "expired")) {
         context.next_action =
             Some(terminal_batch_next_action(updated.output_file_id.as_deref()).to_owned());
@@ -929,6 +1229,10 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
         return recover_retrieved(&job, context);
     }
     if job.state == JobState::Cancelled && job.output_file_id.is_none() {
+        if let Err(error) = finalize_terminal_batch_without_output(&job, context.request_id.clone())
+        {
+            return Err(cost_accounting_failure(error, context, None, None));
+        }
         return Ok(context.report(None));
     }
     let batch_id = require_batch_id(&job, &context)?;
@@ -1031,7 +1335,16 @@ pub fn retrieve(args: &BatchRetrieveArgs) -> Result<BatchReport, BatchFailure> {
     context = context_from_job("batch.retrieve", &job_file, &updated);
     context.attempted = true;
     context.http_status = Some(last_http_status);
-    context.request_id = last_request_id;
+    context.request_id = last_request_id.clone();
+    if let Err(error) = finalize_terminal_batch_without_output(&updated, context.request_id.clone())
+    {
+        return Err(cost_accounting_failure(
+            error,
+            context,
+            Some(last_http_status),
+            last_request_id,
+        ));
+    }
     if !is_terminal_remote_status(updated.remote_status.as_deref().unwrap_or_default()) {
         let error = AppError::not_ready(
             "batch_not_ready",
@@ -1081,11 +1394,17 @@ pub fn cancel(args: &BatchCancelArgs) -> Result<BatchReport, BatchFailure> {
     let mut context = context_from_job("batch.cancel", &job_file, &job);
     if let Some(status) = job.remote_status.as_deref() {
         if matches!(status, "failed" | "expired") {
+            if let Err(error) = finalize_terminal_batch_without_output(&job, None) {
+                return Err(cost_accounting_failure(error, context.clone(), None, None));
+            }
             context.next_action =
                 Some(terminal_batch_next_action(job.output_file_id.as_deref()).to_owned());
             return Err(BatchFailure::new(terminal_batch_error(status), context));
         }
         if matches!(status, "completed" | "cancelled") {
+            if let Err(error) = finalize_terminal_batch_without_output(&job, None) {
+                return Err(cost_accounting_failure(error, context.clone(), None, None));
+            }
             return Err(BatchFailure::new(
                 AppError::preflight(
                     "batch_already_terminal",
@@ -1168,7 +1487,16 @@ pub fn cancel(args: &BatchCancelArgs) -> Result<BatchReport, BatchFailure> {
     })?;
     context = context_from_job("batch.cancel", &job_file, &updated);
     context.http_status = Some(response.status);
-    context.request_id = response.request_id;
+    context.request_id = response.request_id.clone();
+    if let Err(error) = finalize_terminal_batch_without_output(&updated, context.request_id.clone())
+    {
+        return Err(cost_accounting_failure(
+            error,
+            context,
+            Some(response.status),
+            response.request_id,
+        ));
+    }
     if matches!(updated.remote_status.as_deref(), Some("failed" | "expired")) {
         context.next_action =
             Some(terminal_batch_next_action(updated.output_file_id.as_deref()).to_owned());
@@ -1192,6 +1520,11 @@ fn publish_batch_content(
 ) -> Result<BatchReport, BatchFailure> {
     context.http_status = Some(http_status);
     context.request_id = request_id.clone();
+    if let Err(mut error) = record_batch_output_cost(job, content, request_id.clone()) {
+        error.set_http_status(http_status);
+        error.set_request_id(request_id.clone());
+        return Err(BatchFailure::new(error, context));
+    }
     let output_dir = PathBuf::from(&job.output_dir);
     let paths = derive_output_paths(&output_dir, &job.output_names);
     let images = match parse_batch_output(content, job) {
@@ -1851,7 +2184,9 @@ struct BatchItemResponse {
 
 #[derive(Debug, Deserialize)]
 struct BatchImageBody {
+    #[serde(default)]
     data: Vec<BatchImageData>,
+    usage: Option<crate::api::TokenUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2216,6 +2551,15 @@ fn set_context_from_info(context: &mut BatchContext, info: &BatchInfo) {
     context.remote_status = Some(info.status.clone());
     context.output_file_id = info.output_file_id.clone();
     context.error_file_id = info.error_file_id.clone();
+    context.request_counts = info.request_counts.as_ref().map(request_counts_info);
+}
+
+fn request_counts_info(counts: &BatchRequestCounts) -> BatchRequestCountsInfo {
+    BatchRequestCountsInfo {
+        completed: counts.completed,
+        failed: counts.failed,
+        total: counts.total,
+    }
 }
 
 fn is_terminal_remote_status(status: &str) -> bool {
@@ -2344,6 +2688,22 @@ fn context_from_job(operation: &'static str, path: &Path, job: &BatchJob) -> Bat
         image_count: job.image_count,
         attempted: false,
         retained_artifacts: job.retained_artifacts.clone(),
+        request_counts: job
+            .request_counts
+            .as_ref()
+            .map(|counts| BatchRequestCountsInfo {
+                completed: counts.completed,
+                failed: counts.failed,
+                total: counts.total,
+            }),
+        cost_preview: Some(cost::preflight_preview(
+            CostTransport::Batch,
+            &job.model,
+            job.image_count,
+            job.quality.as_api_value(),
+            &job.size,
+            cost::pricing_eligible_for_base_url(&job.api_base_url),
+        )),
         ..BatchContext::default()
     }
 }
@@ -3055,11 +3415,19 @@ mod tests {
             "job-test"
         );
         let job_file = Path::new("/tmp/job-test.json");
+        let mut cost_job = job.clone();
+        cost_job.job_id = format!(
+            "job-test-{:x}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
         let failure = publish_batch_content(
             job_file,
-            &job,
+            &cost_job,
             b"not-json",
-            context_from_job("batch.retrieve", job_file, &job),
+            context_from_job("batch.retrieve", job_file, &cost_job),
             200,
             Some("request-test".to_owned()),
         )
@@ -3144,5 +3512,84 @@ mod tests {
     fn cancellation_can_skip_the_intermediate_remote_status() {
         assert!(is_allowed_remote_transition("in_progress", "cancelled"));
         assert!(!is_allowed_remote_transition("cancelling", "finalizing"));
+    }
+
+    #[test]
+    fn batch_usage_scan_keeps_mixed_success_and_failure_lines() {
+        let job: BatchJob = serde_json::from_value(serde_json::json!({
+            "schema_version": JOB_SCHEMA_VERSION,
+            "revision": 0,
+            "job_id": "job-test",
+            "state": "prepared",
+            "provider": "api",
+            "model": MODEL,
+            "api_base_url": "https://api.openai.com/v1",
+            "output_dir": "/tmp/images",
+            "output_names": ["one.png", "two.png"],
+            "overwrite": false,
+            "format": "png",
+            "image_count": 2,
+            "quality": "low",
+            "size": "auto",
+            "background": "auto",
+            "moderation": "auto",
+            "custom_ids": ["job-test-00", "job-test-01"],
+            "input_sha256": "0".repeat(64),
+            "input_bytes": 1,
+            "input_file_id": null,
+            "batch_id": null,
+            "output_file_id": null,
+            "error_file_id": null,
+            "remote_status": null,
+            "request_counts": null,
+            "publishing": null,
+            "retained_artifacts": [],
+            "created_at": 1,
+            "updated_at": 1
+        }))
+        .unwrap();
+        let content = [
+            serde_json::json!({
+                "custom_id": "job-test-00",
+                "response": {
+                    "status_code": 200,
+                    "body": {
+                        "data": [],
+                        "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}
+                    }
+                }
+            }),
+            serde_json::json!({
+                "custom_id": "job-test-01",
+                "response": {
+                    "status_code": 500,
+                    "body": {
+                        "data": [],
+                        "usage": {"input_tokens": 4, "output_tokens": 5, "total_tokens": 9}
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let observations = collect_batch_usage(content.as_bytes(), &job);
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].outcome, CostOutcome::Succeeded);
+        assert_eq!(observations[1].outcome, CostOutcome::Failed);
+        assert_eq!(
+            observations[0].usage.as_ref().unwrap().output_tokens,
+            Some(20)
+        );
+        assert_eq!(
+            observations[1].usage.as_ref().unwrap().output_tokens,
+            Some(5)
+        );
+
+        let first_line = content.lines().next().unwrap();
+        let duplicate = format!("{first_line}\n{first_line}");
+        assert!(collect_batch_usage(duplicate.as_bytes(), &job).is_empty());
     }
 }

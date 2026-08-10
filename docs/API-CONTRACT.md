@@ -1,6 +1,6 @@
 # CLI API contract 📐
 
-This document describes the stable behavior of version 2 JSON reports for synchronous generation and the durable Batch lifecycle.
+This document describes the stable behavior of version 4 JSON reports for synchronous generation and the durable Batch lifecycle.
 
 ## JSON rules
 
@@ -10,7 +10,7 @@ Every generation report includes:
 
 ```json
 {
-  "schema_version": 2,
+   "schema_version": 4,
   "ok": true,
   "status": "success",
   "exit_code": 0,
@@ -24,7 +24,24 @@ Every generation report includes:
   "http": { "status": 200 },
   "outputs": ["artifacts/design/hero.png"],
   "retained_artifacts": [],
-  "possibly_modified_paths": []
+   "possibly_modified_paths": [],
+   "cost_preview": {
+     "status": "estimated",
+     "currency": "USD",
+     "scope": "output_only",
+     "total_cost_status": "unknown",
+     "model": "gpt-image-2",
+     "transport": "live",
+     "image_count": 1,
+     "quality": "medium",
+     "size": "1536x1024",
+     "pricing_version": "openai-gpt-image-2-2026-08",
+     "pricing_source": "https://developers.openai.com/api/docs/guides/image-generation#calculating-costs",
+     "basis": "official_per_image_output_price_table",
+     "estimated_output_nano_usd": 41000000,
+     "estimated_output_usd": "$0.041000",
+     "excluded_charges": ["text_input_tokens", "image_input_tokens"]
+   }
 }
 ```
 
@@ -40,11 +57,33 @@ Failure reports add:
 
 `outputs` is populated only after all requested files are published. `retained_artifacts` lists private backups deliberately retained after a successful overwrite; they are not automatically unlinked because a pathname-only cleanup can race a competing writer. `possibly_modified_paths` lists outputs/private artifacts that need inspection after a failure. The CLI never calls a multi-file result successful after a partial publication.
 
+`cost_preview` is a non-binding preflight estimate of image-output charges. Its `scope` is always `output_only` and `total_cost_status` is always `unknown`. It is included in dry-run, successful generation, and Batch lifecycle reports after request validation. The estimate uses the official GPT Image 2 per-image output table only for `1024x1024`, `1024x1536`, and `1536x1024`; Batch applies the documented 50% rate. Prompt text and input-image charges are excluded because the CLI cannot derive authoritative pre-request token usage. `status: "unavailable"` includes a machine-readable `reason` such as `custom_endpoint_unpriced`, `auto_size_not_in_official_table`, or `size_or_quality_not_in_official_table`. An unavailable preview is not a safety failure and does not imply zero cost.
+
+`generate --dry-run` and `batch submit --dry-run` validate endpoint policy and inspect output-directory/target safety without reading a key, writing the ledger, creating stages/job files, or using the network. `--quality high` still requires confirmation for a billable request, but dry-run may show its request-specific preview without `--confirm-high-quality`.
+
 Batch reports add `operation`, job/remote IDs, `remote_status`, `next_action`, and the same `outputs`, `retained_artifacts`, and `possibly_modified_paths` fields. `batch submit` uploads bounded JSONL input and creates a 24-hour Batch job with output retention configured for 30 days. `batch status` performs one read, `batch retrieve` can poll with `--wait` and a bounded `--max-wait-seconds`, `batch cancel` sends one cancellation request, and `batch recover` resumes only a confirmed-safe local state or attaches a manually reconciled remote ID after a read-only verification. Batch is API-only, locally limited to 8 image requests, and its job record never stores the prompt, API key, or image bytes. Remote POST outcomes are never automatically retried. Custom HTTPS and loopback endpoint approvals must be repeated explicitly on each operation; editable job records never grant credential-destination approval.
+
+## Cost tracking
+
+Every direct API image POST and every Batch image request gets an immutable local ledger record. A durable `started` record is synchronized before a potentially billable POST; later response/output observations resolve that record without double-counting repeated status, retrieval, or recovery operations. Unknown POST outcomes remain pending/unknown and are never silently treated as zero.
+
+The default ledger is `XDG_STATE_HOME/codex-image/costs.jsonl`, falling back to `XDG_CONFIG_HOME/codex-image/costs.jsonl` and then `$HOME/.local/state/codex-image/costs.jsonl`. It is append-only JSONL protected by a sidecar lock and contains request metadata, safe request IDs, Batch/custom IDs, optional token usage, outcome, and estimate metadata. Prompts, API keys, authorization headers, image bytes, and response bodies are never recorded. Use `--ledger-file FILE` to inspect another ledger.
+
+`cost` never reads a key or uses the network. Dates are inclusive UTC calendar dates. Examples:
+
+```bash
+codex-image cost --period today --json
+codex-image cost --period week --day-by-day --json
+codex-image cost --period month --per-request --json
+codex-image cost --period year --day-by-day --per-request --json
+codex-image cost --from 2026-08-01 --to 2026-08-08 --day-by-day --per-request --json
+```
+
+The report uses cost schema version 2, separates live and Batch totals, and includes requests, image counts, priced/unpriced/pending-known/unknown counts, `estimate_coverage`, day rows, and optional per-request rows. `estimate_coverage` is `complete` only when every non-rejected operation has a usable finalized usage estimate; otherwise it is `partial`. `pending_requests` and `unknown_requests` are disjoint; unknown outcomes may have been billed and must not be auto-retried. Amounts are local estimates in USD, calculated from recorded token usage using the versioned GPT Image 2 rate snapshot; OpenAI billing/dashboard records remain authoritative. Missing usage is unpriced. Compatible loopback/custom origins are recorded but unpriced because the OpenAI rate card is not assumed for non-canonical endpoints. Batch uses the documented discounted rate card. The CLI does not infer a fixed per-image charge when token usage is absent. `--day-by-day` emits every selected UTC calendar day and rejects ranges longer than 3,700 days instead of silently omitting zero-usage days.
 
 ```json
 {
-  "schema_version": 2,
+   "schema_version": 4,
   "operation": "batch.submit",
   "ok": true,
   "status": "validating",
@@ -53,7 +92,8 @@ Batch reports add `operation`, job/remote IDs, `remote_status`, `next_action`, a
   "job_id": "job-example",
   "batch_id": "batch_example",
   "input_file_id": "file-example",
-  "remote_status": "validating",
+   "remote_status": "validating",
+   "request_counts": { "completed": 0, "failed": 0, "total": 2 },
   "request": { "attempted": true, "image_count": 2, "model": "gpt-image-2", "provider": "api" },
   "http": { "status": 200 },
   "outputs": [],

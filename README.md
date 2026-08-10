@@ -102,6 +102,10 @@ codex-image generate \
   --json
 ```
 
+For canonical OpenAI requests using one of the documented standard sizes,
+the dry-run JSON also includes a non-binding image-output cost preview. It
+does not read a key, reserve files, create a Batch job, or contact the network.
+
 That writes `fox-terminal.png` after the generated PNG has passed container validation.
 
 The default API provider supports the documented Image API parameters. Use `--provider codex` for the explicit local subscription path; it currently supports one PNG per command. Use the Batch commands below for bounded asynchronous API jobs.
@@ -125,7 +129,7 @@ Required facts for an agent:
 | Output directory | Create it first; it must be non-symlinked and already exist |
 | One output | `--name hero` with `--n 1` |
 | Several outputs | `--prefix hero --n 3` → `hero-01.png` … `hero-03.png` |
-| No-cost planning | Add `--dry-run --json`; it reads no key and opens no network connection |
+| No-cost planning | Add `--dry-run --json`; it validates endpoint/output safety without reading a key, writing the ledger, reserving files, or opening a network connection, and may include a non-binding output-cost preview |
 | Result parsing | Use `--json`; stdout contains exactly one JSON document |
 
 Read the full [AI agent guide](docs/AI-AGENT-GUIDE.md) and [JSON/exit-code contract](docs/API-CONTRACT.md).
@@ -152,7 +156,7 @@ codex-image generate --prompt <TEXT> [OPTIONS]
 | `--moderation` | `auto` | `auto` or `low`, following the documented API option. |
 | `--overwrite` | off | Atomically exchanges a regular target, then validates that the displaced identity matches preflight. A mismatch is never called success; successful replacements retain a private backup listed in `retained_artifacts`. |
 | `--timeout-seconds` | `180` | 1–300 seconds, one request only. |
-| `--dry-run` | off | No key read, file reservation, DNS, proxy, or HTTP request. |
+| `--dry-run` | off | Validates endpoint policy and output targets without key read, ledger write, file reservation, DNS, proxy, or HTTP request; canonical standard sizes include a non-binding output-cost preview. High quality may be planned without `--confirm-high-quality`. |
 | `--json` | off | Stable JSON schema on stdout; diagnostics are not mixed in. |
 
 `*` Exactly one of `--prompt` and `--prompt-file` is required.
@@ -232,6 +236,22 @@ codex-image generate ... \
 ```
 
 The CLI rejects non-loopback HTTP, embedded URL credentials, query/fragment URLs, redirects, and proxy use. Treat a custom origin as a deliberate decision to send your API key to that service.
+
+### Cost reports 💰
+
+API image requests are recorded locally without prompts, keys, image bytes, or response bodies. Inspect the current day, calendar week/month/year, or an explicit UTC range without a network call:
+
+```bash
+codex-image cost --period today --json
+codex-image cost --period week --day-by-day --json
+codex-image cost --period month --per-request --json
+codex-image cost --period year --day-by-day --per-request --json
+codex-image cost --from 2026-08-01 --to 2026-08-08 --day-by-day --per-request --json
+```
+
+Reports separate live and Batch requests and show priced, unpriced, pending-known, and unknown outcomes plus `estimate_coverage` (`complete` or `partial`). Amounts are local USD estimates from returned token usage and the versioned GPT Image 2 rate snapshot; OpenAI billing records remain authoritative. Missing usage and compatible custom/loopback origins are recorded but unpriced. The append-only ledger defaults to `XDG_STATE_HOME/codex-image/costs.jsonl`, with documented fallbacks in [the API contract](docs/API-CONTRACT.md).
+
+Before spending, parse `cost_preview` from `generate --dry-run --json` or `batch submit --dry-run --json`. For canonical OpenAI requests with `1024x1024`, `1024x1536`, or `1536x1024`, it uses the official GPT Image 2 per-image output table and multiplies by `--n` (Batch uses the discounted rate). It explicitly excludes prompt/input-image charges; `status: "unavailable"` is returned for custom endpoints, Codex, `auto`, and unsupported sizes/qualities. Treat the preview as a planning signal, not a quote or billing record.
 
 ## Cost and failure safety 🧯
 
