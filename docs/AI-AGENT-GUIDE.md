@@ -20,6 +20,8 @@ codex-image doctor --json
 5. Parse `ok`, `status`, `exit_code`, `outputs`, `retained_artifacts`, `possibly_modified_paths`, `cost_preview`, and Batch `request_counts` when present.
 6. Never auto-retry codes 5–7. Surface the API request ID and path list to the caller instead.
 
+The API provider defaults to a cost-conscious `1024x1024` PNG at `low` quality. Choose `--size auto` or a larger size explicitly when the request needs it.
+
 For typed callers, prefer a version 1 `--request-file` JSON request. Keep output naming and security approvals as separate CLI flags.
 
 ```bash
@@ -32,7 +34,7 @@ codex-image generate \
   --prefix robot-garden \
   --n 1 \
   --format png \
-  --quality medium \
+  --quality low \
   --dry-run \
   --json
 
@@ -43,7 +45,7 @@ codex-image generate \
   --prefix robot-garden \
   --n 1 \
   --format png \
-  --quality medium \
+  --quality low \
   --json
 ```
 
@@ -67,6 +69,7 @@ codex-image batch submit \
   --output-dir artifacts/design \
   --prefix robot-garden \
   --n 2 \
+  --quality low \
   --job-file artifacts/design/robot-garden-job.json \
   --json
 
@@ -82,6 +85,32 @@ To inspect local API estimates without a key or network access, use `cost`. Add 
 ```bash
 codex-image cost --period week --day-by-day --per-request --json
 ```
+
+For large asset sets, use a bounded manifest run. Plan first, then pass the exact returned digest to the billable command:
+
+```bash
+codex-image run plan \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --mode batch \
+  --parallelism 8 \
+  --max-active-batches 1 \
+  --wait \
+  --max-wait-seconds 300 \
+  --poll-interval-seconds 10 \
+  --json
+
+codex-image run batch \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --run-file artifacts/design/run.json \
+  --approve-plan <plan-sha256> \
+  --shard-size 8 \
+  --wait \
+  --json
+```
+
+The manifest is bounded and contains only `id`, `prompt`, and optional safe `name` fields. Run state stores IDs, paths, shard/job state, and the plan digest, never prompts or credentials. Use `run direct` for bounded parallel synchronous work; its default concurrency is one and it never retries a generation POST.
 
 ## Contract for tool authors
 
@@ -100,5 +129,6 @@ codex-image cost --period week --day-by-day --per-request --json
 - **Quality gate:** `low` is the default; `--quality high` requires `--confirm-high-quality` after reviewing the cost warning.
 - **Cost accounting:** `cost` reads only the local append-only ledger; missing token usage and custom origins are unpriced, `estimate_coverage: "partial"` means the displayed amount is not complete, and unknown outcomes are never treated as zero or auto-retried.
 - **Preflight cost:** `cost_preview` is a planning estimate, not an authoritative bill or spending cap. Keep it separate from usage-derived `cost` totals and do not infer zero from an unavailable preview.
+- **Large runs:** plan and approve a manifest digest; never edit a manifest or run file after approval, and never resubmit assets marked in-flight or outcome-unknown.
 
 See [API contract](API-CONTRACT.md) for schemas and exit-code semantics.

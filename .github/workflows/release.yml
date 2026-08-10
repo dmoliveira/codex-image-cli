@@ -33,12 +33,14 @@ jobs:
           cargo +stable clippy --all-targets --all-features -- -D warnings
           cargo +stable test --all-targets --no-fail-fast
           python3 scripts/check_links.py
-          python3 -m py_compile scripts/mock_openai_image_api.py scripts/check_links.py
-          bash -n scripts/e2e-local.sh scripts/verify-install.sh
+          python3 -m py_compile scripts/mock_openai_image_api.py scripts/mock_openai_batch_api.py scripts/check_links.py
+          bash -n scripts/e2e-local.sh scripts/e2e-batch-local.sh scripts/verify-install.sh
       - name: Verify install and update
         run: ./scripts/verify-install.sh
       - name: Run offline tmux E2E
-        run: make e2e
+        run: |
+          make e2e
+          make e2e-batch
       - name: Build and checksum
         run: |
           cargo +stable build --release --locked

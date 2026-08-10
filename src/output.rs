@@ -23,6 +23,7 @@ pub struct RecoveryArtifact {
     pub stage_name: String,
     pub expected_stage_id: OutputIdentity,
     pub expected_id: Option<OutputIdentity>,
+    pub expected_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +121,13 @@ mod secure {
     };
 
     type FileId = OutputIdentity;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 
     #[derive(Debug, Clone, Copy)]
     struct EntryInfo {
@@ -234,6 +242,29 @@ mod secure {
         }
     }
 
+    pub fn entry_exists(output_dir: &Path, name: &str) -> Result<bool, AppError> {
+        if !is_safe_output_name(name) {
+            return Err(AppError::preflight(
+                "unsafe_output_name",
+                "The output entry name is not a safe single filename.",
+            ));
+        }
+        let directory = PinnedDirectory::open(output_dir).map_err(|_| {
+            AppError::preflight(
+                "output_directory_unavailable",
+                "The output directory could not be pinned safely before the run.",
+            )
+        })?;
+        raw_entry_info(directory.directory(), name)
+            .map(|entry| entry.is_some())
+            .map_err(|_| {
+                AppError::preflight(
+                    "output_directory_unavailable",
+                    "The output directory could not be inspected safely before the run.",
+                )
+            })
+    }
+
     enum Reservation {
         NoOverwrite,
         Overwrite { expected_id: Option<FileId> },
@@ -250,6 +281,7 @@ mod secure {
         destination: PathBuf,
         reservation: Reservation,
         stage: Stage,
+        expected_sha256: Option<String>,
         publication_attempted: bool,
         committed: bool,
     }
@@ -341,6 +373,7 @@ mod secure {
                         id: stage_id,
                         file: Some(file),
                     },
+                    expected_sha256: None,
                     publication_attempted: false,
                     committed: false,
                 });
@@ -395,6 +428,7 @@ mod secure {
                         id: stage_id,
                         file: Some(file),
                     },
+                    expected_sha256: None,
                     publication_attempted: false,
                     committed: false,
                 });
@@ -466,6 +500,7 @@ mod secure {
                         id: stage_info.id,
                         file: None,
                     },
+                    expected_sha256: Some(artifact.expected_sha256),
                     publication_attempted: false,
                     committed: false,
                 });
@@ -538,6 +573,29 @@ mod secure {
             Ok(())
         }
 
+        pub fn stage_selected(
+            &mut self,
+            selected_indices: &[usize],
+            images: &[Vec<u8>],
+        ) -> Result<(), AppError> {
+            if selected_indices.len() != self.entries.len() {
+                return Err(AppError::output_commit(
+                    "internal_image_count_mismatch",
+                    "The selected image count did not match the reserved output count; no success was reported.",
+                ));
+            }
+            for (position, image_index) in selected_indices.iter().copied().enumerate() {
+                let Some(image) = images.get(image_index) else {
+                    return Err(AppError::output_commit(
+                        "internal_image_index_mismatch",
+                        "A validated image index did not match the reserved output count; no success was reported.",
+                    ));
+                };
+                self.stage_one(position, image)?;
+            }
+            Ok(())
+        }
+
         pub fn stage_one(&mut self, index: usize, image: &[u8]) -> Result<(), AppError> {
             let Some(entry) = self.entries.get_mut(index) else {
                 return Err(AppError::output_commit(
@@ -551,6 +609,7 @@ mod secure {
                     "A staged output was unexpectedly unavailable. The image request may have been billed; no success was reported.",
                 ));
             };
+            let expected_sha256 = sha256_hex(image);
             if file.set_len(0).is_err()
                 || file.seek(SeekFrom::Start(0)).is_err()
                 || file.write_all(image).is_err()
@@ -562,6 +621,7 @@ mod secure {
                 ));
             }
             entry.stage.file.take();
+            entry.expected_sha256 = Some(expected_sha256);
             Ok(())
         }
 
@@ -727,13 +787,76 @@ mod secure {
 
         fn verify_final_entries(&self) -> bool {
             self.entries.iter().all(|entry| {
-                raw_entry_info(self.directory.directory(), &entry.final_name)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|info| {
-                        info.id == entry.stage.id && info.file_type == FileType::RegularFile
+                entry
+                    .expected_sha256
+                    .as_deref()
+                    .is_some_and(|expected_sha256| {
+                        Self::entry_matches_digest(
+                            self.directory.directory(),
+                            &entry.final_name,
+                            entry.stage.id,
+                            expected_sha256,
+                        )
                     })
             })
+        }
+
+        fn entry_matches_digest(
+            directory: &File,
+            name: &str,
+            expected_id: FileId,
+            expected_sha256: &str,
+        ) -> bool {
+            let Ok(mut file) = open_file_component(directory, name.as_ref()) else {
+                return false;
+            };
+            let Ok(before) = file.metadata() else {
+                return false;
+            };
+            let before_id = FileId {
+                device: before.dev(),
+                inode: before.ino(),
+            };
+            if !before.file_type().is_file()
+                || before.nlink() != 1
+                || before_id != expected_id
+                || before.len() > crate::image::MAX_IMAGE_BYTES as u64
+            {
+                return false;
+            }
+            let mut bytes =
+                Vec::with_capacity(before.len().min(crate::image::MAX_IMAGE_BYTES as u64) as usize);
+            if Read::by_ref(&mut file)
+                .take((crate::image::MAX_IMAGE_BYTES as u64).saturating_add(1))
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() > crate::image::MAX_IMAGE_BYTES
+            {
+                return false;
+            }
+            let Ok(after) = file.metadata() else {
+                return false;
+            };
+            if !before.file_type().is_file()
+                || after.nlink() != 1
+                || before.dev() != after.dev()
+                || before.ino() != after.ino()
+                || before.len() != after.len()
+                || before.mtime() != after.mtime()
+                || before.mtime_nsec() != after.mtime_nsec()
+                || before.ctime() != after.ctime()
+                || before.ctime_nsec() != after.ctime_nsec()
+            {
+                return false;
+            }
+            raw_entry_info(directory, name)
+                .ok()
+                .flatten()
+                .is_some_and(|info| {
+                    info.id == expected_id
+                        && info.file_type == FileType::RegularFile
+                        && sha256_hex(&bytes) == expected_sha256
+                })
         }
 
         fn verify_retained_backups(&self) -> bool {
@@ -1214,80 +1337,18 @@ mod secure {
                     "The publication plan contains an unsafe or duplicate output name.",
                 ));
             }
-            let file = open_file_component(directory.directory(), artifact.output_name.as_ref())
-                .map_err(|_| {
-                    AppError::output_commit(
-                        "published_output_sync_failed",
-                        "A published output could not be opened for plan verification.",
-                    )
-                })?;
-            let metadata = file.metadata().map_err(|_| {
-                AppError::output_commit(
-                    "published_output_sync_failed",
-                    "A published output could not be inspected for plan verification.",
-                )
-            })?;
-            if !metadata.file_type().is_file() {
-                return Err(AppError::output_commit(
-                    "published_output_sync_failed",
-                    "A published output is not a regular file during plan verification.",
-                ));
-            }
-            let identity = OutputIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            };
-            if identity != artifact.expected_output_id {
-                return Err(AppError::output_commit(
-                    "published_output_changed",
-                    "A published output changed identity during plan verification.",
-                ));
-            }
-            if metadata.len() > crate::image::MAX_IMAGE_BYTES as u64 {
-                return Err(AppError::output_commit(
-                    "published_output_too_large",
-                    "A published output exceeds the local image safety limit.",
-                ));
-            }
-            let mut bytes = Vec::with_capacity(
-                metadata.len().min(crate::image::MAX_IMAGE_BYTES as u64) as usize,
-            );
-            let mut file = file;
-            std::io::Read::by_ref(&mut file)
-                .take((crate::image::MAX_IMAGE_BYTES as u64).saturating_add(1))
-                .read_to_end(&mut bytes)
-                .map_err(|_| {
-                    AppError::output_commit(
-                        "published_output_sync_failed",
-                        "A published output could not be read for plan verification.",
-                    )
-                })?;
-            if bytes.len() > crate::image::MAX_IMAGE_BYTES {
-                return Err(AppError::output_commit(
-                    "published_output_too_large",
-                    "A published output exceeds the local image safety limit.",
-                ));
-            }
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            let digest = hasher
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            if digest != artifact.expected_sha256 {
+            if !OutputTransaction::entry_matches_digest(
+                directory.directory(),
+                &artifact.output_name,
+                artifact.expected_output_id,
+                &artifact.expected_sha256,
+            ) {
                 return Err(AppError::preflight(
                     "publishing_recovery_required",
-                    "A published output does not match the persisted digest.",
+                    "A published output changed or does not match the persisted digest.",
                 ));
             }
-            file.sync_all().map_err(|_| {
-                AppError::output_commit(
-                    "published_output_sync_failed",
-                    "A published output could not be synchronized during plan verification.",
-                )
-            })?;
-            checked.push((artifact.output_name.clone(), identity));
+            checked.push((artifact.output_name.clone(), artifact.expected_output_id));
             outputs.push(directory.display_path(&artifact.output_name));
         }
         for retained_artifact in retained_artifacts {
@@ -1348,6 +1409,15 @@ mod secure {
                         info.id != *expected_id || info.file_type != FileType::RegularFile
                     })
             })
+            || artifacts.iter().any(|artifact| {
+                !OutputTransaction::entry_matches_digest(
+                    directory.directory(),
+                    &artifact.output_name,
+                    artifact.expected_output_id,
+                    &artifact.expected_sha256,
+                )
+            })
+            || !directory.verify_visible_chain()
         {
             return Err(AppError::output_commit(
                 "published_output_changed",
@@ -1413,6 +1483,26 @@ mod secure {
                         info.id != *expected_id || info.file_type != FileType::RegularFile
                     })
             })
+            || artifacts
+                .iter()
+                .zip(observations.iter())
+                .any(|(artifact, observation)| {
+                    (observation.final_matches
+                        && !OutputTransaction::entry_matches_digest(
+                            directory.directory(),
+                            &artifact.output_name,
+                            artifact.expected_output_id,
+                            &artifact.expected_sha256,
+                        ))
+                        || (observation.stage_matches
+                            && !OutputTransaction::entry_matches_digest(
+                                directory.directory(),
+                                &artifact.stage_name,
+                                artifact.expected_stage_id,
+                                &artifact.expected_sha256,
+                            ))
+                })
+            || !directory.verify_visible_chain()
         {
             return Err(AppError::output_commit(
                 "publishing_output_changed",
@@ -1594,46 +1684,12 @@ mod secure {
         expected_id: OutputIdentity,
         expected_sha256: &str,
     ) -> Result<bool, AppError> {
-        let Some(info) = raw_entry_info(directory, name).map_err(|_| {
-            AppError::output_commit(
-                "publishing_output_changed",
-                "A recovery artifact could not be inspected safely.",
-            )
-        })?
-        else {
-            return Ok(false);
-        };
-        if info.file_type != FileType::RegularFile || info.id != expected_id {
-            return Ok(false);
-        }
-        let Ok(mut file) = open_file_component(directory, std::ffi::OsStr::new(name)) else {
-            return Ok(false);
-        };
-        let Ok(metadata) = file.metadata() else {
-            return Ok(false);
-        };
-        if !metadata.file_type().is_file() || metadata.len() > crate::image::MAX_IMAGE_BYTES as u64
-        {
-            return Ok(false);
-        }
-        let mut bytes =
-            Vec::with_capacity(metadata.len().min(crate::image::MAX_IMAGE_BYTES as u64) as usize);
-        if std::io::Read::by_ref(&mut file)
-            .take((crate::image::MAX_IMAGE_BYTES as u64).saturating_add(1))
-            .read_to_end(&mut bytes)
-            .is_err()
-            || bytes.len() > crate::image::MAX_IMAGE_BYTES
-        {
-            return Ok(false);
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        let digest = hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        Ok(digest == expected_sha256)
+        Ok(OutputTransaction::entry_matches_digest(
+            directory,
+            name,
+            expected_id,
+            expected_sha256,
+        ))
     }
 
     fn raw_entry_info(directory: &File, name: &str) -> rustix::io::Result<Option<EntryInfo>> {
@@ -1708,6 +1764,19 @@ mod secure {
         }
 
         #[test]
+        fn publication_rejects_same_inode_content_tampering() {
+            let directory = safe_tempdir();
+            let mut transaction =
+                OutputTransaction::reserve(directory.path(), vec!["hero.png".to_owned()], false)
+                    .unwrap();
+            transaction.stage_all(&[b"image bytes".to_vec()]).unwrap();
+            let stage = transaction.staged_artifact_paths()[0].clone();
+            fs::write(stage, b"tampered bytes").unwrap();
+            let error = transaction.commit_all().unwrap_err();
+            assert_eq!(error.code, "output_path_changed");
+        }
+
+        #[test]
         fn recovery_read_uses_a_bounded_regular_file_descriptor() {
             let directory = safe_tempdir();
             let destination = directory.path().join("hero.png");
@@ -1755,6 +1824,7 @@ mod secure {
                     stage_name: stage.file_name().unwrap().to_str().unwrap().to_owned(),
                     expected_stage_id: stage_id,
                     expected_id,
+                    expected_sha256: sha256_hex(b"new image"),
                 }],
             )
             .unwrap();
@@ -1786,6 +1856,7 @@ mod secure {
                     stage_name: stage.file_name().unwrap().to_str().unwrap().to_owned(),
                     expected_stage_id: stage_id,
                     expected_id: None,
+                    expected_sha256: sha256_hex(b"our image"),
                 }],
             )
             .unwrap();
@@ -1893,13 +1964,37 @@ mod secure {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use secure::{
-    inspect_recovery_plan, read_and_sync_regular_file, read_regular_file,
+    entry_exists, inspect_recovery_plan, read_and_sync_regular_file, read_regular_file,
     read_regular_file_with_identity, sync_regular_file_identity, sync_regular_files,
     verify_and_sync_plan, verify_regular_file_identity, CommitResult, OutputTransaction,
 };
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub struct OutputTransaction;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn entry_exists(output_dir: &Path, name: &str) -> Result<bool, AppError> {
+    if name.is_empty()
+        || Path::new(name).components().count() != 1
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(AppError::preflight(
+            "unsafe_output_name",
+            "The output entry name is not a safe single filename.",
+        ));
+    }
+    match std::fs::symlink_metadata(output_dir.join(name)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(AppError::preflight(
+            "output_directory_unavailable",
+            "The output directory could not be inspected safely before the run.",
+        )),
+    }
+}
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn read_regular_file(_path: &Path, _max_bytes: usize) -> Result<Vec<u8>, AppError> {
@@ -2104,6 +2199,14 @@ impl OutputTransaction {
     }
 
     pub fn stage_all(&mut self, _images: &[Vec<u8>]) -> Result<(), AppError> {
+        unreachable!("unsupported platforms cannot reserve an output transaction")
+    }
+
+    pub fn stage_selected(
+        &mut self,
+        _selected_indices: &[usize],
+        _images: &[Vec<u8>],
+    ) -> Result<(), AppError> {
         unreachable!("unsupported platforms cannot reserve an output transaction")
     }
 

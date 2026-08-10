@@ -10,9 +10,11 @@ pub mod cli;
 pub mod cost;
 pub mod endpoint;
 pub mod image;
+pub mod manifest;
 pub mod output;
 pub mod provider;
 pub mod report;
+pub mod run;
 
 use std::{
     env, fs,
@@ -42,6 +44,16 @@ pub const MODEL: &str = "gpt-image-2";
 
 /// Validate and execute one image-generation command.
 pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
+    run_generate_with_preflight(args, || Ok(()))
+}
+
+pub(crate) fn run_generate_with_preflight<F>(
+    args: &GenerateArgs,
+    preflight: F,
+) -> Result<RunReport, AppError>
+where
+    F: Fn() -> Result<(), AppError>,
+{
     let raw_provider = args.provider;
     let raw_count = args.n;
     let args = match args.resolve_request_file() {
@@ -54,7 +66,7 @@ pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
     };
     let selected_provider = args.provider;
     let selected_count = args.n;
-    run_generate_inner(&args).map_err(|mut error| {
+    run_generate_inner(&args, &preflight).map_err(|mut error| {
         error.set_provider(selected_provider);
         error.set_image_count(selected_count);
         error
@@ -72,7 +84,10 @@ fn request_cost_preview(args: &GenerateArgs) -> cost::CostPreview {
     )
 }
 
-fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
+fn run_generate_inner(
+    args: &GenerateArgs,
+    preflight: &dyn Fn() -> Result<(), AppError>,
+) -> Result<RunReport, AppError> {
     let prompt = args.read_prompt()?;
     let file_names = derive_file_names(
         args.n,
@@ -116,12 +131,7 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
                 "OPENAI_API_KEY must be set for the default --provider api path, or select --provider codex explicitly.",
             )
         })?;
-        if key.trim().is_empty() {
-            return Err(AppError::usage(
-                "empty_api_key",
-                "OPENAI_API_KEY is empty. Set a non-empty API key in the environment; do not pass it on the command line.",
-            ));
-        }
+        api::validate_api_key(&key)?;
         let client = ApiClient::new(args.timeout_seconds)?;
         Some((key, client))
     } else {
@@ -159,6 +169,10 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
                     error.add_possibly_modified_paths(transaction.abort());
                     error
                 })?;
+            if let Err(mut error) = preflight() {
+                error.add_possibly_modified_paths(transaction.abort());
+                return Err(error);
+            }
             let response = match client.generate(&endpoint, &api_key, &request) {
                 Ok(response) => response,
                 Err(mut error) => {
