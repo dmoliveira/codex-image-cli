@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
 
-use crate::{cli::OutputFormat, report::AppError};
+use crate::{api::TokenUsage, cli::OutputFormat, report::AppError};
 
 /// Cap each decoded artifact so a malicious or misconfigured endpoint cannot
 /// exhaust local memory/disk. Users needing larger assets can choose JPEG/WebP
@@ -45,6 +45,20 @@ pub fn decode_images(
         .into_iter()
         .map(|image| decode_one(image.b64_json, format))
         .collect()
+}
+
+/// Extract response usage without making image decoding depend on the
+/// optional accounting metadata. A malformed or usage-less response simply
+/// returns no usage and is handled by the caller's normal response path.
+pub fn extract_usage(body: &[u8]) -> Option<TokenUsage> {
+    #[derive(Deserialize)]
+    struct UsageEnvelope {
+        usage: Option<TokenUsage>,
+    }
+
+    serde_json::from_slice::<UsageEnvelope>(body)
+        .ok()
+        .and_then(|response| response.usage)
 }
 
 fn decode_one(encoded: Option<String>, format: OutputFormat) -> Result<Vec<u8>, AppError> {

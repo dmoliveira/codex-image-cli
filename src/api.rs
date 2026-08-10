@@ -14,7 +14,24 @@ use crate::{cli::GenerateArgs, endpoint::Endpoint, report::AppError, MODEL};
 /// Bound the full JSON response before parsing it. This protects callers from
 /// a compatible endpoint returning an unexpectedly large body.
 pub const MAX_RESPONSE_BYTES: usize = 180 * 1024 * 1024;
+const MAX_SINGLE_IMAGE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
+
+pub fn validate_api_key(api_key: &str) -> Result<(), AppError> {
+    if api_key.trim().is_empty() {
+        return Err(AppError::usage(
+            "empty_api_key",
+            "OPENAI_API_KEY is empty. Set a non-empty API key in the environment; do not pass it on the command line.",
+        ));
+    }
+    if !api_key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(AppError::usage(
+            "invalid_api_key",
+            "OPENAI_API_KEY must contain only visible ASCII characters and must not include whitespace or control characters.",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize)]
 pub struct ImageGenerationRequest<'a> {
@@ -81,6 +98,25 @@ pub struct BatchRequestCounts {
     pub completed: u32,
     pub failed: u32,
     pub total: u32,
+}
+
+/// Token accounting returned by Image API responses and Batch JSONL items.
+/// The API may omit this object on older responses or compatible test
+/// endpoints, so every component is optional and callers must treat missing
+/// usage as unpriced rather than infer a charge.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub input_tokens_details: Option<TokenUsageDetails>,
+    pub output_tokens_details: Option<TokenUsageDetails>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TokenUsageDetails {
+    pub text_tokens: Option<u64>,
+    pub image_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,9 +218,14 @@ impl ApiClient {
             .with_http(status.as_u16(), request_id));
         }
 
+        let max_response = if request.n == 1 {
+            MAX_SINGLE_IMAGE_RESPONSE_BYTES
+        } else {
+            MAX_RESPONSE_BYTES
+        };
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+            .is_some_and(|length| length > max_response as u64)
         {
             return Err(AppError::invalid_response(
                 "response_too_large",
@@ -193,14 +234,14 @@ impl ApiClient {
             .with_http(status.as_u16(), request_id));
         }
 
-        let body = read_bounded(response, MAX_RESPONSE_BYTES).map_err(|_| {
+        let body = read_bounded(response, max_response).map_err(|_| {
             AppError::indeterminate(
                 "response_read_outcome_unknown",
                 "The image POST may have been processed, but the successful response could not be read completely. Billing and generation outcome are unknown; do not retry automatically.",
             )
             .with_http(status.as_u16(), request_id.clone())
         })?;
-        if body.len() > MAX_RESPONSE_BYTES {
+        if body.len() > max_response {
             return Err(AppError::invalid_response(
                 "response_too_large",
                 "The successful response exceeded the local safety limit. The image request may have been billed; do not retry automatically.",
@@ -720,7 +761,7 @@ mod tests {
             name: None,
             prefix: None,
             format: crate::cli::OutputFormat::Png,
-            size: "auto".to_owned(),
+            size: "1024x1024".to_owned(),
             quality: crate::cli::Quality::Auto,
             confirm_high_quality: false,
             background: crate::cli::Background::Auto,
@@ -735,7 +776,18 @@ mod tests {
         };
         let body = serde_json::to_value(ImageGenerationRequest::from_args("test", &args)).unwrap();
         assert_eq!(body["model"], "gpt-image-2");
+        assert_eq!(body["size"], "1024x1024");
         assert!(body.get("output_compression").is_none());
+    }
+
+    #[test]
+    fn rejects_empty_or_non_visible_api_keys() {
+        assert_eq!(validate_api_key("   ").unwrap_err().code, "empty_api_key");
+        assert_eq!(
+            validate_api_key("test-api-key\n").unwrap_err().code,
+            "invalid_api_key"
+        );
+        assert!(validate_api_key("test-api-key").is_ok());
     }
 
     #[test]

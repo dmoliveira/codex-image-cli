@@ -13,6 +13,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-f0c674.svg)](LICENSE)
 [![Support via Stripe](https://img.shields.io/badge/support-stripe-635bff?logo=stripe&logoColor=white)](https://buy.stripe.com/8x200i8bSgVe3Vl3g8bfO00)
 
+**[Read the friendly documentation site →](https://dmoliveira.github.io/codex-image-cli/)**
+
 ## Why this exists 🎯
 
 AI tools such as OpenCode need a small, predictable image command—not a browser flow or an interactive wizard. `codex-image` provides:
@@ -22,6 +24,7 @@ AI tools such as OpenCode need a small, predictable image command—not a browse
 - 📁 **Safe deterministic files** with collision protection, staged writes, and controlled `--overwrite`
 - 🔒 **Explicit providers**: direct Image API by default, authenticated Codex CLI via `--provider codex`
 - ⏳ **Durable Batch lifecycle**: submit, inspect, retrieve, and cancel bounded API jobs without hidden retries
+- 🧭 **Manifest runs**: plan, resume, shard, and execute large asset sets with bounded direct concurrency or durable Batch children
 - 🧪 **Offline-friendly validation**: `--dry-run`, unit tests, fake-API integration tests, and a tmux E2E harness
 
 ## Important account reality ⚠️
@@ -85,8 +88,8 @@ codex-image generate \
   --output-dir artifacts/design \
   --prefix fox-terminal \
   --n 1 \
-  --size 1536x1024 \
-  --quality medium \
+  --size 1024x1024 \
+  --quality low \
   --dry-run \
   --json
 
@@ -98,9 +101,13 @@ codex-image generate \
   --prefix fox-terminal \
   --n 1 \
   --size 1536x1024 \
-  --quality medium \
+  --quality low \
   --json
 ```
+
+For canonical OpenAI requests using one of the documented standard sizes,
+the dry-run JSON also includes a non-binding image-output cost preview. It
+does not read a key, reserve files, create a Batch job, or contact the network.
 
 That writes `fox-terminal.png` after the generated PNG has passed container validation.
 
@@ -125,7 +132,7 @@ Required facts for an agent:
 | Output directory | Create it first; it must be non-symlinked and already exist |
 | One output | `--name hero` with `--n 1` |
 | Several outputs | `--prefix hero --n 3` → `hero-01.png` … `hero-03.png` |
-| No-cost planning | Add `--dry-run --json`; it reads no key and opens no network connection |
+| No-cost planning | Add `--dry-run --json`; it validates endpoint/output safety without reading a key, writing the ledger, reserving files, or opening a network connection, and may include a non-binding output-cost preview |
 | Result parsing | Use `--json`; stdout contains exactly one JSON document |
 
 Read the full [AI agent guide](docs/AI-AGENT-GUIDE.md) and [JSON/exit-code contract](docs/API-CONTRACT.md).
@@ -145,14 +152,14 @@ codex-image generate --prompt <TEXT> [OPTIONS]
 | `--name STEM` | — | Exact safe stem for one image only: `hero` → `hero.png`. |
 | `--prefix STEM` | `codex-image` | Safe stem for one/many images: `hero` + 3 → `hero-01.png` … |
 | `--format` | `png` | `png`, `jpeg`, or `webp`; response container is verified. |
-| `--size` | `auto` | `auto` or `WIDTHxHEIGHT` within documented GPT Image 2 constraints. |
+| `--size` | `1024x1024` | `auto` or `WIDTHxHEIGHT` within documented GPT Image 2 constraints. Use `--size auto` or a larger explicit size deliberately. |
 | `--quality` | `low` | `low`, `medium`, `high`, or `auto`; `high` requires `--confirm-high-quality`. |
 | `--background` | `auto` | `auto` or `opaque`; GPT Image 2 currently rejects transparent output. |
 | `--compression` | — | 0–100 for JPEG/WebP only. |
 | `--moderation` | `auto` | `auto` or `low`, following the documented API option. |
 | `--overwrite` | off | Atomically exchanges a regular target, then validates that the displaced identity matches preflight. A mismatch is never called success; successful replacements retain a private backup listed in `retained_artifacts`. |
 | `--timeout-seconds` | `180` | 1–300 seconds, one request only. |
-| `--dry-run` | off | No key read, file reservation, DNS, proxy, or HTTP request. |
+| `--dry-run` | off | Validates endpoint policy and output targets without key read, ledger write, file reservation, DNS, proxy, or HTTP request; canonical standard sizes include a non-binding output-cost preview. High quality may be planned without `--confirm-high-quality`. |
 | `--json` | off | Stable JSON schema on stdout; diagnostics are not mixed in. |
 
 `*` Exactly one of `--prompt` and `--prompt-file` is required.
@@ -166,7 +173,7 @@ Use a request file when an agent already has typed parameters:
   "schema_version": 1,
   "prompt": "A warm editorial illustration of a rust-orange fox using a terminal",
   "provider": "codex",
-  "size": "1536x1024",
+  "size": "1024x1024",
   "quality": "medium"
 }
 ```
@@ -190,10 +197,11 @@ Batch is an explicit API-only workflow. It accepts at most 8 image requests loca
 codex-image batch submit \
   --provider api \
   --prompt "A warm editorial illustration of a rust-orange fox using a terminal" \
-  --output-dir artifacts/design \
-  --prefix fox-batch \
-  --n 2 \
-  --job-file artifacts/design/fox-batch-job.json \
+   --output-dir artifacts/design \
+   --prefix fox-batch \
+   --n 2 \
+   --quality low \
+   --job-file artifacts/design/fox-batch-job.json \
   --json
 
 codex-image batch status \
@@ -212,6 +220,57 @@ Use `batch cancel --job-file FILE --json` when cancellation is appropriate. The 
 For a custom endpoint, repeat its exact `--dangerously-allow-api-key-to ORIGIN` approval on each status/retrieve/cancel/recover command. For loopback test endpoints, repeat `--allow-insecure-localhost`; trust approvals are intentionally not taken from an editable job file.
 
 Use `batch recover --job-file FILE --json` for a job left in the safe `input_uploaded` state. For an unknown upload outcome, first inspect the remote Files API and pass `--input-file-id FILE_ID`; for an unknown create outcome, inspect the remote Batches API and pass `--batch-id BATCH_ID`. These explicit reconciliation flags never cause an automatic upload or duplicate creation.
+
+### Large manifest runs
+
+Use a bounded JSONL manifest for a large, parameterized asset set. Each non-empty line contains `id`, `prompt`, and an optional safe output `name` stem:
+
+```jsonl
+{"id":"hero-001","prompt":"A warm editorial hero image","name":"hero-001"}
+{"id":"hero-002","prompt":"A cool editorial hero image","name":"hero-002"}
+```
+
+Plan before spending credits. The plan digest binds the manifest, parameters, output directory, endpoint, and worker/shard settings; reports and run files never contain prompts or keys:
+
+```bash
+codex-image run plan \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --mode direct \
+  --parallelism 2 \
+  --json
+
+codex-image run direct \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --run-file artifacts/design/run.json \
+  --approve-plan <plan-sha256> \
+  --max-concurrency 2 \
+  --json
+
+# For Batch, obtain a separate digest with matching Batch settings first:
+codex-image run plan \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --mode batch \
+  --parallelism 8 \
+  --max-active-batches 1 \
+  --wait \
+  --max-wait-seconds 300 \
+  --poll-interval-seconds 10 \
+  --json
+
+codex-image run batch \
+  --manifest assets.jsonl \
+  --output-dir artifacts/design \
+  --run-file artifacts/design/batch-run.json \
+  --approve-plan <plan-sha256> \
+  --shard-size 8 \
+  --wait \
+  --json
+```
+
+`run direct` is API-only, defaults to one worker, and never retries generation POSTs. A definitive failure stops new dispatches unless `--continue-on-error` is explicit; ambiguous or invalid billed outcomes always stop. `run batch` persists its complete shard map before upload/create, allows bounded active child jobs, and never resubmits an in-flight or unknown child job. Resume the same run with the same approved settings after read-only Batch work completes. See [the run manifest contract](docs/specs/run-manifest.md).
 
 ### Endpoint overrides (advanced) 🔐
 
@@ -232,6 +291,22 @@ codex-image generate ... \
 ```
 
 The CLI rejects non-loopback HTTP, embedded URL credentials, query/fragment URLs, redirects, and proxy use. Treat a custom origin as a deliberate decision to send your API key to that service.
+
+### Cost reports 💰
+
+API image requests are recorded locally without prompts, keys, image bytes, or response bodies. Inspect the current day, calendar week/month/year, or an explicit UTC range without a network call:
+
+```bash
+codex-image cost --period today --json
+codex-image cost --period week --day-by-day --json
+codex-image cost --period month --per-request --json
+codex-image cost --period year --day-by-day --per-request --json
+codex-image cost --from 2026-08-01 --to 2026-08-08 --day-by-day --per-request --json
+```
+
+Reports separate live and Batch requests and show priced, unpriced, pending-known, and unknown outcomes plus `estimate_coverage` (`complete` or `partial`). Amounts are local USD estimates from returned token usage and the versioned GPT Image 2 rate snapshot; OpenAI billing records remain authoritative. Missing usage and compatible custom/loopback origins are recorded but unpriced. The append-only ledger defaults to `XDG_STATE_HOME/codex-image/costs.jsonl`, with documented fallbacks in [the API contract](docs/API-CONTRACT.md).
+
+Before spending, parse `cost_preview` from `generate --dry-run --json` or `batch submit --dry-run --json`. For canonical OpenAI requests with `1024x1024`, `1024x1536`, or `1536x1024`, it uses the official GPT Image 2 per-image output table and multiplies by `--n` (Batch uses the discounted rate). It explicitly excludes prompt/input-image charges; `status: "unavailable"` is returned for custom endpoints, Codex, `auto`, and unsupported sizes/qualities. Treat the preview as a planning signal, not a quote or billing record.
 
 ## Cost and failure safety 🧯
 

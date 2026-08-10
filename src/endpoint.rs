@@ -84,6 +84,13 @@ impl Endpoint {
         &self.url
     }
 
+    /// OpenAI's published pricing is only applied to the canonical API
+    /// origin. Compatible loopback/custom endpoints are still recorded but
+    /// remain explicitly unpriced.
+    pub fn is_canonical_openai(&self) -> bool {
+        is_default_openai(&self.base)
+    }
+
     pub fn files_url(&self) -> Result<Url, AppError> {
         self.url_for("files")
     }

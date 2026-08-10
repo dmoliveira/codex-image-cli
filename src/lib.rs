@@ -7,11 +7,14 @@
 pub mod api;
 pub mod batch;
 pub mod cli;
+pub mod cost;
 pub mod endpoint;
 pub mod image;
+pub mod manifest;
 pub mod output;
 pub mod provider;
 pub mod report;
+pub mod run;
 
 use std::{
     env, fs,
@@ -25,7 +28,10 @@ use std::{
 
 use api::{ApiClient, ImageGenerationRequest};
 use cli::{GenerateArgs, Provider};
-use image::{decode_images, validate_image_bytes};
+use cost::{
+    CostEventKind, CostLedger, CostOperationSpec, CostOutcome, CostResolution, CostTransport,
+};
+use image::{decode_images, extract_usage, validate_image_bytes};
 use output::{derive_file_names, derive_output_paths, OutputTransaction};
 use report::{AppError, RunReport};
 use serde::Serialize;
@@ -38,6 +44,16 @@ pub const MODEL: &str = "gpt-image-2";
 
 /// Validate and execute one image-generation command.
 pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
+    run_generate_with_preflight(args, || Ok(()))
+}
+
+pub(crate) fn run_generate_with_preflight<F>(
+    args: &GenerateArgs,
+    preflight: F,
+) -> Result<RunReport, AppError>
+where
+    F: Fn() -> Result<(), AppError>,
+{
     let raw_provider = args.provider;
     let raw_count = args.n;
     let args = match args.resolve_request_file() {
@@ -50,14 +66,28 @@ pub fn run_generate(args: &GenerateArgs) -> Result<RunReport, AppError> {
     };
     let selected_provider = args.provider;
     let selected_count = args.n;
-    run_generate_inner(&args).map_err(|mut error| {
+    run_generate_inner(&args, &preflight).map_err(|mut error| {
         error.set_provider(selected_provider);
         error.set_image_count(selected_count);
         error
     })
 }
 
-fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
+fn request_cost_preview(args: &GenerateArgs) -> cost::CostPreview {
+    cost::preflight_preview(
+        CostTransport::Live,
+        MODEL,
+        args.n,
+        args.quality.as_api_value(),
+        &args.size,
+        args.provider == Provider::Api && cost::pricing_eligible_for_base_url(&args.api_base_url),
+    )
+}
+
+fn run_generate_inner(
+    args: &GenerateArgs,
+    preflight: &dyn Fn() -> Result<(), AppError>,
+) -> Result<RunReport, AppError> {
     let prompt = args.read_prompt()?;
     let file_names = derive_file_names(
         args.n,
@@ -65,12 +95,33 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
         args.prefix.as_deref(),
         args.format,
     )?;
-    args.validate(&prompt)?;
+    if args.dry_run {
+        args.validate_dry_run(&prompt)?;
+    } else {
+        args.validate(&prompt)?;
+    }
 
     let planned_outputs = derive_output_paths(&args.output_dir, &file_names);
     provider::validate(args)?;
+    let cost_preview = request_cost_preview(args);
+
+    let endpoint = if args.provider == Provider::Api {
+        Some(endpoint::Endpoint::authorize(
+            &args.api_base_url,
+            args.dangerously_allow_api_key_to.as_deref(),
+            args.allow_insecure_localhost,
+        )?)
+    } else {
+        None
+    };
     if args.dry_run {
-        return Ok(RunReport::dry_run(args.n, planned_outputs, args.provider));
+        OutputTransaction::validate_plan(&args.output_dir, &file_names, args.overwrite)?;
+        return Ok(RunReport::dry_run(
+            args.n,
+            planned_outputs,
+            args.provider,
+            cost_preview,
+        ));
     }
 
     let api_key = if args.provider == Provider::Api {
@@ -80,23 +131,9 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
                 "OPENAI_API_KEY must be set for the default --provider api path, or select --provider codex explicitly.",
             )
         })?;
-        if key.trim().is_empty() {
-            return Err(AppError::usage(
-                "empty_api_key",
-                "OPENAI_API_KEY is empty. Set a non-empty API key in the environment; do not pass it on the command line.",
-            ));
-        }
+        api::validate_api_key(&key)?;
         let client = ApiClient::new(args.timeout_seconds)?;
         Some((key, client))
-    } else {
-        None
-    };
-    let endpoint = if args.provider == Provider::Api {
-        Some(endpoint::Endpoint::authorize(
-            &args.api_base_url,
-            args.dangerously_allow_api_key_to.as_deref(),
-            args.allow_insecure_localhost,
-        )?)
     } else {
         None
     };
@@ -107,17 +144,90 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
             let (api_key, client) = api_key.expect("API configuration was preflighted");
             let endpoint = endpoint.expect("endpoint was preflighted for the API provider");
             let request = ImageGenerationRequest::from_args(&prompt, args);
+            let ledger = CostLedger::open(None).map_err(|mut error| {
+                error.add_possibly_modified_paths(transaction.abort());
+                error
+            })?;
+            let operation_id = cost::live_operation_id();
+            ledger
+                .start(
+                    CostOperationSpec {
+                        operation_id: operation_id.clone(),
+                        transport: CostTransport::Live,
+                        model: MODEL.to_owned(),
+                        image_count: u32::from(args.n),
+                        quality: args.quality.as_api_value().to_owned(),
+                        size: args.size.clone(),
+                        output_format: args.format.as_api_value().to_owned(),
+                        pricing_eligible: endpoint.is_canonical_openai(),
+                        batch_id: None,
+                        custom_id: None,
+                    },
+                    cost::now_seconds(),
+                )
+                .map_err(|mut error| {
+                    error.add_possibly_modified_paths(transaction.abort());
+                    error
+                })?;
+            if let Err(mut error) = preflight() {
+                error.add_possibly_modified_paths(transaction.abort());
+                return Err(error);
+            }
             let response = match client.generate(&endpoint, &api_key, &request) {
                 Ok(response) => response,
                 Err(mut error) => {
+                    let outcome = if error.status == report::Status::ApiRejected {
+                        CostOutcome::Rejected
+                    } else if error.status == report::Status::OutcomeIndeterminate {
+                        CostOutcome::Unknown
+                    } else {
+                        CostOutcome::Failed
+                    };
+                    if let Err(accounting_error) = ledger.resolve(CostResolution {
+                        operation_id: operation_id.clone(),
+                        kind: CostEventKind::Final,
+                        outcome,
+                        recorded_at: cost::now_seconds(),
+                        batch_id: None,
+                        request_id: error.request_id.clone(),
+                        usage: None,
+                    }) {
+                        error.message = format!(
+                            "{} Cost accounting also failed: {}",
+                            error.message, accounting_error.message
+                        );
+                        error.automatic_retry_safe = false;
+                    }
                     error.add_possibly_modified_paths(transaction.abort());
                     return Err(error);
                 }
             };
+            let response_request_id = response.request_id.clone();
+            if let Err(accounting_error) = ledger.resolve(CostResolution {
+                operation_id: operation_id.clone(),
+                kind: CostEventKind::Final,
+                outcome: CostOutcome::Succeeded,
+                recorded_at: cost::now_seconds(),
+                batch_id: None,
+                request_id: response.request_id.clone(),
+                usage: extract_usage(&response.body),
+            }) {
+                let mut error = AppError::indeterminate(
+                    "cost_ledger_write_failed",
+                    format!(
+                        "The image request returned successfully, but cost accounting failed: {}. The request may have been billed; do not retry automatically.",
+                        accounting_error.message
+                    ),
+                );
+                error.set_http_status(response.status);
+                error.set_request_id(response.request_id);
+                error.add_possibly_modified_paths(transaction.abort());
+                return Err(error);
+            }
             let images = match decode_images(&response.body, args.n, args.format) {
                 Ok(images) => images,
                 Err(mut error) => {
-                    error.set_request_id(response.request_id);
+                    error.set_request_id(response_request_id);
                     error.set_http_status(response.status);
                     error.add_possibly_modified_paths(transaction.abort());
                     return Err(error);
@@ -151,6 +261,7 @@ fn run_generate_inner(args: &GenerateArgs) -> Result<RunReport, AppError> {
             request_id,
             http_status,
             args.provider,
+            cost_preview,
         )),
         Err(mut error) => {
             error.set_request_id(request_id);

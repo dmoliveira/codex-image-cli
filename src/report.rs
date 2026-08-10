@@ -2,9 +2,10 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::cli::Provider;
+use crate::cost::CostPreview;
 use crate::provider;
 
-pub const SCHEMA_VERSION: u8 = 2;
+pub const SCHEMA_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -198,6 +199,7 @@ impl AppError {
             outputs: Vec::new(),
             retained_artifacts: Vec::new(),
             possibly_modified_paths: path_strings(&self.possibly_modified_paths),
+            cost_preview: None,
             error: Some(ErrorInfo {
                 code: self.code,
                 message: self.message.clone(),
@@ -224,11 +226,18 @@ pub struct RunReport {
     pub retained_artifacts: Vec<String>,
     pub possibly_modified_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_preview: Option<CostPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
 }
 
 impl RunReport {
-    pub fn dry_run(image_count: u8, outputs: Vec<PathBuf>, provider: Provider) -> Self {
+    pub fn dry_run(
+        image_count: u8,
+        outputs: Vec<PathBuf>,
+        provider: Provider,
+        cost_preview: CostPreview,
+    ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             ok: true,
@@ -245,6 +254,7 @@ impl RunReport {
             outputs: path_strings(&outputs),
             retained_artifacts: Vec::new(),
             possibly_modified_paths: Vec::new(),
+            cost_preview: Some(cost_preview),
             error: None,
         }
     }
@@ -256,6 +266,7 @@ impl RunReport {
         request_id: Option<String>,
         http_status: Option<u16>,
         provider: Provider,
+        cost_preview: CostPreview,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -275,6 +286,7 @@ impl RunReport {
             outputs: path_strings(&outputs),
             retained_artifacts: path_strings(&retained_artifacts),
             possibly_modified_paths: Vec::new(),
+            cost_preview: Some(cost_preview),
             error: None,
         }
     }
@@ -323,6 +335,7 @@ pub struct BatchContext {
     pub output_file_id: Option<String>,
     pub error_file_id: Option<String>,
     pub remote_status: Option<String>,
+    pub request_counts: Option<BatchRequestCountsReport>,
     pub http_status: Option<u16>,
     pub request_id: Option<String>,
     pub image_count: u8,
@@ -331,6 +344,7 @@ pub struct BatchContext {
     pub retained_artifacts: Vec<String>,
     pub possibly_modified_paths: Vec<String>,
     pub next_action: Option<String>,
+    pub cost_preview: Option<CostPreview>,
 }
 
 #[derive(Debug, Serialize)]
@@ -347,15 +361,26 @@ pub struct BatchReport {
     pub output_file_id: Option<String>,
     pub error_file_id: Option<String>,
     pub remote_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_counts: Option<BatchRequestCountsReport>,
     pub request: BatchRequestInfo,
     pub http: HttpInfo,
     pub outputs: Vec<String>,
     pub retained_artifacts: Vec<String>,
     pub possibly_modified_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_preview: Option<CostPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchRequestCountsReport {
+    pub completed: u32,
+    pub failed: u32,
+    pub total: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -416,6 +441,7 @@ impl BatchContext {
             output_file_id: self.output_file_id.clone(),
             error_file_id: self.error_file_id.clone(),
             remote_status: self.remote_status.clone(),
+            request_counts: self.request_counts.clone(),
             request: BatchRequestInfo {
                 attempted: self.attempted,
                 image_count: self.image_count,
@@ -429,6 +455,7 @@ impl BatchContext {
             outputs: self.outputs.clone(),
             retained_artifacts: self.retained_artifacts.clone(),
             possibly_modified_paths,
+            cost_preview: self.cost_preview.clone(),
             next_action: self.next_action.clone(),
             error: error_info,
         }
